@@ -2,7 +2,7 @@
 
 Record each test result here: the date, the command, the setup and the measured value. Do not record a result that you did not measure.
 
-CI runs on shared virtual machines. A process there can stall for 100 to 200 ms. Thus the CI gate for stop latency is p95; the plan target (p99 75 ms or less) applies to local and hardware runs.
+CI runs on shared virtual machines with 2 cores. A process there can stall for 100 to 300 ms. Thus CI latency gates only find a gross regression (stop p95 250 ms or less, owner close 250 ms or less). The plan targets (stop p99 75 ms or less, owner close 100 ms or less) apply to local and hardware runs. Record those runs here.
 
 | Date | Phase | Command | Setup | Result |
 | --- | --- | --- | --- | --- |
