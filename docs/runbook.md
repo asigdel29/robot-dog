@@ -107,18 +107,21 @@ Do each check. Write each result in `docs/test-log.md`, with the date, the comma
 
 ### 2.1 Write the SD card (Owner)
 
-1. **(Owner)** In Raspberry Pi Imager, select Raspberry Pi 5 and Raspberry Pi OS Lite (64-bit).
-2. **(Owner)** In the OS customization, set the hostname to `robot-pi`.
-3. **(Owner)** Set the user name to `robot`.
-4. **(Owner)** Set a strong password.
-5. **(Owner)** Keep the password in the password manager.
-6. **(Owner)** Enter the Wi-Fi name, the Wi-Fi password and the Wi-Fi country.
-7. **(Owner)** Set the time zone and the keyboard layout.
-8. **(Owner)** On the Services tab, select SSH with public-key authentication only.
-9. **(Owner)** Paste the SSH public key of the implementer.
-10. **(Owner)** Write the card.
-11. **(Owner)** Put the card in the Pi.
-12. **(Owner)** Connect the power supply.
+1. **(Owner)** In Raspberry Pi Imager, select Raspberry Pi 5.
+2. **(Owner)** Select Raspberry Pi OS Lite (64-bit), the release based on Debian 13 Trixie.
+3. **(Owner)** In the OS customization, set the hostname to `robot-pi`.
+4. **(Owner)** Set the user name to `robot`.
+5. **(Owner)** Set a strong password.
+6. **(Owner)** Keep the password in the password manager.
+7. **(Owner)** Enter the Wi-Fi name, the Wi-Fi password and the Wi-Fi country.
+8. **(Owner)** Set the time zone and the keyboard layout.
+9. **(Owner)** On the Services tab, select SSH with public-key authentication only.
+10. **(Owner)** Paste the SSH public key of the implementer.
+11. **(Owner)** Write the card.
+12. **(Owner)** Put the card in the Pi.
+13. **(Owner)** Connect the power supply.
+
+The Bookworm release of Raspberry Pi OS is not correct for this project. Its OpenCV is 4.6, and mediad needs `cv2.aruco.ArucoDetector` from OpenCV 4.7 or later. `preinstall` refuses a system without it.
 
 ### 2.2 First install
 
@@ -140,10 +143,12 @@ Do each check. Write each result in `docs/test-log.md`, with the date, the comma
 5. Write `wss://dog.<domain>/device` after `DOG_HUB_URL=`.
 6. In the same file, write the droplet value of `DEVICE_TOKEN` after `DOG_DEVICE_TOKEN=`.
 7. Run `sudoedit /etc/dog/console.env`.
-8. Write a new random value after `DOG_CONSOLE_TOKEN=`.
+8. Write the output of `openssl rand -hex 24` after `DOG_CONSOLE_TOKEN=`.
 9. Run `sudo systemctl restart dog.target`.
 
-The droplet value of `DEVICE_TOKEN` is in `/etc/doghub/hub.env`. To make a random value, run `openssl rand -hex 32`.
+The droplet value of `DEVICE_TOKEN` is in `/etc/doghub/hub.env`. The console token goes in a browser cookie, so it must be hex.
+
+The LAN console of mediad is plain HTTP on `console_port` in the `[mediad]` section of `dog.toml` (8080 by default). Use it only on the home LAN. Do not forward that port on the router.
 
 ### 2.4 Phase 6 checks
 

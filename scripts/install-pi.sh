@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # install-pi.sh: first install on the Pi. It installs the apt packages, then applies the first release.
 # Run it once on the Pi: sudo ./install-pi.sh dog-<version>.tar.gz (the .sha256 file must be beside it).
+# The Pi runs Raspberry Pi OS Lite 64-bit based on Debian 13 Trixie, for OpenCV 4.7 or later.
 # The release hooks do every other change to the board, so later releases need only deploy-pi.sh.
 set -euo pipefail
 

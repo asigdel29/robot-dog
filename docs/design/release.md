@@ -110,7 +110,7 @@ The first install has no old release. When its gate fails, the new release stays
 
 `robotctl` runs each hook as root, from the release directory. A hook finds its release from its own path.
 
-- `preinstall` checks Python 3.11 or later, the apt packages and 200 MiB of free space in `/opt`. It creates the absent groups and users and sets their group membership. It changes nothing when all are present.
+- `preinstall` checks Python 3.11 or later, the apt packages, `cv2.aruco.ArucoDetector` (OpenCV 4.7 or later) and 200 MiB of free space in `/opt`. It creates the absent groups and users and sets their group membership. It changes nothing when all are present.
 - `postinstall` copies the units, the tmpfiles entry and the launcher. It runs `systemctl daemon-reload` and `systemd-tmpfiles --create`. It creates `/etc/dog` and copies each absent template. It enables `dog.target`. It does not start a daemon.
 
 Microduck rule: each change that `scripts/install-pi.sh` makes to the board is also in a hook. `install-pi.sh` installs the apt packages and applies the first release with `robotctl`. `preinstall` checks that the same apt packages are present.
