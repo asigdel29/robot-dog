@@ -95,6 +95,7 @@ def make_detector(dictionary):
     detector = cv2.aruco.ArucoDetector(dictionary, params)
 
     def detect(frame):
+        """Return the marker poses of one BGR frame."""
         corners, ids, _ = detector.detectMarkers(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
         return marker_poses(corners, ids)
 
@@ -162,7 +163,7 @@ def open_camera(path):
     """Open a V4L2 camera at 640 x 480 and 15 fps with a one-frame buffer, or return None."""
     if not os.path.exists(path):  # unplugged: no OpenCV message each retry
         return None
-    capture = cv2.VideoCapture(path)
+    capture = cv2.VideoCapture(path, cv2.CAP_V4L2)
     if not capture.isOpened():
         return None
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
@@ -277,6 +278,7 @@ class Mediad:
     # ---- subscribers
 
     def _notify(self, method, params):
+        """Send one notification to each media.subscribe connection."""
         for conn in list(self._subscribers):
             conn.notify(method, params)
 
@@ -330,6 +332,7 @@ class Mediad:
         self._audio_log("end")
 
     def _audio_log(self, event, **fields):
+        """Append one fake speaker event with its monotonic time to audio_out.log."""
         with open(os.path.join(dogproto.run_dir(), "audio_out.log"), "a") as handle:
             handle.write(f"{time.monotonic_ns()} {event} {json.dumps(fields)}\n")
 
@@ -390,7 +393,7 @@ class Mediad:
         return {}
 
     async def h_play(self, params, conn):
-        """audio.play: queue one PCM16 mono item of 30 s or less."""
+        """audio.play: queue one PCM16 mono item of 30 s or less; refused while push-to-talk is down."""
         rate = params.get("rate", 24000)
         if not PLAY_RATES[0] <= rate <= PLAY_RATES[1]:
             raise RpcError(dogproto.INVALID_PARAMS, f"rate must be {PLAY_RATES[0]}..{PLAY_RATES[1]}")
@@ -404,6 +407,8 @@ class Mediad:
             raise RpcError(dogproto.INVALID_PARAMS, f"an item must be {MAX_PLAY_S} s or less")
         if self._queue.qsize() >= PLAY_QUEUE_MAX:
             raise RpcError(dogproto.BUSY, "play queue full")
+        if self._recording is not None and not self._recording.done():
+            raise RpcError(dogproto.BUSY, "push-to-talk in progress")  # never play into the microphone
         self._queue.put_nowait((pcm, rate))
         return {"queued": self._queue.qsize()}
 
@@ -448,6 +453,7 @@ pre{white-space:pre-wrap;font-size:.9rem}
 <pre id="reply"></pre>
 <script>
 const $ = id => document.getElementById(id);
+if (location.search) history.replaceState(null, '', '/');
 async function post(path, body) {
   $('reply').textContent = path + ' ...';
   try {
@@ -528,7 +534,7 @@ class Console:
     """The LAN console: one page, the snapshot, the state, and arm, disarm, stop and trick buttons.
 
     Every endpoint needs the console token: a Bearer header, or the HttpOnly
-    SameSite=Strict cookie that GET /?token=... sets. A POST with an Origin header
+    SameSite=Strict cookie that GET /?token=... sets with the page. A POST with an Origin header
     from another site is refused. The console calls robotd like any local client.
     """
 
@@ -537,9 +543,11 @@ class Console:
         self._token = token.encode()
 
     def _token_ok(self, candidate):
+        """Return True when candidate is the console token; constant time."""
         return hmac.compare_digest(candidate.encode(), self._token)
 
     def _authorized(self, headers):
+        """Return True when the request has the token in a Bearer header or the cookie."""
         auth = headers.get("authorization", "")
         if auth.startswith("Bearer ") and self._token_ok(auth[len("Bearer "):]):
             return True
@@ -572,8 +580,10 @@ class Console:
         if method == "GET" and path == "/" and "token" in query:
             if not self._token_ok(query["token"][0]):
                 return http_response(401, "text/plain", b"wrong console token\n")
+            # The page itself, not a redirect: a browser does not send a Strict cookie on a
+            # redirect that another app started. The page removes the token from the address bar.
             cookie = f"Set-Cookie: {CONSOLE_COOKIE}={self._token.decode()}; HttpOnly; SameSite=Strict; Path=/"
-            return http_response(303, "text/plain", b"", ("Location: /", cookie))
+            return http_response(200, "text/html; charset=utf-8", CONSOLE_PAGE, (cookie,))
         if not self._authorized(headers):
             return http_response(401, "text/plain", b"open /?token=<console token> first\n")
         if method == "POST":

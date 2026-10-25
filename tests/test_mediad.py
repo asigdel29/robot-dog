@@ -84,6 +84,7 @@ class MediaStack(unittest.TestCase):
         cls.stack.stop()
 
     def media(self, method, params=None, cloud=False):
+        """Make one request to mediad of this stack."""
         return self.stack.call(method, params, cloud=cloud, service="mediad")
 
     # ---- snapshot
@@ -189,6 +190,27 @@ class MediaStack(unittest.TestCase):
         self.assertEqual(self.media("audio.stop", cloud=True), {})
         self.stack.wait_for(lambda: self.stack.audio_log()[-1][1] == "cut", "cut after audio.stop", timeout=1)
 
+    def test_play_refused_while_ptt_down(self):
+        quarter_s = base64.b64encode(bytes(int(0.25 * 24000) * 2)).decode()
+
+        async def scenario():
+            pad = await dogproto.Client.connect(self.stack.sock("mediad"))
+            cloud = await dogproto.Client.connect(self.stack.sock("mediad", cloud=True))
+            try:
+                await pad.call("audio.ptt", {"down": True})
+                with self.assertRaises(dogproto.RpcError) as ctx:
+                    await cloud.call("audio.play", {"pcm16_b64": quarter_s})
+                await pad.call("audio.ptt", {"down": False})
+                await asyncio.sleep(0.1)
+                await cloud.call("audio.play", {"pcm16_b64": quarter_s})
+                return ctx.exception.code
+            finally:
+                await pad.close()
+                await cloud.close()
+
+        self.assertEqual(asyncio.run(scenario()), dogproto.BUSY)
+        self.stack.wait_for(lambda: self.stack.audio_log()[-1][1] == "end", "play after the press", timeout=2)
+
     def test_cloud_socket_refuses_ptt(self):
         with self.assertRaises(dogproto.RpcError) as ctx:
             self.media("audio.ptt", {"down": True}, cloud=True)
@@ -209,7 +231,7 @@ class MediaStack(unittest.TestCase):
     def cookie(self):
         """Log in with the token and return the Cookie header value."""
         status, headers, _ = self.request("GET", "/?token=" + self.stack.console_token)
-        self.assertEqual(status, 303)
+        self.assertEqual(status, 200)
         return headers["Set-Cookie"].split(";")[0]
 
     def test_console_needs_token(self):
@@ -221,8 +243,9 @@ class MediaStack(unittest.TestCase):
         self.assertEqual(self.request("GET", "/state", {"Cookie": "dog_console=wrong"})[0], 401)
 
     def test_console_cookie_flow(self):
-        status, headers, _ = self.request("GET", "/?token=" + self.stack.console_token)
-        self.assertEqual((status, headers["Location"]), (303, "/"))
+        status, headers, body = self.request("GET", "/?token=" + self.stack.console_token)
+        self.assertEqual(status, 200)
+        self.assertIn(b"STOP", body)
         set_cookie = headers["Set-Cookie"]
         self.assertIn("HttpOnly", set_cookie)
         self.assertIn("SameSite=Strict", set_cookie)

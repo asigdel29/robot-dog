@@ -113,12 +113,14 @@ class Stack:
         self.wait_for(lambda: self._state("vision_age_ms") is not None, "camera poses at robotd")
 
     def _state(self, field):
+        """Return one field of robot.state, or None while robotd does not answer."""
         try:
             return self.call("robot.state")[field]
         except (OSError, dogproto.RpcError, TimeoutError):
             return None
 
     def _state_esp(self):
+        """Return the bridge state that robotd reports, or None."""
         return self._state("esp")
 
     def wait_for(self, predicate, what, timeout=10.0):
