@@ -1,0 +1,24 @@
+# CI gate: unit, conformance (fake bridge) and end-to-end tests of the dog stack, and the firmware build.
+name: test
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor; 3.13 is the Python of Raspberry Pi OS (Debian 13 Trixie) on the Pi.
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test packages
+        run: python -m pip install -r requirements-dev.txt
+      - name: Unit, conformance and end-to-end tests
+        run: python -m unittest discover -v -s tests
