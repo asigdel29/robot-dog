@@ -64,7 +64,9 @@ MOTION_PER_MIN = 30
 SAY_MAX_CHARS = 300
 NOT_ARMED = -32001
 BUSY = -32002
+STOP_RE = re.compile(r"^\W*(stop|halt|freeze|no)\b", re.IGNORECASE)
 SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
+RUN_FAILED_EVENTS = ("run.failed", "run.cancelled", "run.interrupted")
 TTS_RATE = 24000
 #: 10 s of 24 kHz PCM16 per audio.play: well under the 2 MiB frame limit after base64.
 PLAY_CHUNK_BYTES = TTS_RATE * 2 * 10
@@ -265,12 +267,14 @@ class Voice:
         self._turn = None
         #: The create request of the Hermes run of the current turn, until the run ends.
         self._create = None
+        self._stops = set()
 
     def start(self, params):
         """Start a turn for one utterance; a new utterance ends the old turn."""
         if not _utterance_ok(params):
             log.warning("bad voice.utterance dropped")
             return
+        self.cancel("new utterance")
         self._turn = asyncio.ensure_future(self._run_turn(params))
 
     def cancel(self, reason):
@@ -279,7 +283,26 @@ class Voice:
         if self._turn is None or self._turn.done():
             return
         log.info("voice turn cancelled: %s", reason)
+        if self._create is not None:
+            self._stop_later(self._create)
+            self._create = None  # the turn's own cleanup must not send a second stop
         self._turn.cancel()
+
+    def _stop_later(self, create):
+        """Start a stop of the run that create makes, and keep a reference to the task."""
+        task = asyncio.ensure_future(self._stop_run(create))
+        self._stops.add(task)
+        task.add_done_callback(self._stops.discard)
+
+    async def _stop_run(self, create):
+        """Stop a Hermes run as soon as its create request gives the run id; Hermes stops it at a safe point."""
+        try:
+            run_id = await create
+            reply = await http.post(f"{HERMES_URL}/v1/runs/{run_id}/stop", headers=HERMES_AUTH)
+            reply.raise_for_status()
+            log.info("Hermes run %s stopped", run_id)
+        except Exception as exc:
+            log.warning("stop of a Hermes run failed: %r", exc)
 
     async def _run_turn(self, params):
         """Run one turn and log the time of each stage for the latency budget."""
@@ -294,6 +317,12 @@ class Voice:
             log.info("voice %s: %d characters heard", utt_id, len(text))
             if not text:
                 return
+            if STOP_RE.match(text):  # a stop must not wait for the model
+                try:
+                    await device.call("robot.stop", timeout=5)
+                    log.info("voice stop phrase: robot.stop sent")
+                except DeviceError as exc:
+                    log.warning("voice stop phrase: %s", exc)
             sentences = asyncio.Queue()
             async with asyncio.TaskGroup() as group:
                 group.create_task(self._speak(sentences, marks))
@@ -318,8 +347,10 @@ class Voice:
         """Run Hermes on the text and put each whole sentence of the reply in sentences."""
         create = asyncio.ensure_future(self._create_run(utt_id, text))
         self._create = create
-        pending, last = "", ""
+        # last: the final character of the reply so far; gap: a non-delta event came after it.
+        pending, last, gap, ended = "", "", False, False
         try:
+            # The shield keeps the create request alive when the turn is cancelled, so cancel() can stop the run.
             run_id = await asyncio.shield(create)
             async with http.stream("GET", f"{HERMES_URL}/v1/runs/{run_id}/events", headers=HERMES_AUTH) as events:
                 events.raise_for_status()
@@ -339,20 +370,33 @@ class Voice:
                         delta = event.get("delta")
                         if not isinstance(delta, str) or not delta:
                             continue  # an empty delta must not end the gap of a tool call
+                        # Text before and after a tool call must not fuse into one word.
+                        if gap and last and not last.isspace() and not delta[0].isspace():
+                            delta = " " + delta
+                        gap = False
                         last = delta[-1]
                         *whole, pending = SENTENCE_END_RE.split(pending + delta)
                         for sentence in whole:
                             sentences.put_nowait(sentence)
                     elif name == "run.completed":
+                        ended = True
                         output = event.get("output")
                         if not last and isinstance(output, str):
                             pending = output
                         break
+                    elif name in RUN_FAILED_EVENTS:
+                        ended = True
+                        log.warning("Hermes run %s ended: %s %s", run_id, name, event.get("error", ""))
+                        break
+                    else:
+                        gap = True
             if pending.strip():
                 sentences.put_nowait(pending)
         finally:
             if self._create is create:
                 self._create = None
+                if not ended:  # the turn failed or the stream broke: do not leave the run going
+                    self._stop_later(create)
 
     async def _speak(self, sentences, marks):
         """Speak each queued sentence on the dog in order, until None arrives or the TTS cap is reached."""
@@ -527,6 +571,8 @@ async def device_link(ws):
                 device.on_reply(ws, msg)
             elif ws is device.ws and method == "voice.utterance":
                 voice.start(msg.get("params"))
+            elif ws is device.ws and method == "voice.cancel":
+                voice.cancel("barge-in")
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
