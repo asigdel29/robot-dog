@@ -362,11 +362,12 @@ def health_gate():
 
 def restore(old, old_previous):
     """Undo a release change: make the old release current again, or leave none current after a first install."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)  # a SIGTERM must not stop a rollback halfway
     if old is None:
         point("current", None)
         with contextlib.suppress(UpdateError):
-            quiet(["systemctl", "stop", "dog.target"])
-        return "no release is current and dog.target is stopped; correct the fault and apply again"
+            quiet(["systemctl", "disable", "--now", "dog.target"])
+        return "no release is current and dog.target is disabled; correct the fault and apply again"
     point("current", old)
     point("previous", old_previous)
     with contextlib.suppress(UpdateError):
@@ -385,13 +386,9 @@ def activate(version):
             point("previous", old)
         hook(version, "postinstall")
         quiet(["systemctl", "restart", "dog.target"])
-        health = health_gate()
-    except UpdateError as err:
-        raise UpdateError(f"{version}: {err}; {restore(old, old_previous)}") from None
-    except BaseException:
-        restore(old, old_previous)
-        raise
-    return {"current": version, "previous": old, "health": health}
+        return {"current": version, "previous": old, "health": health_gate()}
+    except BaseException as err:  # also a SIGTERM (on_sigterm) and an OSError
+        raise UpdateError(f"{version}: {str(err) or type(err).__name__}; {restore(old, old_previous)}") from None
 
 
 def prune():
@@ -444,9 +441,9 @@ def update_lock():
 
 
 def on_sigterm(signum, frame):
-    """Turn the first SIGTERM into SystemExit, so that activate() undoes the release change; ignore later ones."""
+    """Turn the first SIGTERM into an UpdateError, so that the update stops with a rollback; ignore later ones."""
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    raise SystemExit(128 + signum)
+    raise UpdateError("stopped by SIGTERM")
 
 
 def in_own_unit(argv):

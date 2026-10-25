@@ -58,7 +58,9 @@ env = {{"PATH": os.path.dirname(os.path.abspath(__file__)) + ":/usr/bin:/bin", "
 env.update(a[len("--setenv="):].split("=", 1) for a in args[:sep] if a.startswith("--setenv="))
 os.execve(args[sep + 1], args[sep + 1:], env)
 '''
-HOOK = '#!/bin/sh\necho "{name} {version}" >> "$DOG_ROOT/hook.log"\n'
+#: A stub hook. It sends SIGTERM to robotctl when the file term-<name>-<version> exists.
+HOOK = ('#!/bin/sh\necho "{name} {version}" >> "$DOG_ROOT/hook.log"\n'
+        '[ ! -e "$DOG_ROOT/term-{name}-{version}" ] || kill -TERM $PPID\n')
 
 
 class FakeRobotd(threading.Thread):
@@ -283,6 +285,17 @@ class UpdateTests(unittest.TestCase):
         self.assertIn("systemctl failed", proc.stderr)
         self.assertEqual((self.link("current"), self.releases()), ("ok-1", ["ok-1"]))
 
+    def test_sigterm_rolls_back(self):
+        self.assertEqual(self.apply("ok-1").returncode, 0)
+        for name in ("term-postinstall-ok-2", "term-postinstall-ok-1"):  # SIGTERM in the update and in each rollback
+            open(os.path.join(self.root, name), "w").close()
+        for version, reason in (("ok-2", "stopped by SIGTERM"), ("fault-3", "health fault")):
+            proc = self.apply(version)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn(f"{version}: {reason}; rolled back to ok-1", proc.stderr)
+        self.assertEqual((self.link("current"), self.releases()), ("ok-1", ["ok-1"]))
+        self.assertEqual(self.restarts(), 4)  # each rollback ran to its end
+
     def test_failed_preinstall_changes_nothing(self):
         self.assertEqual(self.apply("ok-1").returncode, 0)
         proc = self.apply("ok-2", failing_hook="preinstall")
@@ -297,7 +310,7 @@ class UpdateTests(unittest.TestCase):
             self.assertIn("no release is current", proc.stderr)
             self.assertIsNone(self.link("current"))
             self.assertEqual(self.releases(), [])
-        self.assertIn("systemctl stop dog.target", self.lines(self.shim_log))
+        self.assertIn("systemctl disable --now dog.target", self.lines(self.shim_log))
         self.assertEqual(self.apply("ok-1").returncode, 0)
         self.assertEqual(self.link("current"), "ok-1")
 
