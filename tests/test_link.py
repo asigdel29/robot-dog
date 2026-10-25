@@ -43,7 +43,7 @@ DEVICE_TOKEN = "device-secret"
 TOOLS_TOKEN = "tools-secret"
 HERMES_KEY = "hermes-secret"
 OPENAI_KEY = "openai-secret"
-TOOL_NAMES = {"get_state", "look"}
+TOOL_NAMES = {"get_state", "do_trick", "drive", "go_to_marker", "look", "stop"}
 FAKE_JPEG = b"\xff\xd8\xff\xe0fake jpeg\xff\xd9"
 
 
@@ -64,6 +64,16 @@ def answers(url):
         return http_json(url)[0] == 200
     except OSError:
         return False
+
+
+async def feed_pose(stack, halt):
+    """Send robot.observe each 100 ms until halt, as mediad does: the toy at the center, goal marker 2 in a corner."""
+    client = await dogproto.Client.connect(stack.sock("robotd"))
+    while not halt.is_set():
+        client.notify("robot.observe", {"t_mono_ns": time.monotonic_ns(),
+                                        "markers": {"1": [320, 240, 0.0], "2": [600, 440, 0.0]}})
+        await asyncio.sleep(0.1)
+    await client.close()
 
 
 class StubMediad(threading.Thread):
@@ -207,7 +217,7 @@ class Tools(LinkTestCase):
     """The robot tools over the Model Context Protocol, through the hub and linkd to robotd."""
 
     def test_tool_list_and_tokens(self):
-        """Two tools, two read-only; /tools needs TOOLS_TOKEN, /device needs DEVICE_TOKEN and a text hello."""
+        """Six tools, two read-only; /tools needs TOOLS_TOKEN, /device needs DEVICE_TOKEN and a text hello."""
         listed = self.stack.tools(lambda client: client.list_tools())
         self.assertEqual({tool.name for tool in listed.tools}, TOOL_NAMES)
         read_only = {t.name for t in listed.tools if t.annotations and t.annotations.read_only_hint}
@@ -225,6 +235,18 @@ class Tools(LinkTestCase):
                 conn.recv(timeout=5)
         self.assertEqual(closed.exception.rcvd.code, 1008, "a binary hello is refused, not an internal error")
 
+    def test_drive_needs_local_arm(self):
+        """drive gets NOT_ARMED until a local arm; then the bridge gets a hold."""
+        error, text = self.stack.tool("drive", {"direction": "forward", "ms": 300})
+        self.assertTrue(error)
+        self.assertIn("Start", text)
+        self.assertEqual(self.stack.ops("hold"), [])
+        self.arm()
+        error, text = self.stack.tool("drive", {"direction": "forward", "ms": 300})
+        self.assertFalse(error, text)
+        self.assertTrue(json.loads(text)["transmitted"])
+        self.assertTrue(self.stack.wait_ops("hold", 1))
+
     def test_state_look_say_stop(self):
         """get_state, look, say (and its length limit) and stop."""
         state = json.loads(self.stack.tool("get_state")[1])
@@ -234,6 +256,54 @@ class Tools(LinkTestCase):
         result = self.stack.tools(lambda client: client.call_tool("look", {}))
         self.assertEqual(result.content[0].mime_type, "image/jpeg")
         self.assertEqual(base64.b64decode(result.content[0].data), FAKE_JPEG)
+        error, text = self.stack.tool("stop")
+        self.assertFalse(error, text)
+        self.assertTrue(json.loads(text)["stop_transmitted"])
+
+    def test_motion_rate_limit(self):
+        """The 31st motion call in a minute gets the rate limit error; refused calls count too."""
+        async def calls(client):
+            """Make 31 drive calls and return the text of each result."""
+            results = []
+            for _ in range(31):
+                result = await client.call_tool("drive", {"direction": "forward", "ms": 300})
+                results.append(" ".join(block.text for block in result.content))
+            return results
+
+        texts = self.stack.tools(calls)
+        self.assertTrue(all("Start" in text for text in texts[:30]), texts[:30])
+        self.assertIn("rate limit", texts[30])
+
+    def test_device_offline(self):
+        """Without linkd, get_state says the link is down and a motion tool says the dog is offline."""
+        self.stack.kill("linkd")
+        self.stack.wait_for(lambda: "link down" in self.stack.out("hub"), "hub sees the link down")
+        self.assertEqual(json.loads(self.stack.tool("get_state")[1]), {"link": "down"})
+        error, text = self.stack.tool("do_trick", {"name": "bark"})
+        self.assertTrue(error)
+        self.assertIn("offline", text)
+
+    def test_hub_loss_disarms_and_cancels_goto(self):
+        """Hub killed during a goto: linkd disarms robotd and the goto ends; no hold follows."""
+        self.arm()
+        halt = threading.Event()
+        feeder = threading.Thread(target=asyncio.run, args=(feed_pose(self.stack, halt),), daemon=True)
+        feeder.start()
+        self.addCleanup(feeder.join)
+        self.addCleanup(halt.set)
+        time.sleep(0.3)
+        goto = threading.Thread(target=self._quiet_tool, args=("go_to_marker", {"marker_id": 2}), daemon=True)
+        goto.start()
+        self.stack.wait_ops("hold", 1, timeout=5)
+        killed = time.monotonic()
+        self.stack.kill("hub")
+        self.stack.wait_for(lambda: not self.stack.armed(), "disarm after hub loss")
+        print(f"\nhub loss to disarm: {(time.monotonic() - killed) * 1000:.0f} ms")
+        self.assertIsNone(self.stack.call("robot.state")["busy"])
+        quiet_from = time.monotonic_ns() + 400_000_000  # one hold lease after the disarm
+        time.sleep(1.0)
+        self.assertEqual(self.stack.ops("hold", since_ns=quiet_from), [])
+        goto.join(10)
 
     def test_silent_hub_disarms(self):
         """A frozen hub (SIGSTOP) answers no ping: linkd drops the link and disarms in about 11 s."""
@@ -246,6 +316,13 @@ class Tools(LinkTestCase):
         took = time.monotonic() - frozen
         print(f"\nsilent hub to disarm: {took:.1f} s")
         self.assertLess(took, 12.5)
+
+    def _quiet_tool(self, name, arguments):
+        """Call a tool in a thread whose hub dies during the call."""
+        try:
+            self.stack.tool(name, arguments)
+        except Exception:
+            pass
 
 
 class FakeHub:
