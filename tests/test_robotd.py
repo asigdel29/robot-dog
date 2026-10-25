@@ -333,6 +333,17 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
         daemon.tick(1)
         self.assertNotIn("hold forward", daemon.link.names()[disarmed_at:])
 
+    async def test_duplicate_hello_reply_keeps_the_link(self):
+        """A repeated hello can get two replies with our sid; only another sid means a board reset."""
+        daemon = self.make()
+        daemon._sid = 1234
+        daemon._on_esp({"ev": "hello", "sid": 1234, "boot": 1, "fw": "x", "state": "DISARMED"})
+        self.assertTrue(daemon.link_up)
+        self.assertTrue(daemon.armed)
+        daemon._on_esp({"ev": "hello", "sid": 0, "boot": 2, "fw": "x", "state": "DISARMED"})
+        self.assertFalse(daemon.link_up)
+        self.assertFalse(daemon.armed)
+
     async def test_cloud_drive_needs_cloud_flag(self):
         daemon = self.make(registry=demo(forward={"cloud": False}))
         with self.assertRaises(dogproto.RpcError) as ctx:
