@@ -186,7 +186,6 @@ def map_drive(direction, name, registry_path):
 HEALTH_WAIT_S = 30
 #: robotd must stay healthy with one PID for this long before a commit. It is longer than WatchdogSec=2.
 SETTLE_S = 10
-HEALTH_POLL_S = 1.0
 HOOK_TIMEOUT_S = 300
 PIP_TIMEOUT_S = 900
 #: The only environment values that go into the dog-update unit. Tokens never do.
@@ -246,8 +245,6 @@ def quiet(cmd, timeout=HOOK_TIMEOUT_S, **kwargs):
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout,
                               **kwargs)
-    except OSError as err:  # an absent or non-executable hook must also lead to a rollback
-        raise UpdateError(f"cannot run {cmd[0]}: {err}") from None
     except subprocess.TimeoutExpired:
         raise UpdateError(f"{name} did not finish in {timeout} s") from None
     if proc.returncode != 0:
@@ -257,16 +254,14 @@ def quiet(cmd, timeout=HOOK_TIMEOUT_S, **kwargs):
 
 def check_sha256(tarball):
     """Compare the tarball with the digest in its sibling .sha256 file; raise InputError on a mismatch."""
-    digest = hashlib.sha256()
     try:
         with open(f"{tarball}.sha256") as handle:
             expected = handle.read().split()[0].lower()
         with open(tarball, "rb") as handle:
-            for block in iter(lambda: handle.read(1 << 20), b""):
-                digest.update(block)
+            actual = hashlib.file_digest(handle, "sha256").hexdigest()
     except (OSError, IndexError) as err:
         raise InputError(f"cannot read the release or its .sha256 file: {err}") from None
-    if digest.hexdigest() != expected:
+    if actual != expected:
         raise InputError(f"sha256 mismatch for {tarball}; the file is damaged or incomplete")
 
 
@@ -281,7 +276,7 @@ def extract(tarball):
                 parts = member.name.split("/")
                 if not (member.isfile() or member.isdir()) or member.name.startswith("/") or ".." in parts:
                     raise InputError(f"unsafe tar member {member.name}")
-            tar.extractall(staging, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
+            tar.extractall(staging, filter="data")
         with open(os.path.join(staging, "VERSION")) as handle:
             version = handle.read().strip()
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", version):
@@ -356,7 +351,7 @@ def health_gate():
                 return health
         elif since is not None:
             raise UpdateError("robotd stopped answering")
-        time.sleep(max(0.0, min(HEALTH_POLL_S, deadline - time.monotonic())))
+        time.sleep(max(0.0, min(1.0, deadline - time.monotonic())))
     raise UpdateError("no stable health" if since is not None else "no answer")
 
 
@@ -365,14 +360,14 @@ def restore(old, old_previous):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)  # a SIGTERM must not stop a rollback halfway
     if old is None:
         point("current", None)
-        with contextlib.suppress(UpdateError):
+        with contextlib.suppress(UpdateError, OSError):
             quiet(["systemctl", "disable", "--now", "dog.target"])
         return "no release is current and dog.target is disabled; correct the fault and apply again"
     point("current", old)
     point("previous", old_previous)
-    with contextlib.suppress(UpdateError):
+    with contextlib.suppress(UpdateError, OSError):
         hook(old, "postinstall")
-    with contextlib.suppress(UpdateError):
+    with contextlib.suppress(UpdateError, OSError):
         quiet(["systemctl", "restart", "dog.target"])
     return f"rolled back to {old}"
 
@@ -503,7 +498,7 @@ def run_update(args):
         return EXIT_OK
     if not os.environ.get("INVOCATION_ID"):
         tail = [os.path.abspath(args.tarball)] if args.update == "apply" else []
-        return in_own_unit(["--config", args.config, "update", args.update, *tail])
+        return in_own_unit(["update", args.update, *tail])
     signal.signal(signal.SIGTERM, on_sigterm)
     try:
         with update_lock():

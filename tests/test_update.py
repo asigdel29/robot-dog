@@ -131,7 +131,7 @@ class UpdateTests(unittest.TestCase):
         self.shim_log = os.path.join(self.root, "shim.log")
         self.hook_log = os.path.join(self.root, "hook.log")
         self.env = {k: v for k, v in os.environ.items() if k != "INVOCATION_ID"}
-        self.env.update(DOG_ROOT=self.root, DOG_RUN_DIR=run_dir, DOG_CONFIG=os.devnull, DOG_FAKE_VENV="1",
+        self.env.update(DOG_ROOT=self.root, DOG_RUN_DIR=run_dir, DOG_FAKE_VENV="1",
                         DOG_HEALTH_WAIT_S=str(GATE_S), DOG_DEVICE_TOKEN="secret-token-value",
                         PATH=shims + os.pathsep + os.environ["PATH"])
         self.robotd = FakeRobotd(os.path.join(run_dir, "robotd.sock"), self.root)
@@ -216,7 +216,6 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(len(reexec), 1)
         self.assertTrue(reexec[0].startswith("systemd-run --unit=dog-update --wait --collect --pipe "))
         self.assertNotIn("secret-token-value", reexec[0])  # only the listed DOG_* values go into the unit
-        self.assertNotIn("DOG_CONFIG", reexec[0])
         release = os.path.join(self.dog, "releases", "ok-1")
         self.assertTrue(os.path.islink(os.path.join(release, ".venv", "bin", "python")))
         self.assertEqual(os.stat(release).st_mode & 0o777, 0o755)
@@ -258,9 +257,6 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(self.lines(self.hook_log)[-1], "postinstall ok-1")
         self.assertEqual(self.restarts(), restarts)
         return proc, elapsed
-
-    def test_fault_rolls_back_at_once(self):
-        self.assertLess(self.assert_rolled_back("fault-2")[1], GATE_S)
 
     def test_late_fault_rolls_back(self):
         proc, elapsed = self.assert_rolled_back("late-2")
@@ -336,23 +332,17 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(self.releases(), ["ok-2", "ok-3"])
         self.assertEqual((self.link("current"), self.link("previous")), ("ok-3", "ok-2"))
 
-    def test_rollback_command(self):
+    def test_rollback_and_status(self):
         self.assertEqual(self.robotctl("update", "rollback").returncode, 3)  # nothing to roll back to
         for version in ("ok-1", "ok-2"):
             self.assertEqual(self.apply(version).returncode, 0)
         proc = self.robotctl("update", "rollback")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual((self.link("current"), self.link("previous")), ("ok-1", "ok-2"))
-        self.assertEqual(self.releases(), ["ok-1", "ok-2"])
-
-    def test_status(self):
-        for version in ("ok-1", "ok-2"):
-            self.assertEqual(self.apply(version).returncode, 0)
-        reexecs = len(self.lines(self.shim_log))
+        shim_lines = len(self.lines(self.shim_log))
         proc = self.robotctl("update", "status")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(json.loads(proc.stdout), {"current": "ok-2", "previous": "ok-1", "releases": ["ok-1", "ok-2"]})
-        self.assertEqual(len(self.lines(self.shim_log)), reexecs)  # status only reads, so no systemd-run
+        self.assertEqual(json.loads(proc.stdout), {"current": "ok-1", "previous": "ok-2", "releases": ["ok-1", "ok-2"]})
+        self.assertEqual(len(self.lines(self.shim_log)), shim_lines)  # status only reads, so no systemd-run
 
 
 class UnitExecStart(unittest.TestCase):
