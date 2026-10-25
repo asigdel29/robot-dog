@@ -217,7 +217,10 @@ def point(name, version):
 
 def quiet(cmd, **kwargs):
     """Run a command with captured output, so a lost terminal cannot break it; raise UpdateError on failure."""
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **kwargs)
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **kwargs)
+    except OSError as err:  # an absent or non-executable hook must also lead to a rollback
+        raise UpdateError(f"cannot run {cmd[0]}: {err}") from None
     if proc.returncode != 0:
         say(proc.stdout[-2000:])
         raise UpdateError(f"{os.path.basename(cmd[0])} failed with exit code {proc.returncode}")
@@ -256,6 +259,8 @@ def extract(tarball):
             raise InputError(f"bad VERSION {version!r}")
         if version == link_version("current"):
             raise InputError(f"{version} is already the current release")
+        if version == link_version("previous"):
+            raise InputError(f"{version} is the previous release; use robotctl update rollback")
         os.chmod(staging, 0o755)  # mkdtemp makes it 0700; the dog users must read the release
         target = os.path.join(releases, version)
         shutil.rmtree(target, ignore_errors=True)
@@ -413,23 +418,37 @@ def build_parser():
     return parser
 
 
-def run(argv):
-    """Run one command and return its exit code."""
-    args = build_parser().parse_args(argv)
-    cfg = robotd.load_config(args.config)
-    registry_path = cfg.get("registry", "/etc/dog/registry.json")
-    captures_dir = cfg.get("captures", "/var/lib/dog/captures")
-    if args.cmd == "update" and args.update != "status" and not os.environ.get("INVOCATION_ID"):
+def run_update(args):
+    """Run one update command and return its exit code; apply and rollback move into their own unit first."""
+    if args.update != "status" and not os.environ.get("INVOCATION_ID"):
         tail = [os.path.abspath(args.tarball)] if args.update == "apply" else []
         return in_own_unit(["--config", args.config, "update", args.update, *tail])
     try:
-        if args.cmd == "update" and args.update == "apply":
+        if args.update == "apply":
             out(update_apply(args.tarball))
-        elif args.cmd == "update" and args.update == "rollback":
+        elif args.update == "rollback":
             out(update_rollback())
-        elif args.cmd == "update":
+        else:
             out(update_status())
-        elif args.cmd in ("state", "enable", "disarm", "stop"):
+    except InputError as err:
+        say(str(err))
+        return EXIT_INPUT
+    except (UpdateError, OSError) as err:
+        say(f"update did not commit: {err}")
+        return EXIT_REFUSED
+    return EXIT_OK
+
+
+def run(argv):
+    """Run one command and return its exit code."""
+    args = build_parser().parse_args(argv)
+    if args.cmd == "update":
+        return run_update(args)
+    cfg = robotd.load_config(args.config)
+    registry_path = cfg.get("registry", "/etc/dog/registry.json")
+    captures_dir = cfg.get("captures", "/var/lib/dog/captures")
+    try:
+        if args.cmd in ("state", "enable", "disarm", "stop"):
             out(rpc(f"robot.{args.cmd}"))
         elif args.cmd == "do":
             out(rpc("robot.do", {"trick": args.trick, "id": uuid.uuid4().hex}, 30))
@@ -451,9 +470,6 @@ def run(argv):
             out(map_drive(args.dir, args.name, registry_path))
     except dogproto.RpcError as err:
         print(f"refused ({err.code}): {err.message}", file=sys.stderr)
-        return EXIT_REFUSED
-    except UpdateError as err:
-        say(f"update did not commit: {err}")
         return EXIT_REFUSED
     except InputError as err:
         print(str(err), file=sys.stderr)

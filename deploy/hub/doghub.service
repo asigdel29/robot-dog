@@ -12,7 +12,9 @@ StartLimitIntervalSec=0
 User=doghub
 Group=doghub
 EnvironmentFile=/etc/doghub/hub.env
-ExecStart=/opt/doghub/.venv/bin/python -m uvicorn hub.hub:app --app-dir /opt/doghub --host 127.0.0.1 --port 8000
+WorkingDirectory=/opt/doghub
+# hub.py always binds 127.0.0.1. It exits when DEVICE_TOKEN, TOOLS_TOKEN, HERMES_API_KEY or OPENAI_API_KEY is empty.
+ExecStart=/opt/doghub/.venv/bin/python /opt/doghub/hub/hub.py --port 8000
 Restart=always
 RestartSec=1
 StateDirectory=doghub

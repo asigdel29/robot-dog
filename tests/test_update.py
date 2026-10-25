@@ -104,13 +104,13 @@ class UpdateTests(unittest.TestCase):
         self.robotd.stop()
         self.tmp.cleanup()
 
-    def release(self, version, digest_ok=True, preinstall_ok=True):
+    def release(self, version, digest_ok=True, failing_hook=None):
         """Write dog-<version>.tar.gz with stub hooks and its .sha256 file; return the tarball path."""
         tarball = os.path.join(self.tmp.name, f"dog-{version}.tar.gz")
         members = {"VERSION": (version + "\n", 0o644), "pi/robotd.py": ("", 0o644)}
         for name in ("preinstall", "postinstall"):
             text = HOOK.format(name=name, version=version)
-            members[f"hooks/{name}"] = (text + ("exit 1\n" if name == "preinstall" and not preinstall_ok else ""), 0o755)
+            members[f"hooks/{name}"] = (text + ("exit 1\n" if name == failing_hook else ""), 0o755)
         with tarfile.open(tarball, "w:gz") as tar:
             for name, (text, mode) in members.items():
                 data = text.encode()
@@ -201,10 +201,25 @@ class UpdateTests(unittest.TestCase):
 
     def test_failed_preinstall_changes_nothing(self):
         self.assertEqual(self.apply("ok-1").returncode, 0)
-        proc = self.apply("ok-2", preinstall_ok=False)
+        proc = self.apply("ok-2", failing_hook="preinstall")
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(self.link("current"), "ok-1")
         self.assertEqual(self.releases(), ["ok-1"])
+
+    def test_failed_postinstall_rolls_back(self):
+        self.assertEqual(self.apply("ok-1").returncode, 0)
+        proc = self.apply("ok-2", failing_hook="postinstall")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("rolled back to ok-1", proc.stderr)
+        self.assertEqual((self.link("current"), self.releases()), ("ok-1", ["ok-1"]))
+
+    def test_previous_version_is_refused(self):
+        for version in ("ok-1", "ok-2"):
+            self.assertEqual(self.apply(version).returncode, 0)
+        proc = self.apply("ok-1")
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("update rollback", proc.stderr)
+        self.assertEqual(self.releases(), ["ok-1", "ok-2"])
 
     def test_prune_keeps_one_previous(self):
         for version in ("ok-1", "ok-2", "ok-3"):

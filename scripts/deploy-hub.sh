@@ -122,17 +122,24 @@ EOF
 	printf '[Service]\nEnvironment=DOG_DOMAIN=%s\n' "$domain" >/etc/systemd/system/caddy.service.d/dog.conf
 	systemctl daemon-reload
 	systemctl enable doghub.service caddy.service
-	systemctl restart doghub.service caddy.service
+	systemctl restart caddy.service
+	# The hub exits when OPENAI_API_KEY is empty, so it starts only after the owner adds the key.
+	if [[ -n $(env_value OPENAI_API_KEY "$hubenv") ]]; then
+		systemctl restart doghub.service
+	else
+		echo "doghub.service is enabled but not started: OPENAI_API_KEY in $hubenv is empty"
+	fi
 
+	rm -rf "$src"
 	cat <<EOF
 
 Provisioning is complete. Do the manual steps in docs/runbook.md, section "Droplet bring-up":
   1. Put OPENROUTER_API_KEY, VOICE_TOOLS_OPENAI_KEY and TELEGRAM_BOT_TOKEN (from BotFather) in $hh/.env.
-  2. Put OPENAI_API_KEY in $hubenv, then run: systemctl restart doghub
+  2. Put OPENAI_API_KEY in $hubenv, then run: sudo systemctl restart doghub
   3. Put the vision model id in $hh/config.yaml (model.default).
   4. Run: sudo -iu hermes systemctl --user restart hermes-gateway
   5. Send a DM to the bot. Then run: sudo -iu hermes hermes pairing approve telegram <code>
-  6. Copy DEVICE_TOKEN from $hubenv into /etc/dog/link.env on the Pi.
+  6. Copy DEVICE_TOKEN from $hubenv into DOG_DEVICE_TOKEN in /etc/dog/link.env on the Pi.
 EOF
 }
 
