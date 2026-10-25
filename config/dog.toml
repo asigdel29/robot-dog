@@ -9,3 +9,6 @@ captures = "/var/lib/dog/captures"
 [mediad]
 # Persistent path of the camera, from `ls /dev/v4l/by-id/` (use the -video-index0 entry).
 camera = "/dev/v4l/by-id/REPLACE_WITH_C270-video-index0"
+# ALSA devices from `aplay -L` and `arecord -L`, for example "plughw:CARD=Device,DEV=0".
+speaker = "default"
+mic = "default"
