@@ -1,9 +1,8 @@
 """Tests of `robotctl update` (digest, health gate, rollback, prune, status) and of the unit ExecStart lines.
 
-Each update test uses a temp DOG_ROOT, PATH shims for systemctl and systemd-run, and a
-fake robotd on a temp DOG_RUN_DIR. The systemd-run shim passes only the --setenv values,
-like a transient unit. The fake answers robot.state with a health value that comes from
-the VERSION of the current release:
+Each update test uses a temp DOG_ROOT, PATH shims for systemctl and systemd-run, and a fake
+robotd on a temp DOG_RUN_DIR. The fake answers robot.state with the health that the VERSION
+of the current release names:
 
 - "ok-N" answers ok and "degraded-N" answers degraded.
 - "fault-N" answers fault and "silent-N" never answers.
@@ -71,22 +70,19 @@ class FakeRobotd(threading.Thread):
         self.sock = sock
         self.root = root
         self.calls = {}
-        self.loop = asyncio.new_event_loop()
         self.ready = threading.Event()
 
     def run(self):
-        """Serve robot.state until stop() is called, then close each connection."""
-        asyncio.set_event_loop(self.loop)
-        server = self.loop.run_until_complete(dogproto.serve(self.sock, {"robot.state": self.h_state}))
+        """Serve robot.state until stop(); asyncio.run then cancels each open request and closes the loop."""
+        asyncio.run(self.serve())
+
+    async def serve(self):
+        """Open the socket and wait for stop()."""
+        self.loop, self.stopped = asyncio.get_running_loop(), asyncio.Event()
+        server = await dogproto.serve(self.sock, {"robot.state": self.h_state})
         self.ready.set()
-        self.loop.run_forever()
+        await self.stopped.wait()
         server.close()
-        tasks = asyncio.all_tasks(self.loop)
-        for task in tasks:
-            task.cancel()
-        self.loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
-        self.loop.run_until_complete(asyncio.sleep(0))
-        self.loop.close()
 
     async def h_state(self, params, conn):
         """Answer with the health that the current VERSION names (see the module docstring)."""
@@ -107,7 +103,7 @@ class FakeRobotd(threading.Thread):
 
     def stop(self):
         """Stop the event loop thread."""
-        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.loop.call_soon_threadsafe(self.stopped.set)
         self.join(5)
 
 

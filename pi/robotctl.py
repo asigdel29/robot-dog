@@ -317,19 +317,17 @@ def hook(version, name):
 def robotd_identity():
     """Return the MainPID and NRestarts of robotd.service; a change means that robotd started again."""
     try:
-        text = subprocess.run(["systemctl", "show", "robotd", "-p", "MainPID", "-p", "NRestarts"],
+        return subprocess.run(["systemctl", "show", "robotd", "-p", "MainPID", "-p", "NRestarts"],
                               capture_output=True, text=True, timeout=10).stdout
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return sorted(line for line in text.splitlines() if "=" in line)
 
 
 def health_gate():
-    """Return the health ("ok" or "degraded") of a robotd that stays healthy; raise UpdateError with the reason if not.
+    """Return "ok" or "degraded" after SETTLE_S of good answers from one robotd; else raise UpdateError.
 
-    The gate polls robot.state for at most DOG_HEALTH_WAIT_S (30 s). It commits only after SETTLE_S
-    (10 s; a third of a shorter test gate) of ok or degraded answers with one robotd MainPID and
-    NRestarts. A fault, a lost answer after a good one, or a robotd restart fails at once.
+    The gate polls robot.state for DOG_HEALTH_WAIT_S (30 s) at most. A fault, a lost answer after a
+    good one, or a new robotd MainPID or NRestarts fails at once (docs/design/release.md section 5).
     """
     wait = float(os.environ.get("DOG_HEALTH_WAIT_S", HEALTH_WAIT_S))
     settle = min(SETTLE_S, wait / 3)
