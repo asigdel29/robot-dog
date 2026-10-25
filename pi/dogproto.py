@@ -7,9 +7,16 @@ method outside CLOUD_METHODS. The PARAMS table is both the validator and the
 API reference. The design follows microduck's duck-ipc-proto.
 """
 
+import asyncio
+import contextlib
+import itertools
 import json
+import logging
 import math
 import os
+import shutil
+
+log = logging.getLogger("dogproto")
 
 #: Bumped on any wire change. A peer with another value is logged, not refused.
 API_VERSION = 1
@@ -142,3 +149,214 @@ def validate(method, params):
 def encode(obj):
     """Return one wire line for obj."""
     return (json.dumps(obj, separators=(",", ":"), allow_nan=False) + "\n").encode()
+
+
+class Conn:
+    """One accepted client connection; handlers use it to notify and to own actions."""
+
+    #: Notifications are dropped for a client whose unsent bytes pass this size.
+    MAX_BACKLOG = 4 * 1024 * 1024
+
+    def __init__(self, writer, cloud):
+        self.cloud = cloud
+        self._writer = writer
+        self.on_close = []
+        self.closed = False
+
+    def send(self, obj):
+        """Queue one message; a closed connection ignores it."""
+        if not self.closed:
+            self._writer.write(encode(obj))
+
+    def notify(self, method, params=None):
+        """Send a notification, or drop it when this client reads too slowly."""
+        transport = self._writer.transport
+        if transport is not None and transport.get_write_buffer_size() > self.MAX_BACKLOG:
+            return
+        self.send({"jsonrpc": "2.0", "method": method, "params": params or {}})
+
+
+async def serve(path, handlers, *, cloud=False, limit=SMALL_LIMIT, group=None):
+    """Serve handlers, {method: async handler(params, conn)}, on a unix socket; return the asyncio server.
+
+    Each request runs in its own task, so a stop can overtake a long action on the same connection.
+    """
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(path)
+    server = await asyncio.start_unix_server(
+        lambda r, w: _client(r, w, handlers, cloud), path=path, limit=limit)
+    os.chmod(path, 0o660)
+    if group:
+        try:
+            shutil.chown(path, group=group)
+        except (LookupError, PermissionError) as exc:
+            # Fail closed: only this process's user may connect, whatever its primary group is.
+            os.chmod(path, 0o600)
+            log.warning("chown %s to group %s failed, socket is owner-only: %s", path, group, exc)
+    return server
+
+
+async def _client(reader, writer, handlers, cloud):
+    """Serve one connection; on close, cancel its open requests and run its on_close callbacks."""
+    conn = Conn(writer, cloud)
+    tasks = set()
+    try:
+        while True:
+            try:
+                line = await reader.readline()
+            except ValueError:  # the line passes the limit
+                conn.send(_error(None, RpcError(PARSE_ERROR, "line too long")))
+                break
+            if not line:
+                break
+            task = _dispatch(line, conn, handlers)
+            if task is not None:
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
+    except ConnectionError:
+        pass
+    finally:
+        conn.closed = True
+        for task in list(tasks):
+            task.cancel()
+        for callback in conn.on_close:
+            try:
+                callback()
+            except Exception:
+                log.exception("on_close callback failed")
+        writer.close()
+
+
+def _error(msg_id, err):
+    """Return the JSON-RPC error reply for err."""
+    return {"jsonrpc": "2.0", "id": msg_id, "error": err.to_obj()}
+
+
+def _dispatch(line, conn, handlers):
+    """Run one inbound line; return the task of a request, or None."""
+    try:
+        msg = decode(line)
+    except ValueError:
+        conn.send(_error(None, RpcError(PARSE_ERROR, "invalid json")))
+        return None
+    if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
+        conn.send(_error(msg.get("id") if isinstance(msg, dict) else None,
+                         RpcError(INVALID_REQUEST, "not a JSON-RPC 2.0 request")))
+        return None
+    method = msg["method"]
+    is_request = "id" in msg
+    try:
+        handler = handlers.get(method)
+        if handler is None or (conn.cloud and method not in CLOUD_METHODS):
+            raise RpcError(METHOD_NOT_FOUND, f"unknown method {method}")
+        params = validate(method, msg.get("params"))
+    except RpcError as err:
+        if is_request:
+            conn.send(_error(msg["id"], err))
+        else:
+            log.warning("dropped notification %s: %s", method, err.message)
+        return None
+    return asyncio.ensure_future(_run(handler, params, conn, msg["id"] if is_request else None, is_request))
+
+
+async def _run(handler, params, conn, msg_id, is_request):
+    """Run one handler and send its reply when the message is a request."""
+    try:
+        result = await handler(params, conn)
+    except RpcError as err:
+        if is_request:
+            conn.send(_error(msg_id, err))
+        return
+    except Exception as exc:
+        log.exception("handler failed")
+        if is_request:
+            conn.send(_error(msg_id, RpcError(INTERNAL_ERROR, str(exc))))
+        return
+    if is_request:
+        conn.send({"jsonrpc": "2.0", "id": msg_id, "result": result})
+
+
+class Client:
+    """A connection to one daemon socket: requests, notifications, inbound notifications."""
+
+    def __init__(self, reader, writer, on_notify):
+        self._reader = reader
+        self._writer = writer
+        self._on_notify = on_notify
+        self._ids = itertools.count(1)
+        self._pending = {}
+        self.closed = asyncio.Event()
+        self._task = asyncio.ensure_future(self._read())
+
+    @classmethod
+    async def connect(cls, path, on_notify=None, limit=MEDIA_LIMIT):
+        """Open a client; on_notify(method, params) receives server notifications."""
+        reader, writer = await asyncio.open_unix_connection(path, limit=limit)
+        return cls(reader, writer, on_notify)
+
+    async def call(self, method, params=None, timeout=5.0):
+        """Send a request and return its result; raise RpcError or TimeoutError."""
+        if self.closed.is_set():
+            raise ConnectionError("connection closed")
+        msg_id = next(self._ids)
+        future = asyncio.get_running_loop().create_future()
+        self._pending[msg_id] = future
+        self._writer.write(encode({"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params or {}}))
+        try:
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            self._pending.pop(msg_id, None)
+
+    def notify(self, method, params=None):
+        """Send a notification; there is no reply."""
+        if not self.closed.is_set():
+            self._writer.write(encode({"jsonrpc": "2.0", "method": method, "params": params or {}}))
+
+    async def close(self):
+        """Close the connection and fail any open request."""
+        self._writer.close()
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await self._task
+
+    async def _read(self):
+        """Route replies to their requests and notifications to on_notify, until the connection closes."""
+        try:
+            while True:
+                line = await self._reader.readline()
+                if not line:
+                    break
+                try:
+                    msg = decode(line)
+                except ValueError:
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if "method" in msg and "id" not in msg:
+                    if self._on_notify is not None:
+                        self._on_notify(msg["method"], msg.get("params") or {})
+                    continue
+                future = self._pending.get(msg.get("id"))
+                if future is None or future.done():
+                    continue
+                if "error" in msg:
+                    err = msg["error"]
+                    future.set_exception(RpcError(err.get("code"), err.get("message"), err.get("data")))
+                else:
+                    future.set_result(msg.get("result"))
+        except (ConnectionError, ValueError):
+            pass
+        finally:
+            self.closed.set()
+            for future in self._pending.values():
+                if not future.done():
+                    future.set_exception(ConnectionError("connection closed"))
+
+
+async def call_once(path, method, params=None, timeout=5.0):
+    """Open a connection, make one request, close it, and return the result."""
+    client = await Client.connect(path)
+    try:
+        return await client.call(method, params, timeout)
+    finally:
+        await client.close()
