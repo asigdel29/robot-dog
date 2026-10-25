@@ -15,7 +15,6 @@ import base64
 import contextlib
 import hashlib
 import hmac
-import http.cookies
 import json
 import logging
 import math
@@ -591,13 +590,9 @@ class Console:
         auth = headers.get("authorization", "")
         if auth.startswith("Bearer ") and self._token_ok(auth[len("Bearer "):]):
             return True
-        cookie = http.cookies.SimpleCookie()
-        try:
-            cookie.load(headers.get("cookie", ""))
-        except http.cookies.CookieError:
-            return False
-        morsel = cookie.get(CONSOLE_COOKIE)
-        return morsel is not None and hmac.compare_digest(morsel.value.encode(), self._cookie)
+        # A plain split: SimpleCookie drops every cookie after one that it cannot parse.
+        cookies = dict(part.strip().partition("=")[::2] for part in headers.get("cookie", "").split(";"))
+        return hmac.compare_digest(cookies.get(CONSOLE_COOKIE, "").encode(), self._cookie)
 
     async def handle(self, reader, writer):
         """Serve one HTTP request on one connection, then close it; refuse more than 16 open connections."""

@@ -441,7 +441,8 @@ class MediaStack(unittest.TestCase):
         self.assertEqual(set_cookie.split(";")[0], "dog_console=" + derived)
         self.assertNotIn(token, set_cookie)
         self.assertEqual(self.request("GET", "/state", {"Cookie": "dog_console=" + token})[0], 401)
-        cookie = {"Cookie": set_cookie.split(";")[0]}
+        # Another app on the same host can set a cookie that a strict parser refuses.
+        cookie = {"Cookie": 'other={"a":1}; ' + set_cookie.split(";")[0]}
         status, headers, body = self.request("GET", "/", cookie)
         self.assertEqual(status, 200)
         self.assertIn(b"STOP", body)
