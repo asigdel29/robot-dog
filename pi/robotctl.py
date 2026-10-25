@@ -30,7 +30,8 @@ import robotd
 EXIT_OK, EXIT_REFUSED, EXIT_UNREACHABLE, EXIT_INPUT = 0, 1, 2, 3
 TAP_MS = 3000
 HOLD_MS = 4000
-TOGGLE_PROTOS = ("RC5", "RC6")
+#: Protocols whose frames carry a toggle bit; a replay of one fixed frame is ignored on the second press.
+TOGGLE_PROTOS = ("RC5", "RC6", "RC6A", "MARANTZ")
 
 
 class InputError(Exception):
@@ -88,7 +89,7 @@ def entry_from_captures(taps, hold):
     """Build a registry entry from three tap captures and one hold capture; raise InputError if they differ."""
     first = taps[0]
     proto = first.get("proto")
-    if proto in TOGGLE_PROTOS:
+    if str(proto).upper() in TOGGLE_PROTOS:
         raise InputError(f"{proto} uses a toggle bit; replay is refused")
     for other in taps[1:]:
         if proto == "NEC":
