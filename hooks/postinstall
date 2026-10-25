@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# postinstall: installs the units, tmpfiles, launcher and /etc/dog files of this release, then enables dog.target.
-# robotctl update apply runs it as root after the current symlink points at this release.
-# It never overwrites a file in /etc/dog, because those files belong to the owner and to robotctl.
-# It does not start or restart a daemon; robotctl restarts dog.target after this hook.
+# postinstall: installs the units, tmpfiles, modules and launcher of this release and the absent /etc/dog files.
+# robotctl update apply runs it as root after the current symlink points at this release, and again on a rollback.
+# It never overwrites a file in /etc/dog and never starts a daemon; robotctl restarts dog.target after it.
 set -euo pipefail
 
 release=$(cd "$(dirname "$0")/.." && pwd)
