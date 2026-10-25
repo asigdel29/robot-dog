@@ -2,19 +2,19 @@
 
 Real processes: the fake bridge and robotd (devstack Stack), linkd, the hub
 (uvicorn) and stub_hermes (Hermes Agent and OpenAI). A stub mediad cloud socket
-runs in a thread of this process. Some tests put a fake hub in place of the hub,
-to send linkd frames that the real hub never sends. Each check maps to a row of
-the verification table in the plan. Voice latency lines are printed for docs/test-log.md.
+runs in a thread of this process. LinkdRules puts a fake hub in place of the
+hub, to send linkd frames that the real hub never sends. Voice latency lines are
+printed for docs/test-log.md.
 """
 
 import asyncio
 import base64
+import functools
 import json
 import os
 import queue
 import re
 import signal
-import socket
 import sys
 import threading
 import time
@@ -38,8 +38,7 @@ sys.path.insert(0, os.path.join(ROOT, "tests"))
 
 import dogproto  # noqa: E402
 import linkd  # noqa: E402
-from devstack import Stack  # noqa: E402
-from test_e2e import PoseFeeder  # noqa: E402
+from devstack import Stack, free_port  # noqa: E402
 
 DEVICE_TOKEN = "device-secret"
 TOOLS_TOKEN = "tools-secret"
@@ -47,13 +46,6 @@ HERMES_KEY = "hermes-secret"
 OPENAI_KEY = "openai-secret"
 TOOL_NAMES = {"get_state", "do_trick", "drive", "go_to_marker", "look", "say", "stop"}
 FAKE_JPEG = b"\xff\xd8\xff\xe0fake jpeg\xff\xd9"
-
-
-def free_port():
-    """Return a TCP port that is free now on loopback."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def http_json(url, body=None, headers=None):
@@ -75,12 +67,23 @@ def answers(url):
         return False
 
 
+async def feed_pose(stack, halt):
+    """Send robot.observe each 100 ms until halt, as mediad does: the toy at the center, goal marker 2 in a corner."""
+    client = await dogproto.Client.connect(stack.sock("robotd"))
+    while not halt.is_set():
+        client.notify("robot.observe", {"t_mono_ns": time.monotonic_ns(),
+                                        "markers": {"1": [320, 240, 0.0], "2": [600, 440, 0.0]}})
+        await asyncio.sleep(0.1)
+    await client.close()
+
+
 class StubMediad(threading.Thread):
-    """Stands in for mediad's cloud socket: snapshot, subscribe, audio.play and audio.stop; it records each play."""
+    """Stands in for mediad's cloud socket: snapshot, subscribe, audio.play and audio.stop."""
 
     def __init__(self, path):
         super().__init__(daemon=True)
         self.path = path
+        #: (t_mono_ns, params) of each accepted audio.play.
         self.plays = []
         #: True plays the part of a held push-to-talk: audio.play answers BUSY.
         self.busy = False
@@ -90,38 +93,36 @@ class StubMediad(threading.Thread):
         self._halt = None
 
     def run(self):
+        """Serve the socket until halt()."""
         asyncio.run(self._serve())
 
     async def _serve(self):
+        """Serve the four methods on the cloud socket."""
         self.loop = asyncio.get_running_loop()
         self._halt = asyncio.Event()
-
-        async def snapshot(params, conn):
-            return {"jpeg_b64": base64.b64encode(FAKE_JPEG).decode(), "age_ms": 12}
-
-        async def subscribe(params, conn):
-            self.subscribers.append(conn)
-            return {}
-
-        async def play(params, conn):
-            if self.busy:
-                raise dogproto.RpcError(dogproto.BUSY, "push-to-talk is down")
-            self.plays.append((time.monotonic_ns(), params))
-            return {"queued": True}
-
-        async def audio_stop(params, conn):
-            return {}
-
-        handlers = {"media.snapshot": snapshot, "media.subscribe": subscribe, "audio.play": play,
-                    "audio.stop": audio_stop}
+        methods = ("media.snapshot", "media.subscribe", "audio.play", "audio.stop")
+        handlers = {method: functools.partial(self._handle, method) for method in methods}
         server = await dogproto.serve(self.path, handlers, cloud=True, limit=dogproto.MEDIA_LIMIT)
         self.ready.set()
         await self._halt.wait()
         server.close()
 
+    async def _handle(self, method, params, conn):
+        """Answer one method; a play is recorded, or refused with BUSY while busy is True."""
+        if method == "media.snapshot":
+            return {"jpeg_b64": base64.b64encode(FAKE_JPEG).decode(), "age_ms": 12}
+        if method == "media.subscribe":
+            self.subscribers.append(conn)
+        if method == "audio.play":
+            if self.busy:
+                raise dogproto.RpcError(dogproto.BUSY, "push-to-talk is down")
+            self.plays.append((time.monotonic_ns(), params))
+        return {}
+
     def notify(self, method, params):
         """Send one notification to each subscriber; callable from the test thread."""
         def send():
+            """Notify each subscriber; runs on the server loop."""
             for conn in self.subscribers:
                 conn.notify(method, params)
         self.loop.call_soon_threadsafe(send)
@@ -181,17 +182,17 @@ class LinkStack(Stack):
             self.mediad.halt()
 
     def stub_config(self, **changes):
-        """Change the stub_hermes transcript or reply."""
+        """Change the stub_hermes config."""
         http_json(f"{self.stub_url}/_stub/config", changes)
 
-    def stub_requests(self, path=None):
-        """Return the requests that stub_hermes recorded, for one path or all."""
-        rows = http_json(f"{self.stub_url}/_stub/requests")[1]
-        return [r for r in rows if path is None or r["path"] == path]
+    def stub_requests(self, path):
+        """Return the requests that stub_hermes recorded for one path."""
+        return [r for r in http_json(f"{self.stub_url}/_stub/requests")[1] if r["path"] == path]
 
     def tools(self, work):
         """Run work(client) with a Model Context Protocol client on /tools, as Hermes does."""
         async def session():
+            """Open the client, run work and return its result."""
             headers = {"Authorization": f"Bearer {TOOLS_TOKEN}"}
             async with httpx2.AsyncClient(headers=headers, timeout=httpx2.Timeout(10, read=60)) as http:
                 async with Client(streamable_http_client(f"{self.hub_url}/tools/", http_client=http)) as client:
@@ -215,6 +216,10 @@ class LinkStack(Stack):
         """Return the voice latency lines of the hub log."""
         return re.findall(r"voice \S+ latency ms: .*", self.out("hub"))
 
+    def armed(self):
+        """Return the armed flag of robotd."""
+        return self.call("robot.state")["armed"]
+
 
 class LinkTestCase(unittest.TestCase):
     """Starts a fresh LinkStack for each test; hub_env adds hub settings."""
@@ -222,11 +227,13 @@ class LinkTestCase(unittest.TestCase):
     hub_env = {}
 
     def setUp(self):
+        """Start the stack."""
         self.stack = LinkStack(hub_env=self.hub_env)
         self.addCleanup(self.stack.stop)
         self.stack.start()
 
     def arm(self):
+        """Arm the dog from the local socket, as gamepad Start does."""
         self.assertTrue(self.stack.call("robot.enable")["armed"])
 
 
@@ -234,6 +241,7 @@ class Tools(LinkTestCase):
     """The robot tools over the Model Context Protocol, through the hub and linkd to robotd."""
 
     def test_tool_list_and_tokens(self):
+        """Seven tools, two read-only; /tools needs TOOLS_TOKEN, /device needs DEVICE_TOKEN and a text hello."""
         listed = self.stack.tools(lambda client: client.list_tools())
         self.assertEqual({tool.name for tool in listed.tools}, TOOL_NAMES)
         read_only = {t.name for t in listed.tools if t.annotations and t.annotations.read_only_hint}
@@ -244,15 +252,15 @@ class Tools(LinkTestCase):
         for headers in ({}, {"Authorization": "Bearer wrong"}):
             with self.assertRaises(websockets.exceptions.InvalidStatus):
                 websockets.sync.client.connect(device_url, additional_headers=headers, open_timeout=5)
-
-    def test_do_trick_reaches_bridge(self):
-        self.arm()
-        error, text = self.stack.tool("do_trick", {"name": "bark"})
-        self.assertFalse(error, text)
-        self.assertTrue(json.loads(text)["transmitted"])
-        self.assertEqual([m["name"] for _, m in self.stack.wait_ops("send", 1)], ["bark"])
+        with websockets.sync.client.connect(device_url, additional_headers={"Authorization": f"Bearer {DEVICE_TOKEN}"},
+                                            open_timeout=5) as conn:
+            conn.send(b"\x00 binary hello")
+            with self.assertRaises(websockets.exceptions.ConnectionClosed) as closed:
+                conn.recv(timeout=5)
+        self.assertEqual(closed.exception.rcvd.code, 1008, "a binary hello is refused, not an internal error")
 
     def test_drive_needs_local_arm(self):
+        """drive gets NOT_ARMED until a local arm; then the bridge gets a hold."""
         error, text = self.stack.tool("drive", {"direction": "forward", "ms": 300})
         self.assertTrue(error)
         self.assertIn("Start", text)
@@ -264,8 +272,8 @@ class Tools(LinkTestCase):
         self.assertTrue(self.stack.wait_ops("hold", 1))
 
     def test_state_look_say_stop(self):
-        error, text = self.stack.tool("get_state")
-        state = json.loads(text)
+        """get_state, look, say (and its length limit) and stop."""
+        state = json.loads(self.stack.tool("get_state")[1])
         self.assertEqual(state["link"], "up")
         self.assertIn("bark", {t["name"] for t in state["tricks"]})
         self.assertTrue(state["caps"]["goto"])
@@ -281,7 +289,9 @@ class Tools(LinkTestCase):
         self.assertTrue(json.loads(text)["stop_transmitted"])
 
     def test_motion_rate_limit(self):
+        """The 31st motion call in a minute gets the rate limit error; refused calls count too."""
         async def calls(client):
+            """Make 31 drive calls and return the text of each result."""
             results = []
             for _ in range(31):
                 result = await client.call_tool("drive", {"direction": "forward", "ms": 300})
@@ -293,6 +303,7 @@ class Tools(LinkTestCase):
         self.assertIn("rate limit", texts[30])
 
     def test_device_offline(self):
+        """Without linkd, get_state says the link is down and a motion tool says the dog is offline."""
         self.stack.kill("linkd")
         self.stack.wait_for(lambda: "link down" in self.stack.out("hub"), "hub sees the link down")
         self.assertEqual(json.loads(self.stack.tool("get_state")[1]), {"link": "down"})
@@ -303,17 +314,18 @@ class Tools(LinkTestCase):
     def test_hub_loss_disarms_and_cancels_goto(self):
         """Hub killed during a goto: linkd disarms robotd and the goto ends; no hold follows."""
         self.arm()
-        feeder = PoseFeeder(self.stack, (600, 440))
+        halt = threading.Event()
+        feeder = threading.Thread(target=asyncio.run, args=(feed_pose(self.stack, halt),), daemon=True)
         feeder.start()
         self.addCleanup(feeder.join)
-        self.addCleanup(feeder.halt.set)
+        self.addCleanup(halt.set)
         time.sleep(0.3)
-        goto = threading.Thread(target=lambda: self._quiet_tool("go_to_marker", {"marker_id": 2}), daemon=True)
+        goto = threading.Thread(target=self._quiet_tool, args=("go_to_marker", {"marker_id": 2}), daemon=True)
         goto.start()
         self.stack.wait_ops("hold", 1, timeout=5)
         killed = time.monotonic()
         self.stack.kill("hub")
-        self.stack.wait_for(lambda: not self.stack.call("robot.state")["armed"], "disarm after hub loss")
+        self.stack.wait_for(lambda: not self.stack.armed(), "disarm after hub loss")
         print(f"\nhub loss to disarm: {(time.monotonic() - killed) * 1000:.0f} ms")
         self.assertIsNone(self.stack.call("robot.state")["busy"])
         quiet_from = time.monotonic_ns() + 400_000_000  # one hold lease after the disarm
@@ -328,28 +340,32 @@ class Tools(LinkTestCase):
         hub.send_signal(signal.SIGSTOP)
         self.addCleanup(hub.send_signal, signal.SIGCONT)
         frozen = time.monotonic()
-        self.stack.wait_for(lambda: not self.stack.call("robot.state")["armed"], "disarm after a silent hub",
-                            timeout=15)
+        self.stack.wait_for(lambda: not self.stack.armed(), "disarm after a silent hub", timeout=15)
         took = time.monotonic() - frozen
         print(f"\nsilent hub to disarm: {took:.1f} s")
         self.assertLess(took, 12.5)
 
     def _quiet_tool(self, name, arguments):
+        """Call a tool in a thread whose hub dies during the call."""
         try:
             self.stack.tool(name, arguments)
         except Exception:
-            pass  # the hub dies during this call
+            pass
 
 
 class VoiceLoop(LinkTestCase):
     """Utterance to STT, Hermes run, TTS and audio.play, with the stop fast path and barge-in."""
 
     def wait_latency_line(self):
+        """Wait for the end of a turn and print the latency lines."""
         self.stack.wait_for(lambda: self.stack.latency_lines(), "voice latency line")
         for line in self.stack.latency_lines():
             print(f"\n{line}")
 
     def test_utterance_plays_reply(self):
+        """One turn with the right models, headers and sentences; stream lines that are not events are skipped."""
+        junk = ["id: 7", "data: [DONE]", "data: [1, 2]", 'data: {"event": "message.delta", "delta": 7}']
+        self.stack.stub_config(junk_lines=junk)
         utt_id = self.stack.utter()
         self.stack.wait_for(lambda: len(self.stack.mediad.plays) >= 2, "two sentences played")
         stt = self.stack.stub_requests("/v1/audio/transcriptions")[0]
@@ -365,7 +381,10 @@ class VoiceLoop(LinkTestCase):
         self.wait_latency_line()
 
     def test_tool_call_during_stream(self):
-        """Hermes calls do_trick through /tools while the voice loop waits on its stream: no deadlock."""
+        """Hermes calls do_trick through /tools while the voice loop waits on its stream: no deadlock.
+
+        The text around the tool call gets exactly one space, also after an empty delta.
+        """
         self.arm()
         self.stack.stub_config(transcript="please bark")
         self.stack.utter()
@@ -374,19 +393,15 @@ class VoiceLoop(LinkTestCase):
         call = self.stack.stub_requests("tool:do_trick")[0]
         self.assertFalse(call["is_error"], call["text"])
         self.assertTrue(json.loads(call["text"])["transmitted"])
-        spoken = [r["body"]["input"] for r in self.stack.stub_requests("/v1/audio/speech")]
-        self.assertEqual(spoken, ["Sure, I can do that.", "Here I go!"], "no second space after the tool call")
         self.wait_latency_line()
-
-    def test_text_around_tool_call_is_not_fused(self):
-        self.arm()
-        self.stack.stub_config(transcript="please bark", reply=["Okay.", "Done!"])
+        self.stack.stub_config(reply=["Okay.", "", "Done!"])
         self.stack.utter()
-        self.stack.wait_for(lambda: len(self.stack.mediad.plays) >= 2, "both sentences played")
+        self.stack.wait_for(lambda: len(self.stack.mediad.plays) >= 4, "second reply played")
         spoken = [r["body"]["input"] for r in self.stack.stub_requests("/v1/audio/speech")]
-        self.assertEqual(spoken, ["Okay.", "Done!"])
+        self.assertEqual(spoken, ["Sure, I can do that.", "Here I go!", "Okay.", "Done!"])
 
     def test_bargein_stops_run(self):
+        """A barge-in stops the Hermes run and the speech that is not sent yet."""
         self.stack.stub_config(reply=[" One."] * 40, delta_delay=0.1)
         self.stack.utter()
         self.stack.wait_for(lambda: self.stack.mediad.plays, "first sentence played")
@@ -414,15 +429,8 @@ class VoiceLoop(LinkTestCase):
         self.assertEqual(self.stack.stub_requests("/v1/runs/events"), [])
         self.assertEqual(self.stack.mediad.plays, [])
 
-    def test_bad_stream_lines_skipped(self):
-        junk = ["data: [DONE]", "data: [1, 2]", 'data: {"event": "message.delta", "delta": 7}']
-        self.stack.stub_config(junk_lines=junk)
-        self.stack.utter()
-        self.stack.wait_for(lambda: len(self.stack.mediad.plays) >= 2, "reply played after bad lines")
-        spoken = [r["body"]["input"] for r in self.stack.stub_requests("/v1/audio/speech")]
-        self.assertEqual(spoken, ["Sure, I can do that.", "Here I go!"])
-
     def test_failed_turn_stops_run(self):
+        """A turn that ends without a terminal run event stops its Hermes run."""
         self.stack.stub_config(events_status=500)
         self.stack.utter()
         self.stack.wait_for(lambda: self.stack.stub_requests("/v1/runs/stop"), "run stop after a failed turn")
@@ -454,6 +462,7 @@ class VoiceLoop(LinkTestCase):
         self.assertEqual(json.loads(self.stack.tool("say", {"text": "Woof."})[1])["spoken"], False)
 
     def test_stop_phrase_before_hermes(self):
+        """A stop phrase reaches the bridge as a stop before the Hermes run starts."""
         self.stack.stub_config(transcript="Stop! Stop right there.")
         self.stack.utter()
         self.stack.wait_for(lambda: self.stack.stub_requests("/v1/runs"), "Hermes run")
@@ -469,6 +478,7 @@ class DailyCaps(LinkTestCase):
     hub_env = {"DOG_TTS_CHARS_PER_DAY": "10", "DOG_STT_MINUTES_PER_DAY": "0.001"}
 
     def test_caps(self):
+        """say stops at the TTS cap; an utterance over the STT cap gets no STT call."""
         self.assertFalse(self.stack.tool("say", {"text": "Woof."})[0])
         error, text = self.stack.tool("say", {"text": "Woof, woof."})
         self.assertTrue(error)
@@ -494,6 +504,7 @@ class FakeHub:
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def _handler(self, conn):
+        """Hand each connection to the test and keep it open until close()."""
         self.conns.put(conn)
         if self.close_at_once:
             conn.close(code=1008)
@@ -510,6 +521,7 @@ class LinkdRules(unittest.TestCase):
     """linkd against a fake hub: hello, bearer, STALE, cloud-only methods, concurrency and forwards."""
 
     def setUp(self):
+        """Start the stack with linkd linked to a fake hub, and read the hello."""
         self.hub = FakeHub()
         self.addCleanup(self.hub.close)
         self.stack = LinkStack(hub_ws=self.hub.url)
@@ -534,38 +546,39 @@ class LinkdRules(unittest.TestCase):
                 return msg
 
     def test_hello_and_bearer(self):
+        """linkd sends the bearer header and then link.hello."""
         self.assertEqual(self.conn.request.headers["Authorization"], f"Bearer {DEVICE_TOKEN}")
         self.assertEqual(self.hello["method"], "link.hello")
         self.assertEqual({k: self.hello["params"][k] for k in ("api", "device")}, {"api": 1, "device": "dog-01"})
 
-    def test_old_sent_at_is_stale(self):
+    def test_stale_rule(self):
+        """An old, future, infinite or absent sent_at gets STALE; stop, disarm and audio.stop always pass."""
         self.assertTrue(self.stack.call("robot.enable")["armed"])
-        self.request("robot.do", {"trick": "bark", "id": uuid.uuid4().hex}, age_ms=5000)
-        self.assertEqual(self.reply()["error"]["code"], dogproto.STALE)
-        self.request("robot.do", {"trick": "bark", "id": uuid.uuid4().hex}, age_ms=-5000)
-        self.assertEqual(self.reply()["error"]["code"], dogproto.STALE, "a future sent_at")
+        for age_ms in (5000, -5000):
+            self.request("robot.do", {"trick": "bark", "id": uuid.uuid4().hex}, age_ms=age_ms)
+            self.assertEqual(self.reply()["error"]["code"], dogproto.STALE, age_ms)
         self.conn.send('{"jsonrpc": "2.0", "id": 98, "method": "robot.state", "params": {}, "sent_at": 1e999}')
         self.assertEqual(self.reply()["error"]["code"], dogproto.STALE, "an infinite sent_at")
         self.conn.send(json.dumps({"jsonrpc": "2.0", "id": 99, "method": "robot.state", "params": {}}))
         self.assertEqual(self.reply()["error"]["code"], dogproto.STALE, "no sent_at")
         self.assertEqual(self.stack.wait_ops("send", 1, timeout=0.5), [])
-
-    def test_stops_are_never_stale(self):
         for method in ("robot.stop", "robot.disarm", "audio.stop"):
             self.request(method, age_ms=60000)
             self.assertIn("result", self.reply(), method)
         self.conn.send(json.dumps({"jsonrpc": "2.0", "id": 600, "method": "robot.stop", "params": {}}))
-        self.assertIn("result", self.reply())
+        self.assertIn("result", self.reply(), "a stop with no sent_at")
 
     def test_only_cloud_methods(self):
+        """Arming, stick motion, a second subscription and link methods get METHOD_NOT_FOUND."""
         for method in ("robot.enable", "robot.move", "media.subscribe", "link.hello"):
             self.request(method)
             self.assertEqual(self.reply()["error"]["code"], dogproto.METHOD_NOT_FOUND, method)
-        self.assertFalse(self.stack.call("robot.state")["armed"])
+        self.assertFalse(self.stack.armed())
         self.request("robot.state")
         self.assertIn("armed", self.reply()["result"])
 
     def test_nan_and_infinity_refused(self):
+        """A frame with NaN is dropped; 1e999 in params gets INVALID_PARAMS."""
         self.conn.send('{"jsonrpc": "2.0", "id": 500, "method": "robot.state", "params": {}, "sent_at": NaN}')
         state = self.request("robot.state")
         self.assertEqual(self.reply()["id"], state, "a frame with NaN must be dropped")
@@ -575,6 +588,7 @@ class LinkdRules(unittest.TestCase):
         self.assertEqual((reply["id"], reply["error"]["code"]), (501, dogproto.INVALID_PARAMS))
 
     def test_stop_overtakes_drive(self):
+        """A stop gets its reply before the drive that it ends, which gets PREEMPTED."""
         self.assertTrue(self.stack.call("robot.enable")["armed"])
         drive = self.request("robot.drive", {"dir": "forward", "ms": 1000, "id": uuid.uuid4().hex})
         time.sleep(0.1)
@@ -584,6 +598,7 @@ class LinkdRules(unittest.TestCase):
         self.assertEqual(second["error"]["code"], dogproto.PREEMPTED)
 
     def test_forwards_utterance_and_bargein(self):
+        """mediad utterances and barge-ins reach the hub as voice.utterance and voice.cancel."""
         self.stack.wait_for(lambda: self.stack.mediad.subscribers, "linkd subscribed to mediad")
         self.stack.mediad.notify("media.utterance", {"id": "u1", "rate": 16000, "pcm16_b64": ""})
         self.stack.mediad.notify("media.bargein", {})
@@ -592,11 +607,15 @@ class LinkdRules(unittest.TestCase):
         self.assertEqual(frames[0]["params"]["id"], "u1")
 
     def test_link_loss_disarms(self):
+        """A closed link and a SIGTERM of linkd both disarm the dog; a reconnect does not arm it."""
         self.assertTrue(self.stack.call("robot.enable")["armed"])
         self.conn.close()
-        self.stack.wait_for(lambda: not self.stack.call("robot.state")["armed"], "disarm after link loss")
+        self.stack.wait_for(lambda: not self.stack.armed(), "disarm after link loss")
         self.hub.conns.get(timeout=10)  # linkd reconnects
-        self.assertFalse(self.stack.call("robot.state")["armed"], "a reconnect must not arm")
+        self.assertFalse(self.stack.armed(), "a reconnect must not arm")
+        self.assertTrue(self.stack.call("robot.enable")["armed"])
+        self.stack.kill("linkd", signal.SIGTERM)
+        self.assertFalse(self.stack.armed(), "disarm on SIGTERM")
 
     def test_backoff_after_short_sessions(self):
         """A hub that closes each link at once gets 1, 2, 4 s waits, not a reconnect and disarm each second."""
@@ -612,14 +631,17 @@ class ClockWatch(unittest.TestCase):
     """linkd's NTP flag: refreshed off the event loop; an unknown state keeps the last value."""
 
     def test_unknown_state_keeps_last_value(self):
-        link = linkd.Link("ws://127.0.0.1:1/device", "token", "dog-01", assume_synced=False)
+        """The flag follows True, keeps True on an unknown state, then goes False; False makes a request STALE."""
+        link = linkd.Link("ws://127.0.0.1:1/device", "token", "dog-01", clock_synced=False)
         answers, seen = [True, None, False], []
 
         def fake_check():
+            """Record the flag before each check and return the next answer."""
             seen.append(link.clock_synced)
             return answers.pop(0) if answers else None
 
         async def scenario():
+            """Run the watcher until it made four checks."""
             task = asyncio.ensure_future(link._watch_clock())
             while len(seen) < 4:
                 await asyncio.sleep(0.01)

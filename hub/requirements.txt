@@ -1,5 +1,6 @@
 # Python packages of the hub on the droplet (hub/hub.py). uvicorn serves the /device WebSocket with websockets.
-fastapi==0.162.0
+# mcp also needs starlette and httpx2; the hub uses both directly, so they are pinned here.
+starlette==1.10.0
 uvicorn==0.54.0
 mcp==2.3.0
 openai==3.37.0
