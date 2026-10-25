@@ -1,25 +1,21 @@
 """mediad: camera, ArUco pose, microphone, speaker and the LAN console of the robot dog.
 
-It is the only writer of the pose: each camera frame goes through ArUco
-detection, and the marker poses go to robotd as robot.observe notifications.
-It records push-to-talk audio with arecord, plays queued replies with aplay and
-serves a small HTTP console for the owner on the LAN. It moves the dog only
-through robotd methods. --fake-camera draws the markers from the simulated toy
-pose and then runs the same detection; --fake-audio replaces the audio
-subprocesses with a log. docs/design/media.md owns the rules.
+It is the only writer of the pose: it sends the markers of each camera frame to
+robotd as robot.observe. It records push-to-talk audio with arecord, plays queued
+replies with aplay and serves the owner console. docs/design/media.md owns the rules.
 """
 
 import argparse
 import asyncio
 import base64
 import contextlib
+import functools
 import hashlib
 import hmac
 import json
 import logging
 import math
 import os
-import signal
 import sys
 import threading
 import time
@@ -40,6 +36,7 @@ CAMERA_FPS = 15
 FRAME_W, FRAME_H = 640, 480
 CAMERA_RETRY_S = 1.0
 ROBOTD_RETRY_S = 0.5
+FAKE_ROBOT_MARKER = 1  # goto.robot_marker of the dev stack registry
 FAKE_MARKER_PX = 36  # 6 px for each cell of a 4x4 marker with its border
 FAKE_MARGIN_PX = 6  # white quiet zone around each fake marker
 FAKE_FLOOR_GRAY = 150
@@ -71,49 +68,39 @@ def require_aruco_detector():
         sys.exit(f"mediad needs OpenCV 4.7 or later (cv2.aruco.ArucoDetector); this is OpenCV {cv2.__version__}")
 
 
-def aruco_dictionary(name):
-    """Return the predefined ArUco dictionary with this name, for example DICT_4X4_50."""
-    if not name.startswith("DICT_"):
-        raise ValueError(f"not an ArUco dictionary: {name}")
-    return cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, name))
+def aruco_dict():
+    """Return the ArUco dictionary of the printed markers."""
+    return cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 
 
-def marker_poses(corners, ids):
-    """Return {id: [cx, cy, heading_rad]} in image pixels from ArUco corners.
+def make_detector():
+    """Return detect(bgr_frame) -> {id: [cx, cy, heading_rad]}; real and fake frames use this one path.
 
     The heading is the angle from the marker center to the midpoint of its top
-    edge (corner 0 to corner 1), with image y down. The robot marker is attached
-    with its top edge toward the nose, so this is the direction the dog faces.
+    edge (corners 0 and 1), with image y down.
     """
-    poses = {}
-    if ids is None:
-        return poses
-    for quad, marker_id in zip(corners, ids.flatten()):
-        points = quad.reshape(4, 2)
-        cx, cy = points.mean(axis=0)
-        tx, ty = (points[0] + points[1]) / 2
-        poses[str(int(marker_id))] = [round(float(cx), 1), round(float(cy), 1),
-                                      round(math.atan2(ty - cy, tx - cx), 4)]
-    return poses
-
-
-def make_detector(dictionary):
-    """Return detect(bgr_frame) -> marker poses; real and fake frames use this one path."""
     params = cv2.aruco.DetectorParameters()
     params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-    detector = cv2.aruco.ArucoDetector(dictionary, params)
+    detector = cv2.aruco.ArucoDetector(aruco_dict(), params)
 
     def detect(frame):
-        """Return the marker poses of one BGR frame."""
-        corners, ids, _ = detector.detectMarkers(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-        return marker_poses(corners, ids)
+        """Return the marker poses of one frame in image pixels."""
+        corners, ids, _ = detector.detectMarkers(frame)
+        poses = {}
+        for quad, marker_id in zip(corners, [] if ids is None else ids.flatten()):
+            points = quad.reshape(4, 2)
+            cx, cy = points.mean(axis=0)
+            tx, ty = (points[0] + points[1]) / 2
+            poses[str(marker_id)] = [round(float(cx), 1), round(float(cy), 1), round(math.atan2(ty - cy, tx - cx), 4)]
+        return poses
 
     return detect
 
 
-def marker_tile(dictionary, marker_id):
+@functools.cache
+def marker_tile(marker_id):
     """Return one marker as a BGR image with a white quiet zone, top edge up."""
-    marker = cv2.aruco.generateImageMarker(dictionary, marker_id, FAKE_MARKER_PX)
+    marker = cv2.aruco.generateImageMarker(aruco_dict(), marker_id, FAKE_MARKER_PX)
     tile = cv2.copyMakeBorder(marker, *[FAKE_MARGIN_PX] * 4, cv2.BORDER_CONSTANT, value=255)
     return cv2.cvtColor(tile, cv2.COLOR_GRAY2BGR)
 
@@ -129,27 +116,23 @@ def draw_marker(frame, tile, cx, cy, heading):
                    flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_TRANSPARENT)
 
 
-def read_json(path):
-    """Return the JSON value in path, or None when the file is absent or partial."""
+def read_json(name):
+    """Return the JSON value of a file in DOG_RUN_DIR, or None when the file is absent or partial."""
     try:
-        with open(path) as handle:
+        with open(os.path.join(dogproto.run_dir(), name)) as handle:
             return json.load(handle)
     except (OSError, ValueError):
         return None
 
 
 class FakeCamera:
-    """Frame source for dev and tests with the cv2.VideoCapture read/release interface.
+    """Frame source for dev and tests with the read/release interface of cv2.VideoCapture.
 
-    Each frame is a floor with the goal markers of fake_markers.json ({"2": [x, y]})
-    and the robot marker at the toy pose of sim_pose.json, both in DOG_RUN_DIR.
+    Each frame is a floor with the upright goal markers of fake_markers.json
+    ({"2": [x, y]}) and the robot marker at the toy pose of sim_pose.json.
     """
 
-    def __init__(self, run_dir, dictionary, robot_marker):
-        self._pose_path = os.path.join(run_dir, "sim_pose.json")
-        self._markers_path = os.path.join(run_dir, "fake_markers.json")
-        self._dictionary = dictionary
-        self._robot_tile = marker_tile(dictionary, robot_marker)
+    def __init__(self):
         self._next = time.monotonic()
 
     def read(self):
@@ -157,11 +140,11 @@ class FakeCamera:
         self._next = max(self._next + 1 / CAMERA_FPS, time.monotonic())
         time.sleep(max(0.0, self._next - time.monotonic()))
         frame = np.full((FRAME_H, FRAME_W, 3), FAKE_FLOOR_GRAY, np.uint8)
-        for marker_id, (x, y) in (read_json(self._markers_path) or {}).items():
-            draw_marker(frame, marker_tile(self._dictionary, int(marker_id)), float(x), float(y), -math.pi / 2)
-        pose = read_json(self._pose_path)
+        for marker_id, (x, y) in (read_json("fake_markers.json") or {}).items():
+            draw_marker(frame, marker_tile(int(marker_id)), x, y, -math.pi / 2)
+        pose = read_json("sim_pose.json")
         if pose:
-            draw_marker(frame, self._robot_tile, pose["x"], pose["y"], pose["heading"])
+            draw_marker(frame, marker_tile(FAKE_ROBOT_MARKER), pose["x"], pose["y"], pose["heading"])
         return True, frame
 
     def release(self):
@@ -182,8 +165,9 @@ def open_camera(path):
     return capture
 
 
-def capture_loop(open_source, detect, deliver):
+def capture_loop(open_source, deliver):
     """Read frames forever (a thread): stamp, detect and deliver each one; reopen a failed source each 1 s."""
+    detect = make_detector()
     source = None
     warned = False
     while True:
@@ -213,28 +197,21 @@ def encode_jpeg(frame, max_px):
     height, width = frame.shape[:2]
     scale = max_px / max(width, height)
     if scale < 1:
-        frame = cv2.resize(frame, (max(1, int(width * scale)), max(1, int(height * scale))),
-                           interpolation=cv2.INTER_AREA)
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-    if not ok:
-        raise RpcError(dogproto.INTERNAL_ERROR, "jpeg encode failed")
-    return buf.tobytes()
+        frame = cv2.resize(frame, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
+    return cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])[1].tobytes()
 
 
-# ---------------------------------------------------------------- audio
-
-
-def tone(seconds):
-    """Return a quiet 440 Hz tone as 16 kHz PCM16: the fake microphone."""
-    samples = np.arange(int(seconds * REC_RATE)) / REC_RATE
-    return (np.sin(2 * np.pi * 440 * samples) * 1000).astype("<i2").tobytes()
+def audio_log(event):
+    """Append one fake speaker event with its monotonic time in ns to DOG_RUN_DIR/audio_out.log."""
+    with open(os.path.join(dogproto.run_dir(), "audio_out.log"), "a") as handle:
+        handle.write(f"{time.monotonic_ns()} {event}\n")
 
 
 # ---------------------------------------------------------------- daemon
 
 
 class Mediad:
-    """All mediad state: the latest frame, the robotd link, subscribers, the play queue and the recording."""
+    """All mediad state: the newest frame, the robotd link, subscribers, the play queue and push-to-talk."""
 
     def __init__(self, fake_audio, speaker, mic):
         self.fake_audio = fake_audio
@@ -245,8 +222,8 @@ class Mediad:
         self._subscribers = set()
         self._queue = asyncio.Queue()
         self._playing = None
-        self._ptt_owner = None  # the connection that holds push-to-talk down; None when it is up
-        self._ptt_watched = set()
+        self._ptt_owner = None  # the connection that holds push-to-talk down
+        self._ptt_watched = set()  # connections with a close callback for push-to-talk
         self._ptt_up = None
         self._recording = None
 
@@ -255,42 +232,27 @@ class Mediad:
         return {"media.snapshot": self.h_snapshot, "media.subscribe": self.h_subscribe,
                 "audio.play": self.h_play, "audio.stop": self.h_stop, "audio.ptt": self.h_ptt}
 
-    # ---- camera and pose
-
     def on_frame(self, t_ns, frame, markers):
         """Keep the newest frame and send its marker poses to robotd; never waits on robotd."""
         self.frame = (t_ns, frame)
         if self.robotd is not None:
             self.robotd.notify("robot.observe", {"t_mono_ns": t_ns, "markers": markers})
 
-    async def robotd_link(self):
-        """Keep one connection to robotd open, and open it again after a robotd restart."""
-        await dogproto.keep_connected(dogproto.sock_path("robotd"), self._set_robotd, ROBOTD_RETRY_S)
-
-    def _set_robotd(self, client):
-        """Use a new robotd connection for the poses."""
-        self.robotd = client
+    def frame_age_ms(self):
+        """Return the age of the newest frame in ms, or None before the first frame."""
+        return None if self.frame is None else (time.monotonic_ns() - self.frame[0]) // 1_000_000
 
     async def snapshot(self, max_px):
         """Return (JPEG bytes, age_ms) of the newest frame."""
         if self.frame is None:
             raise RpcError(dogproto.UNAVAILABLE, "no camera frame yet")
         age_ms = self.frame_age_ms()
-        jpeg = await asyncio.to_thread(encode_jpeg, self.frame[1], max_px)
-        return jpeg, age_ms
-
-    def frame_age_ms(self):
-        """Return the age of the newest frame in ms, or None before the first frame."""
-        return None if self.frame is None else (time.monotonic_ns() - self.frame[0]) // 1_000_000
-
-    # ---- subscribers
+        return await asyncio.to_thread(encode_jpeg, self.frame[1], max_px), age_ms
 
     def _notify(self, method, params):
         """Send one notification to each media.subscribe connection."""
         for conn in list(self._subscribers):
             conn.notify(method, params)
-
-    # ---- speaker
 
     async def player(self):
         """Play the queued items one at a time; cut() cancels the current one."""
@@ -312,7 +274,13 @@ class Mediad:
     async def _play_one(self, pcm, rate):
         """Play one PCM16 mono item to its end; a cancel stops it at once."""
         if self.fake_audio:
-            await self._fake_play(pcm, rate)
+            audio_log("play")
+            try:
+                await asyncio.sleep(len(pcm) / 2 / rate)  # the real play time
+            except asyncio.CancelledError:
+                audio_log("cut")
+                raise
+            audio_log("end")
             return
         proc = await asyncio.create_subprocess_exec(
             "aplay", "-q", "-D", self.speaker, "-t", "raw", "-f", "S16_LE", "-c", "1", "-r", str(rate),
@@ -328,27 +296,8 @@ class Mediad:
                 proc.kill()
                 await proc.wait()
 
-    async def _fake_play(self, pcm, rate):
-        """Write the PCM and log lines to DOG_RUN_DIR, and take the real play time."""
-        self._audio_log("play", bytes=len(pcm), rate=rate)
-        with open(os.path.join(dogproto.run_dir(), "audio_out.pcm"), "ab") as handle:
-            handle.write(pcm)
-        try:
-            await asyncio.sleep(len(pcm) / 2 / rate)
-        except asyncio.CancelledError:
-            self._audio_log("cut")
-            raise
-        self._audio_log("end")
-
-    def _audio_log(self, event, **fields):
-        """Append one fake speaker event with its monotonic time to audio_out.log."""
-        with open(os.path.join(dogproto.run_dir(), "audio_out.log"), "a") as handle:
-            handle.write(f"{time.monotonic_ns()} {event} {json.dumps(fields)}\n")
-
-    # ---- microphone
-
     async def _record(self, ptt_up):
-        """Record until ptt up or the 10 s cap; send the utterance unless it is shorter than 300 ms."""
+        """Record until ptt_up or the 10 s cap; send the utterance unless it is shorter than 300 ms."""
         try:
             pcm = await (self._fake_capture(ptt_up) if self.fake_audio else self._arecord(ptt_up))
         except OSError as exc:
@@ -362,14 +311,14 @@ class Mediad:
                                          "pcm16_b64": base64.b64encode(pcm).decode()})
 
     async def _fake_capture(self, ptt_up):
-        """Return a tone as long as the press, capped at 10 s."""
+        """Return silence as long as the press, capped at 10 s."""
         start = time.monotonic()
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(ptt_up.wait(), MAX_UTTERANCE_S)
-        return tone(min(time.monotonic() - start, MAX_UTTERANCE_S))
+        return bytes(2 * int(min(time.monotonic() - start, MAX_UTTERANCE_S) * REC_RATE))
 
     async def _arecord(self, ptt_up):
-        """Return the PCM that arecord gives until ptt up or the 10 s cap."""
+        """Return the PCM that arecord gives until ptt_up or the 10 s cap."""
         proc = await asyncio.create_subprocess_exec(
             "arecord", "-q", "-D", self.mic, "-t", "raw", "-f", "S16_LE", "-c", "1", "-r", str(REC_RATE),
             stdout=asyncio.subprocess.PIPE)
@@ -384,8 +333,6 @@ class Mediad:
             return await reader
         except asyncio.IncompleteReadError as exc:
             return exc.partial
-
-    # ---- method handlers
 
     async def h_snapshot(self, params, conn):
         """media.snapshot: return the newest frame as a JPEG with its age."""
@@ -427,11 +374,7 @@ class Mediad:
         return {}
 
     async def h_ptt(self, params, conn):
-        """audio.ptt: down silences the speaker, sends media.bargein and starts to record; up ends the press.
-
-        The press lasts until up or until the connection that pressed closes, also
-        after the recording stopped at its 10 s cap; audio.play is refused until then.
-        """
+        """audio.ptt: down cuts the speaker, sends media.bargein and records; the press ends on up or close of conn."""
         if not params["down"]:
             self._release_ptt()
             return {}
@@ -439,30 +382,25 @@ class Mediad:
         self._notify("media.bargein", {})
         if self._ptt_owner is None:
             self._ptt_owner = conn
-            self._watch_ptt_owner(conn)
+            if conn not in self._ptt_watched:
+                self._ptt_watched.add(conn)
+                conn.on_close.append(lambda: self._ptt_closed(conn))
             if self._recording is None or self._recording.done():
                 self._ptt_up = asyncio.Event()
                 self._recording = asyncio.ensure_future(self._record(self._ptt_up))
         return {}
 
     def _release_ptt(self):
-        """End the press: ptt up, or the close of the connection that pressed."""
+        """End the press; audio.play works again."""
         self._ptt_owner = None
         if self._ptt_up is not None:
             self._ptt_up.set()
 
-    def _watch_ptt_owner(self, conn):
-        """Release push-to-talk when conn closes, so a stopped padd cannot leave the microphone open."""
-        if conn in self._ptt_watched:
-            return
-        self._ptt_watched.add(conn)
-
-        def closed():
-            self._ptt_watched.discard(conn)
-            if self._ptt_owner is conn:
-                self._release_ptt()
-
-        conn.on_close.append(closed)
+    def _ptt_closed(self, conn):
+        """Release push-to-talk when the connection that pressed closes, so a dead padd cannot keep the mic open."""
+        self._ptt_watched.discard(conn)
+        if self._ptt_owner is conn:
+            self._release_ptt()
 
 
 # ---------------------------------------------------------------- LAN console
@@ -475,41 +413,33 @@ CONSOLE_PAGE = b"""<!doctype html>
 <style>
 body{margin:0 auto;padding:16px;max-width:640px;font-family:system-ui,sans-serif;background:#111;color:#eee}
 button{width:100%;margin:4px 0;padding:14px;border:0;border-radius:10px;font-size:1.2rem;background:#444;color:#fff}
-#stop{padding:28px;font-size:2rem;font-weight:bold;background:#d11}
-.row{display:flex;gap:8px}
-img{display:block;width:100%;aspect-ratio:4/3;margin:8px 0;border-radius:8px;background:#333}
-pre{white-space:pre-wrap;font-size:.9rem}
+#stop{padding:28px;font-size:2rem;background:#d11}
+img{width:100%;aspect-ratio:4/3;background:#333}
+pre{white-space:pre-wrap}
 </style></head><body>
-<button id="stop">STOP</button>
-<div class="row"><button id="arm">Arm</button><button id="disarm">Disarm</button></div>
-<img id="cam" alt="Camera image">
-<pre id="state">Loading</pre>
-<div id="tricks"></div>
-<pre id="reply"></pre>
+<button id="stop">STOP</button><button id="arm">Arm</button><button id="disarm">Disarm</button>
+<img id="cam" alt="Camera image"><pre id="state">Loading</pre><div id="tricks"></div><pre id="reply"></pre>
 <script>
 const $ = id => document.getElementById(id);
-if (location.search) history.replaceState(null, '', '/');
+history.replaceState(null, '', '/');
 async function post(path, body) {
   $('reply').textContent = path + ' ...';
   try {
-    const r = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                 body: JSON.stringify(body || {})});
-    $('reply').textContent = path + ': ' + JSON.stringify(await r.json());
+    const r = await fetch(path, {method: 'POST', body: JSON.stringify(body || {})});
+    $('reply').textContent = path + ': ' + await r.text();
   } catch (e) { $('reply').textContent = path + ': ' + e; }
   poll();
 }
-$('stop').onclick = () => post('/stop');
-$('arm').onclick = () => post('/arm');
-$('disarm').onclick = () => post('/disarm');
-let trickNames = '';
+for (const id of ['stop', 'arm', 'disarm']) $(id).onclick = () => post('/' + id);
+let trickNames;
 async function poll() {
   try {
     const s = await (await fetch('/state')).json();
-    $('state').textContent = s.error ? 'robotd: ' + s.error :
-      `armed: ${s.armed}  health: ${s.health}  fault: ${s.fault}\\nesp32: ${s.esp}  busy: ${JSON.stringify(s.busy)}` +
-      `\\nvision age: ${s.vision_age_ms} ms  frame age: ${s.frame_age_ms} ms`;
+    $('state').textContent = s.error ? 'robotd: ' + s.error : `armed: ${s.armed}  health: ${s.health}  fault: ${s.fault}
+esp32: ${s.esp}  busy: ${JSON.stringify(s.busy)}
+vision age: ${s.vision_age_ms} ms  frame age: ${s.frame_age_ms} ms`;
     const names = (s.tricks || []).map(t => t.name);
-    if (names.join() !== trickNames) {
+    if (names.join() !== trickNames) {  // a new button under a finger would lose the tap
       trickNames = names.join();
       $('tricks').replaceChildren(...names.map(name => {
         const b = document.createElement('button');
@@ -521,8 +451,7 @@ async function poll() {
   } catch (e) { $('state').textContent = String(e); }
 }
 function nextFrame() { setTimeout(() => { $('cam').src = '/snapshot.jpg?t=' + Date.now(); }, 500); }
-$('cam').onload = nextFrame;
-$('cam').onerror = nextFrame;
+$('cam').onload = $('cam').onerror = nextFrame;
 nextFrame();
 poll();
 setInterval(poll, 1000);
@@ -566,18 +495,15 @@ async def read_request(reader):
 
 
 class Console:
-    """The LAN console: one page, the snapshot, the state, and arm, disarm, stop and trick buttons.
+    """The LAN console: the page, the snapshot, the state, and the arm, disarm, stop and trick buttons.
 
-    Every endpoint needs the console token: a Bearer header, or the HttpOnly
-    SameSite=Strict cookie that GET /?token=... sets with the page. The cookie
-    holds an HMAC of the token, not the token. A POST with an Origin header
-    from another site is refused. The console calls robotd like any local client.
+    Each endpoint needs the token in a Bearer header, or the HttpOnly SameSite=Strict
+    cookie that GET /?token=... sets. The cookie holds an HMAC of the token, not the token.
     """
 
     def __init__(self, media, token):
         self.media = media
         self._token = token.encode()
-        # The cookie holds a value derived from the token, so a browser never stores the token itself.
         self._cookie = hmac.new(self._token, b"cookie", hashlib.sha256).hexdigest().encode()
         self._open = 0
 
@@ -630,40 +556,27 @@ class Console:
             return http_response(200, "text/html; charset=utf-8", CONSOLE_PAGE, (cookie,))
         if not self._authorized(headers):
             return http_response(401, "text/plain", b"open /?token=<console token> first\n")
-        if method == "POST":
-            origin = headers.get("origin")
-            if origin is not None and origin != f"http://{headers.get('host', '')}":
-                return http_response(403, "text/plain", b"cross-origin request refused\n")
-            return await self._post(path, body)
-        if method != "GET":
-            return http_response(405, "text/plain", b"method not allowed\n")
-        if path == "/":
+        origin = headers.get("origin")
+        if method == "POST" and origin is not None and origin != f"http://{headers.get('host', '')}":
+            return http_response(403, "text/plain", b"cross-origin request refused\n")
+        if (method, path) == ("GET", "/"):
             return http_response(200, "text/html; charset=utf-8", CONSOLE_PAGE)
-        if path == "/snapshot.jpg":
+        if (method, path) == ("GET", "/snapshot.jpg"):
             try:
                 jpeg, _ = await self.media.snapshot(FRAME_W)
             except RpcError as err:
                 return http_response(503, "text/plain", err.message.encode())
             return http_response(200, "image/jpeg", jpeg)
-        if path == "/state":
-            status, state = await self._robot("robot.state")
-            if status != 200:
-                state = {"error": state["error"]}
+        if (method, path) == ("GET", "/state"):
+            _, state = await self._robot("robot.state")
             return json_response(200, {**state, "frame_age_ms": self.media.frame_age_ms()})
-        return http_response(404, "text/plain", b"not found\n")
-
-    async def _post(self, path, body):
-        """Run one console button through robotd."""
-        if path in CONSOLE_BUTTONS:
+        if method == "POST" and path in CONSOLE_BUTTONS:
             return json_response(*await self._robot(CONSOLE_BUTTONS[path]))
-        if path == "/do":
+        if (method, path) == ("POST", "/do"):
             try:
-                trick = dogproto.decode(body or b"{}").get("trick")
-            except (ValueError, AttributeError):
-                trick = None
-            if not isinstance(trick, str) or not trick:
-                return json_response(400, {"error": "body must be {\"trick\": name}"})
-            params = {"trick": trick, "id": uuid.uuid4().hex}
+                params = {"trick": dogproto.decode(body)["trick"], "id": uuid.uuid4().hex}
+            except (ValueError, TypeError, KeyError, RecursionError):
+                return json_response(400, {"error": 'body must be {"trick": name}'})
             return json_response(*await self._robot("robot.do", params, TRICK_WAIT_S))
         return http_response(404, "text/plain", b"not found\n")
 
@@ -680,17 +593,8 @@ class Console:
 # ---------------------------------------------------------------- start-up
 
 
-def load_config(path):
-    """Return the [mediad] table of dog.toml, or {} when the file is absent."""
-    try:
-        with open(path, "rb") as handle:
-            return tomllib.load(handle).get("mediad", {})
-    except FileNotFoundError:
-        return {}
-
-
 async def main(argv=None):
-    """Start mediad: sockets, console, camera thread, robotd link and player."""
+    """Start mediad: sockets, console, camera thread, robotd link and player; run until killed."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", default=os.environ.get("DOG_CONFIG", "/etc/dog/dog.toml"))
     parser.add_argument("--fake-camera", action="store_true", help="draw markers from DOG_RUN_DIR/sim_pose.json")
@@ -699,47 +603,34 @@ async def main(argv=None):
     parser.add_argument("--console-port", type=int)
     args = parser.parse_args(argv)
     require_aruco_detector()
-    cfg = load_config(args.config)
-    dictionary = aruco_dictionary(cfg.get("aruco_dict", "DICT_4X4_50"))
+    try:
+        with open(args.config, "rb") as handle:
+            cfg = tomllib.load(handle).get("mediad", {})
+    except FileNotFoundError:
+        cfg = {}
     media = Mediad(args.fake_audio, cfg.get("speaker", "default"), cfg.get("mic", "default"))
     os.makedirs(dogproto.run_dir(), exist_ok=True)
-    servers = [
-        await dogproto.serve(dogproto.sock_path("mediad"), media.handlers(), limit=dogproto.MEDIA_LIMIT, group="dog"),
-        await dogproto.serve(dogproto.sock_path("mediad", cloud=True), media.handlers(), cloud=True,
-                             limit=dogproto.MEDIA_LIMIT, group="doglink"),
-    ]
+    await dogproto.serve(dogproto.sock_path("mediad"), media.handlers(), limit=dogproto.MEDIA_LIMIT, group="dog")
+    await dogproto.serve(dogproto.sock_path("mediad", cloud=True), media.handlers(), cloud=True,
+                         limit=dogproto.MEDIA_LIMIT, group="doglink")
     token = os.environ.get("DOG_CONSOLE_TOKEN", "")
     if len(token) >= CONSOLE_MIN_TOKEN_CHARS:
         bind = args.console_bind or cfg.get("console_bind", "127.0.0.1")
         port = args.console_port or cfg.get("console_port", 8080)
-        servers.append(await asyncio.start_server(Console(media, token).handle, bind, port, limit=HTTP_HEAD_LIMIT))
+        await asyncio.start_server(Console(media, token).handle, bind, port, limit=HTTP_HEAD_LIMIT)
         log.info("console on http://%s:%d", bind, port)
     else:
-        log.error("DOG_CONSOLE_TOKEN must have %d characters or more; the LAN console is off",
-                  CONSOLE_MIN_TOKEN_CHARS)
-    loop = asyncio.get_running_loop()
-    if args.fake_camera:
-        robot_marker = cfg.get("robot_marker", 1)
-        open_source = lambda: FakeCamera(dogproto.run_dir(), dictionary, robot_marker)  # noqa: E731
-    else:
-        open_source = lambda: open_camera(cfg.get("camera", "/dev/video0"))  # noqa: E731
-    threading.Thread(target=capture_loop, daemon=True, args=(
-        open_source, make_detector(dictionary),
-        lambda t_ns, frame, markers: loop.call_soon_threadsafe(media.on_frame, t_ns, frame, markers))).start()
-    tasks = [asyncio.ensure_future(media.player()), asyncio.ensure_future(media.robotd_link())]
-    stop = asyncio.Event()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, stop.set)
+        log.error("DOG_CONSOLE_TOKEN must have %d characters or more; the LAN console is off", CONSOLE_MIN_TOKEN_CHARS)
+    open_source = FakeCamera if args.fake_camera else functools.partial(open_camera, cfg.get("camera", "/dev/video0"))
+    deliver = functools.partial(asyncio.get_running_loop().call_soon_threadsafe, media.on_frame)
+    threading.Thread(target=capture_loop, args=(open_source, deliver), daemon=True).start()
     log.info("mediad ready, api %d", dogproto.API_VERSION)
-    await stop.wait()
-    media.cut()
-    await asyncio.sleep(0.05)  # let a cancelled aplay be killed
-    for task in tasks:
-        task.cancel()
-    for server in servers:
-        server.close()
+    # systemd stops aplay and arecord with mediad: the unit kills its whole control group.
+    await asyncio.gather(media.player(), dogproto.keep_connected(
+        dogproto.sock_path("robotd"), functools.partial(setattr, media, "robotd"), ROBOTD_RETRY_S))
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=os.environ.get("DOG_LOG", "INFO"), format="%(name)s %(levelname)s %(message)s")
-    asyncio.run(main(sys.argv[1:]))
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(main(sys.argv[1:]))
