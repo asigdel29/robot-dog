@@ -12,6 +12,7 @@ import math
 import os
 import statistics
 import sys
+import tempfile
 import time
 import types
 import unittest
@@ -27,6 +28,23 @@ sys.path.insert(0, os.path.join(ROOT, "sim"))
 import dogproto  # noqa: E402
 import mediad  # noqa: E402
 from devstack import Stack  # noqa: E402
+
+#: Stub aplay: records its pid and never reads stdin, like a long playback.
+STUB_APLAY = """#!/bin/sh
+echo $$ > "$STUB_DIR/aplay.pid"
+exec sleep 30
+"""
+
+#: Stub arecord: records its pid and writes 16 kHz PCM16 at the real rate.
+STUB_ARECORD = f"""#!{sys.executable}
+import os, sys, time
+with open(os.path.join(os.environ["STUB_DIR"], "arecord.pid"), "w") as handle:
+    handle.write(str(os.getpid()))
+while True:
+    sys.stdout.buffer.write(b"\\x01\\x00" * 800)
+    sys.stdout.buffer.flush()
+    time.sleep(0.05)
+"""
 
 
 def floor():
@@ -68,6 +86,134 @@ class MarkerMath(unittest.TestCase):
             mediad.require_aruco_detector()
         self.assertIn("4.7", str(ctx.exception.code))
         mediad.require_aruco_detector()
+
+
+class FakeConn:
+    """Stands in for a dogproto connection: keeps notifications and runs on_close callbacks on close()."""
+
+    def __init__(self):
+        self.on_close = []
+        self.notes = []
+
+    def notify(self, method, params=None):
+        """Keep one notification."""
+        self.notes.append((method, params))
+
+    def close(self):
+        """Run the on_close callbacks, as dogproto does when a client goes away."""
+        for callback in self.on_close:
+            callback()
+
+
+async def until(predicate, what, timeout=3.0):
+    """Wait until predicate() is true; fail with what after timeout."""
+    end = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > end:
+            raise AssertionError(f"timed out waiting for {what}")
+        await asyncio.sleep(0.01)
+
+
+def gone(pid):
+    """Return True when no process (not even a zombie) has this pid."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def read_pid(path):
+    """Return the pid that a stub wrote, or None before it wrote it."""
+    try:
+        with open(path) as handle:
+            return int(handle.read())
+    except (OSError, ValueError):
+        return None
+
+
+class InProcess(unittest.IsolatedAsyncioTestCase):
+    """Mediad handlers in this process: push-to-talk ownership, the cap and the real audio subprocess paths."""
+
+    async def asyncSetUp(self):
+        self.stub_dir = tempfile.mkdtemp()
+        for name, body in (("aplay", STUB_APLAY), ("arecord", STUB_ARECORD)):
+            path = os.path.join(self.stub_dir, name)
+            with open(path, "w") as handle:
+                handle.write(body)
+            os.chmod(path, 0o755)
+        env = {"PATH": self.stub_dir + os.pathsep + os.environ["PATH"], "STUB_DIR": self.stub_dir,
+               "DOG_RUN_DIR": self.stub_dir}
+        self.env = mock.patch.dict(os.environ, env)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def media(self, fake_audio):
+        """Return a mediad state object with one subscriber and the player running."""
+        media = mediad.Mediad(fake_audio, "default", "default")
+        self.sub = FakeConn()
+        media._subscribers.add(self.sub)
+        player = asyncio.ensure_future(media.player())
+        self.addCleanup(player.cancel)
+        return media
+
+    async def play_refused(self, media):
+        """Return True when audio.play gives BUSY."""
+        pcm = base64.b64encode(bytes(4800)).decode()
+        try:
+            await media.h_play({"pcm16_b64": pcm}, FakeConn())
+        except dogproto.RpcError as err:
+            return err.code == dogproto.BUSY
+        media.cut()
+        return False
+
+    def utterances(self):
+        """Return the PCM byte counts of the utterances that the subscriber got."""
+        return [len(base64.b64decode(p["pcm16_b64"])) for m, p in self.sub.notes if m == "media.utterance"]
+
+    async def test_close_of_pressing_connection_releases_ptt(self):
+        media = self.media(fake_audio=True)
+        pad = FakeConn()
+        await media.h_ptt({"down": True}, pad)
+        self.assertTrue(await self.play_refused(media))
+        await asyncio.sleep(0.4)
+        pad.close()  # padd died or the pad was lost while A was down
+        await until(lambda: self.utterances(), "utterance after the close")
+        self.assertFalse(await self.play_refused(media))
+
+    async def test_cut_kills_aplay(self):
+        media = self.media(fake_audio=False)
+        await media.h_play({"pcm16_b64": base64.b64encode(bytes(48000)).decode()}, FakeConn())
+        pid_path = os.path.join(self.stub_dir, "aplay.pid")
+        await until(lambda: read_pid(pid_path), "aplay start")
+        media.cut()
+        await until(lambda: gone(read_pid(pid_path)), "aplay exit", timeout=2)
+        await until(lambda: media._playing is None, "player idle")
+
+    async def test_arecord_partial_read_and_kill(self):
+        media = self.media(fake_audio=False)
+        pad = FakeConn()
+        await media.h_ptt({"down": True}, pad)
+        pid_path = os.path.join(self.stub_dir, "arecord.pid")
+        await until(lambda: read_pid(pid_path), "arecord start")
+        await asyncio.sleep(0.5)
+        await media.h_ptt({"down": False}, pad)
+        await until(lambda: self.utterances(), "utterance after up")
+        self.assertAlmostEqual(self.utterances()[0] / 32000, 0.5, delta=0.15)
+        self.assertTrue(gone(read_pid(pid_path)))
+
+    async def test_held_past_cap_sends_at_cap_and_stays_down(self):
+        media = self.media(fake_audio=False)
+        pad = FakeConn()
+        with mock.patch.object(mediad, "MAX_UTTERANCE_S", 0.4):
+            await media.h_ptt({"down": True}, pad)
+            await until(lambda: self.utterances(), "utterance at the cap")
+        self.assertEqual(self.utterances(), [int(0.4 * 32000)])
+        self.assertTrue(gone(read_pid(os.path.join(self.stub_dir, "arecord.pid"))), "arecord ends at the cap")
+        self.assertTrue(await self.play_refused(media), "still down after the cap")
+        await media.h_ptt({"down": False}, pad)
+        self.assertFalse(await self.play_refused(media))
+        self.assertEqual(len(self.utterances()), 1)
 
 
 class MediaStack(unittest.TestCase):
