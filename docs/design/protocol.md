@@ -115,3 +115,7 @@ The firmware is `firmware/ir_bridge/ir_bridge.ino`. The fake is `sim/fake_esp32.
 3. Only `arm` moves the bridge out of FAULT.
 4. A port open toggles DTR and resets the Feather. This is acceptable, because a new link always starts DISARMED.
 5. robotd sends the registry to the bridge at each handshake. A new capture never needs a new firmware.
+
+## 3. Pi to hub (WSS)
+
+`docs/design/cloud.md` owns this link. It gives the frames between `linkd` and the hub, the robot tools, the voice loop, the time limits, the caps and the tokens. The hub sends only methods from `CLOUD_METHODS`, each with a `sent_at` field. The Pi sends `link.hello`, `voice.utterance` and `voice.cancel`.
