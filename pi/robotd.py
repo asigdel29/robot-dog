@@ -7,6 +7,7 @@ loop never waits on another service. The design follows microduck's robotd;
 docs/design/safety.md and docs/design/registry.md own the rules.
 """
 
+import argparse
 import asyncio
 import collections
 import contextlib
@@ -16,9 +17,12 @@ import logging
 import math
 import os
 import random
+import signal
 import socket
+import sys
 import termios
 import time
+import tomllib
 import tty
 
 import dogproto
@@ -37,6 +41,10 @@ STICK_DEADBAND = 0.5
 HOLD_LEASE_MS = 300  # firmware caps leases at 400; 300 gives three renewals of margin
 HOLD_RENEW_S = 0.1
 VISION_MAX_AGE_S = 2.0
+GOTO_LIMIT_S = 30
+GOTO_MAX_STEPS = 20
+GOTO_NO_PROGRESS_STEPS = 5
+TURN_THRESHOLD_RAD = math.radians(25)
 RESULT_CACHE = 256
 MAX_TICK_ERRORS = 10
 DEGRADED_HZ = 15
@@ -212,6 +220,31 @@ def wrap(angle):
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
+def nav_step(robot, goal, radius, turn_sign=1):
+    """Return "done", "left", "right" or "forward" for one goto step from robot (cx, cy, heading) to goal (cx, cy).
+
+    Image y points down, so a positive heading error is a right turn when the
+    camera looks straight down; turn_sign = -1 swaps the turns for a mirrored view.
+    """
+    dx, dy = goal[0] - robot[0], goal[1] - robot[1]
+    if math.hypot(dx, dy) <= radius:
+        return "done"
+    err = wrap(math.atan2(dy, dx) - robot[2]) * turn_sign
+    if abs(err) > TURN_THRESHOLD_RAD:
+        return "right" if err > 0 else "left"
+    return "forward"
+
+
+def inside(point, polygon):
+    """Return True when point is inside polygon (ray cast)."""
+    x, y = point
+    hit = False
+    for (x1, y1), (x2, y2) in zip(polygon, polygon[1:] + polygon[:1]):
+        if (y1 > y) != (y2 > y) and x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
+            hit = not hit
+    return hit
+
+
 def sd_notify(state):
     """Send one systemd notify message; do nothing outside systemd."""
     addr = os.environ.get("NOTIFY_SOCKET")
@@ -333,6 +366,10 @@ class Robotd:
         self._results = collections.OrderedDict()
         self._last_activity = time.monotonic()
         self._tick_errors = 0
+
+    def handlers(self):
+        """Return the method table for dogproto.serve: robot.x goes to h_x."""
+        return {m: getattr(self, "h_" + m[len("robot."):]) for m in dogproto.PARAMS if m.startswith("robot.")}
 
     def _load_registry(self):
         """Read the registry; one that breaks a rule is replaced by an empty one, so nothing can load or move."""
@@ -784,6 +821,50 @@ class Robotd:
             raise RpcError(dogproto.INVALID_PARAMS, f"ms must be 50..{limit}")
         return await self._run_action("drive", params["id"], lambda: self._hold(name, ms))
 
+    async def h_goto(self, params, conn):
+        """robot.goto: drive toward an ArUco marker with short pulses, 30 s limit."""
+        caps = self.caps[conn.cloud]
+        if not caps["goto"]:
+            raise RpcError(dogproto.UNAVAILABLE, "goto needs verified forward and turn commands")
+        return await self._run_action("goto", params["id"], lambda: self._goto(str(params["marker"]), caps["drive"]))
+
+    async def _goto(self, goal_id, caps):
+        """Drive toward the goal marker; the goal is where the camera last saw it in this goto."""
+        cfg = self.registry["goto"]
+        drive = self.registry["drive"]
+        cmds = self.registry["commands"]
+        best, since_best, steps, move, goal = math.inf, 0, 0, None, None
+        try:
+            async with asyncio.timeout(GOTO_LIMIT_S):
+                for steps in range(1, GOTO_MAX_STEPS + 1):
+                    _, markers = self._markers()
+                    robot = self._robot_pose()
+                    goal = markers.get(goal_id, goal)  # the dog covers a floor marker as it arrives
+                    if robot is None or goal is None:
+                        return {"reached": False, "reason": "vision stale or marker not seen", "steps": steps}
+                    if not inside(robot[:2], cfg["area_px"]):
+                        return {"reached": False, "reason": "robot left the area", "steps": steps}
+                    dist = math.hypot(goal[0] - robot[0], goal[1] - robot[1])
+                    if dist < best - 2:
+                        best, since_best = dist, 0
+                    elif move == "forward":  # only a forward pulse is expected to get closer
+                        since_best += 1
+                        if since_best >= GOTO_NO_PROGRESS_STEPS:
+                            return {"reached": False, "reason": "no progress", "steps": steps}
+                    move = nav_step(robot, goal, cfg["goal_radius_px"], cfg["turn_sign"])
+                    if move == "done":
+                        return {"reached": True, "reason": "inside goal radius", "steps": steps}
+                    if move in ("left", "right") and not caps[move]:
+                        move = "right" if move == "left" else "left"  # turn the long way round
+                    ms = cfg["forward_ms"] if move == "forward" else cfg["turn_ms"]
+                    ms = min(ms, cmds[drive[move]]["max_run_ms"])  # a pulse never exceeds its command limit
+                    if ms > 0:
+                        await self._hold(drive[move], ms)
+                    await asyncio.sleep(cfg["settle_ms"] / 1000)
+        except TimeoutError:
+            return {"reached": False, "reason": "time limit", "steps": steps}
+        return {"reached": False, "reason": "step limit", "steps": steps}
+
     async def h_state(self, params, conn):
         """robot.state: report arm, link, health, tricks and capabilities."""
         return self.state(conn)
@@ -830,3 +911,63 @@ class Robotd:
         once = cmd["repeat"] == "none"
         return await self._run_action("test", f"test-{time.monotonic_ns()}", lambda: (
             self._esp_call("send", done_s=2.0, name=name) if once else self._hold(name, ms)))
+
+    async def h_reload(self, params, conn):
+        """robot.reload: read the registry again and re-load the bridge; DISARMED only."""
+        if self.armed:
+            raise RpcError(dogproto.BUSY, "disarm before reload")
+        self._load_registry()
+        self._close_link()  # the connector opens it again and loads the new entries
+        return {"ready": not self.reg_errors, "errors": self.reg_errors}
+
+    async def shutdown(self):
+        """Stop IR output and disarm before the process exits."""
+        self._disarm("shutdown")
+        await asyncio.sleep(0.05)
+        self._close_link()
+
+
+def load_config(path):
+    """Return the [robotd] table of dog.toml, or {} when the file is absent."""
+    try:
+        with open(path, "rb") as handle:
+            return tomllib.load(handle).get("robotd", {})
+    except FileNotFoundError:
+        return {}
+
+
+async def main(argv=None):
+    """Start robotd: sockets, connector and loop."""
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--config", default=os.environ.get("DOG_CONFIG", "/etc/dog/dog.toml"))
+    parser.add_argument("--serial")
+    parser.add_argument("--registry")
+    args = parser.parse_args(argv)
+    cfg = load_config(args.config)
+    daemon = Robotd(args.serial or cfg.get("serial", "/dev/ttyUSB0"),
+                    args.registry or cfg.get("registry", "/etc/dog/registry.json"))
+    if daemon.reg_errors:
+        log.warning("registry not ready: %s", "; ".join(daemon.reg_errors[:5]))
+    os.makedirs(dogproto.run_dir(), exist_ok=True)
+    servers = [
+        await dogproto.serve(dogproto.sock_path("robotd"), daemon.handlers(), group="dog"),
+        await dogproto.serve(dogproto.sock_path("robotd", cloud=True), daemon.handlers(), cloud=True, group="doglink"),
+    ]
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+    tasks = [asyncio.ensure_future(daemon.run_loop()), asyncio.ensure_future(daemon.connector())]
+    sd_notify("READY=1")
+    log.info("robotd ready, api %d, serial %s", dogproto.API_VERSION, daemon.serial_path)
+    await stop.wait()
+    await daemon.shutdown()
+    for task in tasks:
+        task.cancel()
+    for server in servers:
+        server.close()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=os.environ.get("DOG_LOG", "INFO"), format="%(name)s %(levelname)s %(message)s")
+    asyncio.run(main(sys.argv[1:]))
