@@ -50,6 +50,7 @@ class Stack:
     """Processes of one dev stack and helpers to call them and read the fake log."""
 
     def __init__(self, registry=None):
+
         self.run_dir = tempfile.mkdtemp(prefix="dog-")
         self.registry_path = os.path.join(self.run_dir, "registry.json")
         with open(self.registry_path, "w") as handle:
