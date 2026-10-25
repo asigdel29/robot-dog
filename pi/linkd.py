@@ -158,7 +158,7 @@ class Link:
     async def _handle(self, ws, frame):
         """Answer one hub request; frames that are not requests are ignored."""
         try:
-            msg = json.loads(frame)
+            msg = dogproto.decode(frame)
         except ValueError:
             return
         if not isinstance(msg, dict) or "id" not in msg:

@@ -22,6 +22,7 @@ The code is in `pi/linkd.py`, `hub/hub.py` and `sim/stub_hermes.py`. The tests a
 - linkd sends the header `Authorization: Bearer <DOG_DEVICE_TOKEN>`. The token is never in the URL.
 - linkd reads both values from `/etc/dog/link.env` (mode 0600).
 - Each message is one JSON-RPC 2.0 object in one text frame. The frame limit is 2 MiB.
+- A frame with `NaN` or `Infinity` is not valid JSON. The receiver drops it.
 - Each side sends a ping each 5 s. A side closes the link when no pong arrives in 5 s.
 - The first frame from linkd is `link.hello {api, version, device}`. `version` is the release directory name.
 - The hub closes the link with code 1008 when the first frame in 10 s is not a `link.hello` for `dog-01`.

@@ -123,7 +123,7 @@ class Device:
                "sent_at": int(time.time() * 1000)}
         try:
             async with self._send_lock:
-                await ws.send_text(json.dumps(msg, separators=(",", ":")))
+                await ws.send_text(json.dumps(msg, separators=(",", ":"), allow_nan=False))
             return await asyncio.wait_for(future, timeout)
         except TimeoutError:
             raise DeviceError(f"the dog did not answer {method} within {timeout:.0f} s") from None
@@ -160,6 +160,16 @@ class Device:
 device = Device()
 
 
+def _no_constant(name):
+    """Refuse a NaN or Infinity constant in a frame."""
+    raise ValueError(f"{name} is not valid JSON")
+
+
+def _decode(text):
+    """Parse one frame from the Pi; NaN and Infinity are refused, as on the Pi bus (dogproto.decode)."""
+    return json.loads(text, parse_constant=_no_constant)
+
+
 def _bearer_ok(header, token):
     """Return True when an Authorization header carries this token; an unset token never matches."""
     return bool(token) and hmac.compare_digest(header.encode(), f"Bearer {token}".encode())
@@ -168,7 +178,7 @@ def _bearer_ok(header, token):
 def _hello_params(text):
     """Return the params of a valid link.hello from our device, or None."""
     try:
-        msg = json.loads(text)
+        msg = _decode(text)
     except ValueError:
         return None
     if not isinstance(msg, dict) or msg.get("method") != "link.hello":
@@ -551,7 +561,7 @@ async def device_link(ws: WebSocket):
     try:
         while True:
             try:
-                msg = json.loads(await ws.receive_text())
+                msg = _decode(await ws.receive_text())
             except ValueError:
                 continue
             if not isinstance(msg, dict):

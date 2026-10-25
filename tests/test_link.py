@@ -153,18 +153,14 @@ class LinkStack(Stack):
             self.spawn("stub_hermes", os.path.join(ROOT, "sim", "stub_hermes.py"), "--port", str(stub_port),
                        "--tools-url", f"{self.hub_url}/tools/")
             self.wait_for(lambda: answers(f"{self.stub_url}/_stub/requests"), "stub_hermes", timeout=20)
-            self.start_hub(hub_port)
+            self.hub_port = hub_port
+            self.spawn("hub", os.path.join(ROOT, "hub", "hub.py"), "--port", str(hub_port))
+            self.wait_for(lambda: answers(f"{self.hub_url}/healthz"), "hub /healthz", timeout=20)
         self.env.update({"DOG_HUB_URL": self.hub_ws or f"ws://127.0.0.1:{self.hub_port}/device",
                          "DOG_DEVICE_TOKEN": DEVICE_TOKEN})
         self.spawn("linkd", os.path.join(ROOT, "pi", "linkd.py"), "--assume-synced")
         if self.hub_ws is None:
             self.wait_for(lambda: "device dog-01 up" in self.out("hub"), "linkd link to the hub")
-
-    def start_hub(self, port):
-        """Start the hub and wait for /healthz."""
-        self.hub_port = port
-        self.spawn("hub", os.path.join(ROOT, "hub", "hub.py"), "--port", str(port))
-        self.wait_for(lambda: answers(f"{self.hub_url}/healthz"), "hub /healthz", timeout=20)
 
     def out(self, name):
         """Return the output of one process so far."""
@@ -186,10 +182,10 @@ class LinkStack(Stack):
         rows = http_json(f"{self.stub_url}/_stub/requests")[1]
         return [r for r in rows if path is None or r["path"] == path]
 
-    def tools(self, work, token=TOOLS_TOKEN):
+    def tools(self, work):
         """Run work(client) with a Model Context Protocol client on /tools, as Hermes does."""
         async def session():
-            headers = {"Authorization": f"Bearer {token}"}
+            headers = {"Authorization": f"Bearer {TOOLS_TOKEN}"}
             async with httpx2.AsyncClient(headers=headers, timeout=httpx2.Timeout(10, read=60)) as http:
                 async with Client(streamable_http_client(f"{self.hub_url}/tools/", http_client=http)) as client:
                     return await work(client)
@@ -468,6 +464,12 @@ class LinkdRules(unittest.TestCase):
         self.assertFalse(self.stack.call("robot.state")["armed"])
         self.request("robot.state")
         self.assertIn("armed", self.reply()["result"])
+
+    def test_nan_frame_dropped(self):
+        self.conn.send('{"jsonrpc": "2.0", "id": 500, "method": "robot.state", "params": {"x": NaN}, "sent_at": %d}'
+                       % (time.time() * 1000))
+        state = self.request("robot.state")
+        self.assertEqual(self.reply()["id"], state)
 
     def test_stop_overtakes_drive(self):
         self.assertTrue(self.stack.call("robot.enable")["armed"])
