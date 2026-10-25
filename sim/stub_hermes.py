@@ -1,13 +1,11 @@
-"""stub_hermes: a stand-in for Hermes Agent and the OpenAI speech endpoints, for tests and the dev stack.
+"""stub_hermes: a stand-in for Hermes Agent and the OpenAI speech endpoints, for tests/test_link.py.
 
-It fakes the Hermes runs API (POST /v1/runs, the GET /v1/runs/{id}/events SSE
-stream in the Hermes wire format, POST /v1/runs/{id}/stop) and the two OpenAI
-endpoints that the hub uses (/v1/audio/transcriptions, /v1/audio/speech). When
-a run input contains "bark", the stream calls do_trick("bark") on the hub's
-/tools endpoint with a real Model Context Protocol client, in the middle of the
-stream, as Hermes does. Each request is recorded: GET /_stub/requests returns
-the list, and POST /_stub/config changes the transcript, the reply, the delays,
-the event stream status, extra raw stream lines and the length of each speech reply.
+It fakes the Hermes runs API (POST /v1/runs, the SSE stream of GET
+/v1/runs/{id}/events, POST /v1/runs/{id}/stop) and the two OpenAI endpoints of
+the hub (/v1/audio/transcriptions, /v1/audio/speech). When a run input contains
+"bark", the stream calls do_trick("bark") on the hub's /tools with a real Model
+Context Protocol client, in the middle of the stream, as Hermes does.
+GET /_stub/requests returns each recorded request; POST /_stub/config changes config.
 """
 
 import argparse
@@ -25,17 +23,18 @@ from fastapi.responses import StreamingResponse
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 
-#: Text that a test can change with POST /_stub/config.
+#: What a test can change: STT text, reply deltas, delays (s), event stream status, raw SSE lines, TTS length (s).
 config = {"transcript": "hello dog", "reply": ["Sure,", " I can do that.", " Here I go!"], "delta_delay": 0.05,
-          "create_delay": 0, "events_status": 200, "junk_lines": [], "speech_seconds": 0.1,
-          "tools_url": "", "tools_token": ""}
+          "create_delay": 0, "events_status": 200, "junk_lines": [], "speech_seconds": 0.1, "tools_url": ""}
+TOOLS_TOKEN = os.environ.get("TOOLS_TOKEN", "")
 requests = []
+#: Run id to (input text, stop event).
 runs = {}
 app = FastAPI()
 
 
 def record(path, **fields):
-    """Keep one request for the test to read; t_ns is monotonic, the clock of the fake bridge log."""
+    """Keep one request for the test; t_ns is monotonic, the clock of the fake bridge log."""
     requests.append({"t_ns": time.monotonic_ns(), "path": path, **fields})
 
 
@@ -46,9 +45,8 @@ def hermes_headers(request):
 
 @app.post("/_stub/config")
 async def set_config(request: Request):
-    """Change any config value: transcript, reply, delays, events_status, junk_lines or speech_seconds."""
+    """Change config values."""
     config.update(await request.json())
-    return config
 
 
 @app.get("/_stub/requests")
@@ -62,76 +60,60 @@ async def create_run(request: Request):
     """Start a run, as Hermes does: 202 with a run id, after create_delay seconds."""
     body = await request.json()
     run_id = f"run_{uuid.uuid4().hex}"
-    runs[run_id] = {"input": body.get("input", ""), "stopped": asyncio.Event()}
+    runs[run_id] = (body["input"], asyncio.Event())
     record("/v1/runs", headers=hermes_headers(request), body=body, run_id=run_id)
     await asyncio.sleep(config["create_delay"])
-    return {"run_id": run_id, "status": "started", "replayed": False}
+    return {"run_id": run_id, "status": "started"}
 
 
 @app.post("/v1/runs/{run_id}/stop")
 async def stop_run(run_id: str, request: Request):
     """Stop a run; its stream ends with run.cancelled."""
     record("/v1/runs/stop", headers=hermes_headers(request), run_id=run_id)
-    if run_id not in runs:
-        return Response(status_code=404)
-    runs[run_id]["stopped"].set()
+    runs[run_id][1].set()
     return {"run_id": run_id, "status": "stopping"}
 
 
 @app.get("/v1/runs/{run_id}/events")
-async def run_events(run_id: str, request: Request):
-    """Stream the run events in the Hermes SSE format."""
-    record("/v1/runs/events", headers=hermes_headers(request), run_id=run_id)
-    if run_id not in runs:
-        return Response(status_code=404)
+async def run_events(run_id: str):
+    """Stream the run events in the Hermes SSE format, or answer with events_status."""
+    record("/v1/runs/events", run_id=run_id)
     if config["events_status"] != 200:
         return Response(status_code=config["events_status"])
-    return StreamingResponse(_events(run_id), media_type="text/event-stream")
+    return StreamingResponse(_events(*runs[run_id]), media_type="text/event-stream")
 
 
-async def _events(run_id):
-    """Yield the SSE frames of one run: deltas, an optional mid-stream tool call, then a terminal event."""
-    run = runs[run_id]
-    seq = 0
+def _frame(name, **fields):
+    """Return one SSE event: a data line with the event JSON, then a blank line."""
+    return f"data: {json.dumps({'event': name, **fields})}\n\n"
 
-    def frame(name, **fields):
-        nonlocal seq
-        seq += 1
-        payload = {"event": name, "run_id": run_id, "timestamp": time.time(), **fields, "seq": seq}
-        return f"id: {seq}\ndata: {json.dumps(payload)}\n\n"
 
+async def _events(text, stopped):
+    """Yield the SSE lines of one run: deltas, a tool call after the first delta for "bark", then the end event."""
     yield ": open\n\n"
     for line in config["junk_lines"]:
         yield f"{line}\n\n"
-    text = ""
     for index, delta in enumerate(config["reply"]):
-        if index == 1 and "bark" in run["input"].lower():
-            yield frame("tool.started", tool="mcp_dog_do_trick", preview='{"name": "bark"}')
-            started = time.monotonic()
-            result = await call_tool("do_trick", {"name": "bark"})
-            yield frame("tool.completed", tool="mcp_dog_do_trick", duration=time.monotonic() - started,
-                        error=result["is_error"], preview=result["text"][:500])
+        if index == 1 and "bark" in text:
+            yield _frame("tool.started", tool="mcp_dog_do_trick")
+            await call_tool("do_trick", {"name": "bark"})
         with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(run["stopped"].wait(), config["delta_delay"])
-        if run["stopped"].is_set():
-            yield frame("run.cancelled", completed=False, interrupted=True, turn_exit_reason="interrupted_by_user")
-            yield ": stream closed\n\n"
+            await asyncio.wait_for(stopped.wait(), config["delta_delay"])
+        if stopped.is_set():
+            yield _frame("run.cancelled")
             return
-        text += delta
-        yield frame("message.delta", delta=delta)
-    yield frame("run.completed", completed=True, output=text, usage={}, runtime={})
-    yield ": stream closed\n\n"
+        yield _frame("message.delta", delta=delta)
+    yield _frame("run.completed", output="".join(config["reply"]))
 
 
 async def call_tool(name, arguments):
     """Call one hub tool as a Model Context Protocol client and record the result."""
-    headers = {"Authorization": f"Bearer {config['tools_token']}"}
+    headers = {"Authorization": f"Bearer {TOOLS_TOKEN}"}
     async with httpx2.AsyncClient(headers=headers, timeout=httpx2.Timeout(10, read=60)) as http:
         async with Client(streamable_http_client(config["tools_url"], http_client=http)) as client:
             result = await client.call_tool(name, arguments)
     text = " ".join(getattr(block, "text", "") for block in result.content)
-    record(f"tool:{name}", arguments=arguments, is_error=result.is_error, text=text)
-    return {"is_error": result.is_error, "text": text}
+    record(f"tool:{name}", is_error=result.is_error, text=text)
 
 
 @app.post("/v1/audio/transcriptions")
@@ -139,7 +121,7 @@ async def transcriptions(request: Request):
     """Return the configured transcript for any audio file."""
     form = await request.form()
     audio = await form["file"].read()
-    record("/v1/audio/transcriptions", model=form.get("model"), bytes=len(audio), wav=audio[:4] == b"RIFF",
+    record("/v1/audio/transcriptions", model=form.get("model"), wav=audio[:4] == b"RIFF",
            authorization=request.headers.get("authorization"))
     return {"text": config["transcript"]}
 
@@ -147,19 +129,17 @@ async def transcriptions(request: Request):
 @app.post("/v1/audio/speech")
 async def speech(request: Request):
     """Return speech_seconds of silent 24 kHz PCM16 for any text."""
-    body = await request.json()
-    record("/v1/audio/speech", body=body)
+    record("/v1/audio/speech", body=await request.json())
     return Response(content=b"\x00\x00" * int(24000 * config["speech_seconds"]), media_type="audio/pcm")
 
 
 def main():
-    """Serve the stub on loopback."""
+    """Serve the stub on loopback; the hub's /tools token comes from TOOLS_TOKEN."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--port", type=int, default=8642)
     parser.add_argument("--tools-url", default="http://127.0.0.1:8000/tools/")
     args = parser.parse_args()
     config["tools_url"] = args.tools_url
-    config["tools_token"] = os.environ.get("TOOLS_TOKEN", "")
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
 
 
