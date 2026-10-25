@@ -58,15 +58,12 @@ The pose of one marker is `[cx, cy, heading_rad]` in image pixels:
 - mediad never waits for robotd. When the connection closes, mediad tries to connect again each 0.5 s.
 - `robot.state` gives the age of the last pose as `vision_age_ms`. robotd stops a goto when the pose is older than 2 s.
 
-Targets: a pose rate of 10 Hz or more, and a `vision_age_ms` p95 of less than 200 ms.
-
 ## 5. Fake camera
 
 `mediad --fake-camera` replaces the camera in the dev stack and in the tests.
 
 - Each frame is a gray floor of 640 x 480 px.
-- The fake camera draws marker 1 at the toy pose in `sim_pose.json`. The top edge of the marker points along the toy heading.
-- Marker 1 is the `goto.robot_marker` of the dev stack registry.
+- The fake camera draws marker 1, the robot marker of the dev stack registry, at the toy pose in `sim_pose.json`. The top edge of the marker points along the toy heading.
 - The fake camera draws each goal marker of `fake_markers.json` upright. The file format is `{"2": [x, y]}`.
 - mediad reads the two files in `DOG_RUN_DIR` for each frame. `Stack.set_goal_markers` in `sim/devstack.py` writes `fake_markers.json`.
 - Each fake marker is 36 px, with a white margin of 6 px.
@@ -99,9 +96,8 @@ The press follows the button:
 - When padd loses the pad or stops, it sends `audio.ptt {down: false}`. When padd stops suddenly, for example after `kill -9`, the closed connection ends the press.
 - At the 10 s limit, mediad stops `arecord` and sends the utterance. The press continues until the person releases A.
 - While the press continues, mediad refuses `audio.play` with BUSY. Thus the speaker cannot play into the microphone.
-- `audio.stop` stops `aplay` and clears the play queue.
 - mediad records audio only while a person holds A.
-- When mediad stops, systemd also stops `aplay` and `arecord`. The unit stops its full control group.
+- When mediad stops, systemd stops `aplay` and `arecord` with the rest of the unit.
 
 `mediad --fake-audio` uses no subprocesses:
 
