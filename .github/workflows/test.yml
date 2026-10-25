@@ -1,4 +1,4 @@
-# CI gate: unit, conformance (fake bridge) and end-to-end tests of the dog stack.
+# CI gate: unit, conformance (fake bridge) and end-to-end tests of the dog stack, and the firmware build.
 name: test
 on:
   pull_request:
@@ -17,3 +17,23 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
       - name: Unit, conformance and end-to-end tests
         run: python -m unittest discover -v -s tests
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      ESP32_INDEX: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+        with:
+          version: "1.5.1"
+      - name: Install the esp32 core and the libraries
+        run: |
+          arduino-cli core update-index --additional-urls "$ESP32_INDEX"
+          arduino-cli core install esp32:esp32@3.3.12 --additional-urls "$ESP32_INDEX"
+          arduino-cli lib install IRremote@4.7.1 ArduinoJson@7.4.3
+      - name: Compile the IR bridge; any compiler warning fails the job
+        shell: bash
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:adafruit_feather_esp32_v2 --warnings all firmware/ir_bridge 2>&1 | tee build.log
+          if grep -n "warning:" build.log; then exit 1; fi
