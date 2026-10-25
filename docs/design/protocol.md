@@ -61,7 +61,7 @@ The `PARAMS` table in `dogproto.py` is the reference for each method and its fie
 | `robot.do {trick, id}` | Request | Yes | Replies when the trick ends. |
 | `robot.drive {dir, ms, id}` | Request | Yes | `dir` is forward, back, left or right. `ms` is 50 to the command `max_run_ms`. |
 | `robot.goto {marker, id}` | Request | Yes | 30 s limit. Needs verified forward and one turn. |
-| `robot.state` | Request | Yes | A cloud caller sees only cloud tricks. |
+| `robot.state` | Request | Yes | A cloud caller sees only cloud tricks and cloud capabilities. |
 | `robot.capture {ms}` | Request | No | DISARMED only, one at a time. `ms` is 100 to 10000. Returns the IR frames that the receiver saw. |
 | `robot.test {name, ms}` | Request | No | Armed only. `ms` is 50 to 1000. Accepts a command that is not verified. |
 | `robot.reload` | Request | No | DISARMED only. Reads the registry again and loads the bridge again. |

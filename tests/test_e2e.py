@@ -9,12 +9,14 @@ are printed so a run can go into docs/test-log.md.
 import asyncio
 import contextlib
 import copy
+import json
 import math
 import os
 import random
 import signal
 import statistics
 import sys
+import threading
 import time
 import unittest
 import uuid
@@ -209,6 +211,38 @@ class RobotdStack(unittest.TestCase):
 
         self.assertEqual(asyncio.run(scenario()), dogproto.PREEMPTED)
         self.stack.wait_for(lambda: any(m["name"] == "left" for _, m in self.stack.ops("hold")), "stick hold")
+
+
+class PoseFeeder(threading.Thread):
+    """Stands in for mediad: turns the fake toy pose into robot.observe with a goal marker (used by test_link)."""
+
+    def __init__(self, stack, goal):
+        super().__init__(daemon=True)
+        self.stack = stack
+        self.goal = goal
+        self.halt = threading.Event()
+
+    def run(self):
+        """Feed poses until halt is set."""
+        asyncio.run(self._feed())
+
+    async def _feed(self):
+        """Send one robot.observe each 100 ms from sim_pose.json."""
+        client = await dogproto.Client.connect(self.stack.sock("robotd"))
+        path = os.path.join(self.stack.run_dir, "sim_pose.json")
+        try:
+            while not self.halt.is_set():
+                try:
+                    with open(path) as handle:
+                        pose = json.load(handle)
+                except (OSError, ValueError):
+                    pose = None
+                if pose:
+                    client.notify("robot.observe", {"t_mono_ns": time.monotonic_ns(), "markers": {
+                        "1": [pose["x"], pose["y"], pose["heading"]], "2": [self.goal[0], self.goal[1], 0.0]}})
+                await asyncio.sleep(0.1)
+        finally:
+            await client.close()
 
 
 class BadRegistry(unittest.TestCase):
