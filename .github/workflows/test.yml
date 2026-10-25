@@ -49,7 +49,7 @@ jobs:
       - name: Create the dog directories from the tmpfiles entry
         run: |
           sudo systemd-tmpfiles --create "$PWD/deploy/pi/dog-tmpfiles.conf"
-          stat -c '%U:%G %a %n' /run/dog /var/lib/dog /var/lib/dog/captures
+          sudo stat -c '%U:%G %a %n' /run/dog /var/lib/dog /var/lib/dog/captures
       - name: Validate the Caddyfile with the Ubuntu caddy package (the droplet version)
         run: |
           sudo apt-get update
