@@ -180,8 +180,9 @@ class Capture(unittest.TestCase):
             robotctl.entry_from_captures([self.TAP, {**self.TAP, "cmd": 1}, self.TAP], [self.TAP])
 
     def test_toggle_refused(self):
-        with self.assertRaises(robotctl.InputError):
-            robotctl.entry_from_captures([{**self.TAP, "proto": "RC5"}] * 3, [])
+        for proto in ("RC5", "RC6", "RC6A", "Marantz"):
+            with self.assertRaises(robotctl.InputError):
+                robotctl.entry_from_captures([{**self.TAP, "proto": proto}] * 3, [])
 
     def test_raw_timings_compared(self):
         raw = {"proto": "raw", "raw": [1000, 500, 1000, 500], "gap_us": 0}
