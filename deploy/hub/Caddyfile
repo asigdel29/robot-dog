@@ -1,0 +1,14 @@
+# Caddyfile: the public TLS front of the hub. Install it as /etc/caddy/Caddyfile.
+# Only /device (the WSS link from the Pi) and /healthz reach the hub; every other path gets 404.
+# DOG_DOMAIN comes from the caddy.service drop-in that scripts/deploy-hub.sh writes.
+# reverse_proxy passes WebSocket upgrades through with no extra settings.
+
+dog.{$DOG_DOMAIN} {
+	@hub path /device /healthz
+	handle @hub {
+		reverse_proxy 127.0.0.1:8000
+	}
+	handle {
+		respond 404
+	}
+}
