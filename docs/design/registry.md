@@ -76,6 +76,9 @@ Do these steps for each of the 12 remote buttons.
 4. Hold the button down for 4 s when the tool tells you.
 5. Arm the dog with gamepad Start.
 6. Run `robotctl registry test <name> --ms 300`. Watch the dog.
-7. Record the behavior with `robotctl registry verify <name> --kind <kind> --natural-ms <ms> --interruptible <yes|no> --notes "<evidence>"`.
-8. Add `--cloud yes` only after the stop test passes at operating distance.
-9. For a drive button, run `robotctl registry map <dir> <name>`.
+7. Disarm the dog. robotd reads a new registry only while it is DISARMED.
+8. Record the behavior with `robotctl registry verify <name> --kind <kind> --natural-ms <ms> --interruptible <yes|no> --notes "<evidence>"`.
+9. Add `--cloud yes` only after the stop test passes at operating distance.
+10. For a drive button, run `robotctl registry map <dir> <name>`.
+
+When the dog is armed, `verify` and `map` write the file and report `reload: pending`. Disarm the dog. Then run `robotctl registry reload`.

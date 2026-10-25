@@ -58,6 +58,8 @@ class Stack:
         self.env = {**os.environ, "DOG_RUN_DIR": self.run_dir, "PYTHONUNBUFFERED": "1"}
         self.procs = {}
         self._logs = []
+        self._log_pos = 0
+        self._log_rows = []
 
     def __enter__(self):
         self.start()
@@ -115,16 +117,26 @@ class Stack:
             return json.load(handle)
 
     def log(self):
-        """Return the fake bridge log as (t_mono_ns, "in"|"out", message) tuples."""
-        rows = []
-        with open(os.path.join(self.run_dir, "fake_esp32.log")) as handle:
-            for line in handle:
-                t_ns, direction, body = line.rstrip("\n").split(" ", 2)
-                try:
-                    rows.append((int(t_ns), direction, json.loads(body)))
-                except ValueError:
-                    continue
-        return rows
+        """Return the fake bridge log as (t_mono_ns, "in"|"out", message) tuples.
+
+        Reads only the new bytes since the last call: a full re-read on each poll
+        takes enough CPU on a small CI runner to delay the daemons under test.
+        """
+        with open(os.path.join(self.run_dir, "fake_esp32.log"), "rb") as handle:
+            handle.seek(self._log_pos)
+            data = handle.read()
+        complete, _, _ = data.rpartition(b"\n")
+        if complete:
+            self._log_pos += len(complete) + 1
+        for line in complete.decode(errors="replace").splitlines():
+            parts = line.split(" ", 2)
+            if len(parts) != 3:
+                continue
+            try:
+                self._log_rows.append((int(parts[0]), parts[1], json.loads(parts[2])))
+            except ValueError:
+                continue
+        return list(self._log_rows)
 
     def ops(self, op, since_ns=0):
         """Return logged ops of one kind sent to the fake after since_ns."""
@@ -137,7 +149,7 @@ class Stack:
             rows = self.ops(op, since_ns)
             if len(rows) >= count or time.monotonic() > end:
                 return rows
-            time.sleep(0.01)
+            time.sleep(0.02)
 
     def kill(self, name, sig=signal.SIGKILL):
         """Send a signal to one process and wait for it to exit."""

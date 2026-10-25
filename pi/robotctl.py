@@ -56,11 +56,23 @@ def write_registry(path, doc):
     errors = robotd.check_registry(doc)
     if errors:
         raise InputError("registry rules: " + "; ".join(errors))
-    tmp = f"{path}.tmp"
+    tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w") as handle:
         json.dump(doc, handle, indent=2)
         handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(tmp, path)
+
+
+def reload_after_write():
+    """Ask robotd to read the registry again; an armed dog keeps the old registry until a disarm."""
+    try:
+        return rpc("robot.reload")
+    except dogproto.RpcError as err:
+        if err.code != dogproto.BUSY:
+            raise
+        return {"written": True, "reload": "pending: disarm the dog, then run robotctl registry reload"}
 
 
 def entry_from_captures(taps, hold):
@@ -139,7 +151,7 @@ def verify(args, registry_path):
     evidence = args.notes or "verified"
     cmd["notes"] = f"{cmd.get('notes', '')}; {datetime.date.today().isoformat()}: {evidence}".strip("; ")
     write_registry(registry_path, doc)
-    return rpc("robot.reload")
+    return reload_after_write()
 
 
 def map_drive(direction, name, registry_path):
@@ -149,7 +161,7 @@ def map_drive(direction, name, registry_path):
     doc = read_registry(registry_path)
     doc.setdefault("drive", {})[direction] = None if name == "none" else name
     write_registry(registry_path, doc)
-    return rpc("robot.reload")
+    return reload_after_write()
 
 
 # ---------------------------------------------------------------- CLI
@@ -223,7 +235,7 @@ def run(argv):
     except InputError as err:
         print(str(err), file=sys.stderr)
         return EXIT_INPUT
-    except (ConnectionError, FileNotFoundError, TimeoutError) as err:
+    except (OSError, TimeoutError) as err:  # ConnectionError, FileNotFoundError and PermissionError are OSErrors
         print(f"robotd not reachable: {err}", file=sys.stderr)
         return EXIT_UNREACHABLE
     return EXIT_OK
