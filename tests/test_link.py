@@ -598,11 +598,15 @@ class LinkdRules(unittest.TestCase):
         self.assertEqual(frames[0]["params"]["id"], "u1")
 
     def test_link_loss_disarms(self):
+        """A closed link and a SIGTERM of linkd both disarm the dog; a reconnect does not arm it."""
         self.assertTrue(self.stack.call("robot.enable")["armed"])
         self.conn.close()
         self.stack.wait_for(lambda: not self.stack.call("robot.state")["armed"], "disarm after link loss")
         self.hub.conns.get(timeout=10)  # linkd reconnects
         self.assertFalse(self.stack.call("robot.state")["armed"], "a reconnect must not arm")
+        self.assertTrue(self.stack.call("robot.enable")["armed"])
+        self.stack.kill("linkd", signal.SIGTERM)
+        self.assertFalse(self.stack.call("robot.state")["armed"], "disarm on SIGTERM")
 
     def test_backoff_after_short_sessions(self):
         """A hub that closes each link at once gets 1, 2, 4 s waits, not a reconnect and disarm each second."""
@@ -618,7 +622,7 @@ class ClockWatch(unittest.TestCase):
     """linkd's NTP flag: refreshed off the event loop; an unknown state keeps the last value."""
 
     def test_unknown_state_keeps_last_value(self):
-        link = linkd.Link("ws://127.0.0.1:1/device", "token", "dog-01", assume_synced=False)
+        link = linkd.Link("ws://127.0.0.1:1/device", "token", "dog-01", clock_synced=False)
         answers, seen = [True, None, False], []
 
         def fake_check():
