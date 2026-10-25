@@ -1,0 +1,17 @@
+# CI gate: unit, conformance (fake bridge) and end-to-end tests of the dog stack.
+name: test
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Unit, conformance and end-to-end tests
+        run: python -m unittest discover -v -s tests

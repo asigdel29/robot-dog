@@ -1,0 +1,7 @@
+# Configuration of the robot dog daemons on the Pi. Install it as /etc/dog/dog.toml.
+# Replace the device paths with the persistent paths from `ls -l /dev/serial/by-id/ /dev/v4l/by-id/`.
+
+[robotd]
+serial = "/dev/serial/by-id/REPLACE_WITH_FEATHER"
+registry = "/etc/dog/registry.json"
+captures = "/var/lib/dog/captures"
