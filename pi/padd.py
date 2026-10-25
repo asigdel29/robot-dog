@@ -5,10 +5,28 @@ bus calls on robotd and mediad. On a lost pad or a stop it releases push-to-talk
 and the stick. docs/design/media.md owns the mapping.
 """
 
+import argparse
+import asyncio
+import contextlib
+import functools
+import logging
+import os
+import signal
+import sys
+import time
+import tomllib
 import uuid
 
+import dogproto
+
+log = logging.getLogger("padd")
+
+TICK_HZ = 20
 DEADBAND = 0.15
 SELECT_HOLD_S = 1.0
+RETRY_S = 1.0
+REPLY_WAIT_S = 60.0
+RELEASE_WAIT_S = 1.0
 EV_KEY, EV_ABS = 1, 3
 ABS_X, ABS_Y = 0, 1
 #: Linux codes that the xpad driver reports for an XInput pad.
@@ -85,3 +103,101 @@ class PadMapper:
         if self._moving:
             actions.append(("robotd", "robot.move", {"vx": 0.0, "vyaw": 0.0}))
         return actions
+
+
+def find_pad():
+    """Return (device, absinfo) of the first device with two stick axes and gamepad buttons, or None."""
+    import evdev  # Linux only
+
+    for path in evdev.list_devices():
+        device = evdev.InputDevice(path)
+        caps = device.capabilities()
+        axes = {code: (info.min, info.max) for code, info in caps.get(EV_ABS, []) if code in (ABS_X, ABS_Y)}
+        if len(axes) == 2 and {BTN_A, BTN_B, BTN_START} <= set(caps.get(EV_KEY, [])):
+            return device, axes
+        device.close()
+    return None
+
+
+async def report(method, call):
+    """Wait for one reply and log it; a failed request is not sent again."""
+    try:
+        log.info("%s: %s", method, await call)
+    except (dogproto.RpcError, ConnectionError, TimeoutError) as exc:
+        log.warning("%s failed: %s", method, exc)
+
+
+def dispatch(clients, actions):
+    """Send actions without waiting: robot.move as a notification, the rest as requests; return the request tasks."""
+    tasks = []
+    for service, method, params in actions:
+        client = clients.get(service)
+        if client is None or client.closed.is_set():
+            log.warning("%s not connected; %s dropped", service, method)
+            continue
+        if method == "robot.move":
+            client.notify(method, params)
+        else:
+            tasks.append(asyncio.ensure_future(report(method, client.call(method, params, REPLY_WAIT_S))))
+    return tasks
+
+
+async def tick_loop(mapper, clients):
+    """Run the mapper ticks at 20 Hz."""
+    while True:
+        dispatch(clients, mapper.on_tick(time.monotonic()))
+        await asyncio.sleep(1 / TICK_HZ)
+
+
+async def run(bindings):
+    """Find the pad, map its events, and look for it again each 1 s after an unplug."""
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
+    clients = {}
+    keepers = [asyncio.ensure_future(dogproto.keep_connected(
+        dogproto.sock_path(service), functools.partial(clients.__setitem__, service), RETRY_S))
+        for service in ("robotd", "mediad")]
+    try:
+        while True:
+            found = find_pad()
+            if found is None:
+                await asyncio.sleep(RETRY_S)
+                continue
+            device, absinfo = found
+            log.info("gamepad %s at %s", device.name, device.path)
+            mapper = PadMapper(absinfo, bindings)
+            ticker = asyncio.ensure_future(tick_loop(mapper, clients))
+            try:
+                async for event in device.async_read_loop():
+                    dispatch(clients, mapper.on_event(event.type, event.code, event.value, time.monotonic()))
+            except OSError as exc:
+                log.warning("gamepad lost: %s", exc)
+            finally:
+                ticker.cancel()
+                device.close()
+                pending = dispatch(clients, mapper.release())
+                if pending:
+                    await asyncio.wait(pending, timeout=RELEASE_WAIT_S)
+            await asyncio.sleep(RETRY_S)
+    finally:
+        for keeper in keepers:
+            keeper.cancel()
+
+
+def main(argv=None):
+    """Start padd; refuse a bad [padd.bindings] of dog.toml before the pad is open."""
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--config", default=os.environ.get("DOG_CONFIG", "/etc/dog/dog.toml"))
+    args = parser.parse_args(argv)
+    try:
+        with open(args.config, "rb") as handle:
+            bindings = tomllib.load(handle).get("padd", {}).get("bindings", {})
+    except FileNotFoundError:
+        bindings = {}
+    PadMapper({ABS_X: (-1, 1), ABS_Y: (-1, 1)}, bindings)
+    with contextlib.suppress(asyncio.CancelledError, KeyboardInterrupt):
+        asyncio.run(run(bindings))
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=os.environ.get("DOG_LOG", "INFO"), format="%(name)s %(levelname)s %(message)s")
+    main(sys.argv[1:])
