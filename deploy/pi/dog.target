@@ -1,0 +1,9 @@
+# dog.target: groups the four dog daemons so that one command starts, stops or restarts all of them.
+# Each service has PartOf=dog.target, so `systemctl restart dog.target` restarts each daemon.
+
+[Unit]
+Description=Robot dog daemons
+Wants=robotd.service mediad.service padd.service linkd.service
+
+[Install]
+WantedBy=multi-user.target

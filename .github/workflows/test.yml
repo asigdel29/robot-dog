@@ -17,3 +17,36 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
       - name: Unit, conformance and end-to-end tests
         run: python -m unittest discover -v -s tests
+  deploy:
+    # Static checks of the deploy files: shell scripts, systemd units, tmpfiles and the Caddyfile.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck the scripts, hooks and launcher
+        run: shellcheck scripts/*.sh hooks/preinstall hooks/postinstall deploy/pi/robotctl
+      - name: Create the users and venv paths that the units name
+        run: |
+          sudo groupadd --system dog
+          sudo groupadd --system doglink
+          sudo useradd --system --gid dog --no-create-home dog
+          sudo useradd --system --gid doglink --no-create-home doglink
+          sudo useradd --system --user-group --no-create-home doghub
+          for venv in /opt/dog/current/.venv /opt/doghub/.venv; do
+            sudo mkdir -p "$venv/bin"
+            sudo ln -s /usr/bin/python3 "$venv/bin/python"
+          done
+      - name: Verify the systemd units
+        # verify only warns about an unknown key, so a warning that names one of these units also fails the step.
+        run: |
+          systemd-analyze verify deploy/pi/dog.target deploy/pi/*.service deploy/hub/doghub.service 2>&1 | tee verify.log
+          if grep -E 'dog\.target|(robotd|mediad|padd|linkd|doghub)\.service' verify.log; then exit 1; fi
+      - name: Create the dog directories from the tmpfiles entry
+        run: |
+          sudo systemd-tmpfiles --create "$PWD/deploy/pi/dog-tmpfiles.conf"
+          stat -c '%U:%G %a %n' /run/dog /var/lib/dog /var/lib/dog/captures
+      - name: Validate the Caddyfile with the Ubuntu caddy package (the droplet version)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y caddy
+          DOG_DOMAIN=example.com caddy validate --adapter caddyfile --config deploy/hub/Caddyfile

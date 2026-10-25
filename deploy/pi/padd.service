@@ -1,0 +1,30 @@
+# padd.service: runs padd, which reads the wired gamepad (arm, stop, drive, push-to-talk).
+# It needs the input group for /dev/input and talks to robotd and mediad over unix sockets only.
+
+[Unit]
+Description=Robot dog gamepad (padd)
+PartOf=dog.target
+After=robotd.service
+StartLimitIntervalSec=0
+
+[Service]
+User=dog
+Group=dog
+ExecStart=/opt/dog/current/.venv/bin/python /opt/dog/current/pi/padd.py --config /etc/dog/dog.toml
+Restart=always
+RestartSec=1
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run/dog
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX
