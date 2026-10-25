@@ -10,7 +10,7 @@ The code is in `pi/dogproto.py`.
 - The transport is a unix socket in `/run/dog/`. The `DOG_RUN_DIR` variable changes this directory for tests.
 - There is no broker. Each daemon serves its own sockets.
 - `API_VERSION` is 1. A peer with a different value is logged. It is not refused.
-- The line limit is 64 KiB for robotd. A longer line gets PARSE_ERROR (-32700), and the daemon closes the connection.
+- The line limit is 64 KiB for robotd and 2 MiB for mediad. A longer line gets PARSE_ERROR (-32700), and the daemon closes the connection.
 
 ### 1.1 Two sockets for each daemon
 
