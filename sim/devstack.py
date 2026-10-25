@@ -59,10 +59,11 @@ def free_port():
 class Stack:
     """Processes of one dev stack and helpers to call them and read the fake logs.
 
-    media=False leaves mediad out, for a test that writes robot.observe itself.
+    media=True also starts mediad. The robotd tests leave it out, so the camera
+    work does not share the CPU with their latency checks.
     """
 
-    def __init__(self, registry=None, pose="320,240,0", media=True):
+    def __init__(self, registry=None, pose="320,240,0", media=False):
         self.run_dir = tempfile.mkdtemp(prefix="dog-")
         self.registry_path = os.path.join(self.run_dir, "registry.json")
         with open(self.registry_path, "w") as handle:
@@ -91,7 +92,7 @@ class Stack:
         return self.procs[name]
 
     def start(self):
-        """Start fake_esp32, robotd and (unless media=False) mediad, and wait until each is ready."""
+        """Start fake_esp32, robotd and (with media=True) mediad, and wait until each is ready."""
         self.spawn("fake_esp32", os.path.join(ROOT, "sim", "fake_esp32.py"), "--run-dir", self.run_dir,
                    "--pose", self.pose)
         self.wait_for(lambda: os.path.exists(os.path.join(self.run_dir, "esp32")), "fake esp32 pty")
@@ -216,7 +217,7 @@ class Stack:
 
 def main():
     """Start a dev stack and keep it alive until Ctrl-C."""
-    with Stack() as stack:
+    with Stack(media=True) as stack:
         print(f"run dir: {stack.run_dir}")
         print(f"robotctl: DOG_RUN_DIR={stack.run_dir} python pi/robotctl.py --config /dev/null state")
         print(f"console: {stack.console_url('/?token=' + stack.console_token)}")

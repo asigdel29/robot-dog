@@ -76,7 +76,7 @@ class MediaStack(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.stack = Stack()
+        cls.stack = Stack(media=True)
         cls.stack.start()
 
     @classmethod

@@ -242,7 +242,7 @@ class SimGoto(unittest.TestCase):
     def test_goto_random_goals(self):
         rng = random.Random(7)
         reached = 0
-        with Stack(media=False) as stack:
+        with Stack() as stack:
             stack.call("robot.enable")
             for seed in range(10):
                 goal = random_goal(rng, stack.sim_pose())
@@ -264,7 +264,7 @@ class CameraPose(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.stack = Stack()
+        cls.stack = Stack(media=True)
         cls.stack.start()
 
     @classmethod
