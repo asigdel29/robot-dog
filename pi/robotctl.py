@@ -84,7 +84,8 @@ def entry_from_captures(taps, hold):
         raise InputError(f"{proto} uses a toggle bit; replay is refused")
     for other in taps[1:]:
         if proto == "NEC":
-            if (other.get("proto"), other.get("addr"), other.get("cmd")) != ("NEC", first["addr"], first["cmd"]):
+            if ((other.get("proto"), other.get("addr"), other.get("cmd"), other.get("data"))
+                    != ("NEC", first["addr"], first["cmd"], first.get("data"))):
                 raise InputError("the three presses decoded differently")
         else:
             a, b = first.get("raw", []), other.get("raw", [])
@@ -93,6 +94,8 @@ def entry_from_captures(taps, hold):
     if proto == "NEC":
         ir = {"proto": "NEC", "addr": first["addr"], "cmd": first["cmd"], "bits": first.get("bits", 32),
               "raw_us": [], "carrier_khz": 38}
+        if first.get("data") is not None:
+            ir["data"] = first["data"]  # the 32 bits on the air: exact replay, also for an extended address
     else:
         ir = {"proto": "raw", "addr": 0, "cmd": 0, "bits": 0, "raw_us": first.get("raw", []), "carrier_khz": 38}
     repeats = [f for f in hold if f.get("repeat")]

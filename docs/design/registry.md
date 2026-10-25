@@ -28,6 +28,7 @@ This document owns the registry format, its rules and the capture procedure. Whe
 | Field | Values | Meaning |
 | --- | --- | --- |
 | `ir.proto` | `NEC` or `raw` | `raw` replays `raw_us` timings. Protocols with a toggle bit are refused. |
+| `ir.data` | integer, optional | The 32 NEC bits that the capture saw. With `data`, the bridge sends these bits, not `addr` and `cmd`. |
 | `kind` | `hold`, `episodic`, `perpetual`, `mode` | `hold`: motion while frames repeat. `episodic`: one routine with a natural end. `perpetual`: continues until a stop command. `mode`: changes a toy setting. |
 | `repeat` | `nec`, `resend`, `none` | How the remote repeats a held button. |
 | `period_ms` | integer | Time between repeat frames. |
@@ -63,6 +64,7 @@ When a rule fails, robotd runs, but `registry_ready` is false and robotd refuses
 7. A `mode` command can never be a cloud command.
 8. Each `drive` entry must name a `hold` command. An entry that names a command that is not verified is not an error. That direction is only not available.
 9. `goto` is available only when forward and one turn are verified.
+10. Each IR payload and each command name must be inside the bridge limits in `protocol.md` section 2.4. Thus the bridge never refuses a `load`.
 
 These rules replace "refuse to arm without stop" from the old plan. A toy with no stop button is safe when each enabled command is a hold command or a bounded episodic command.
 

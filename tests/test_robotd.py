@@ -92,6 +92,21 @@ class RegistryRules(unittest.TestCase):
         self.assertFalse(caps["drive"]["left"])
         self.assertFalse(caps["goto"])
 
+    def test_bridge_limits(self):
+        """A registry with a payload that the bridge refuses at load is never ready (protocol.md 2.4)."""
+        nec = {"proto": "NEC", "addr": 0, "cmd": 1, "bits": 32, "raw_us": [], "carrier_khz": 38}
+        for ir in ({**nec, "cmd": 0x100}, {**nec, "addr": 0x10000}, {**nec, "carrier_khz": 70},
+                   {**nec, "carrier_khz": 38.0}, {**nec, "data": -1}, {**nec, "data": "x"}, {**nec, "raw_us": [0]},
+                   {"proto": "raw", "raw_us": [60000, 60000, 30001]}, {"proto": "raw", "raw_us": [70000]},
+                   {"proto": "raw", "raw_us": []}, {"proto": "raw", "raw_us": [500] * 121}):
+            self.assertTrue(robotd.check_registry(demo(bark={"ir": ir})), ir)
+        self.assertEqual(robotd.check_registry(demo(bark={"ir": {**nec, "data": 0xE718FF00}})), [])
+        self.assertEqual(robotd.check_registry(demo(bark={"ir": {"proto": "raw", "raw_us": [60000, 60000, 30000]}})), [])
+        self.assertTrue(robotd.check_registry(demo(**{"\u00e9" * 16: {"ir": None}})))
+        self.assertEqual(robotd.check_registry(demo(**{"\u00e9" * 15: {"ir": None}})), [])
+        many = demo(**{f"c{i}": {"ir": nec} for i in range(24)})
+        self.assertTrue(any("more than 24" in e for e in robotd.check_registry(many)))
+
     def test_goto_needs_forward_and_a_turn(self):
         self.assertTrue(robotd.capabilities(DEMO_REGISTRY)["goto"])
         self.assertTrue(robotd.capabilities(demo(left={"verified": False, "cloud": False}))["goto"])
@@ -183,6 +198,14 @@ class Capture(unittest.TestCase):
         for proto in ("RC5", "RC6", "RC6A", "Marantz"):
             with self.assertRaises(robotctl.InputError):
                 robotctl.entry_from_captures([{**self.TAP, "proto": proto}] * 3, [])
+
+    def test_nec_data_kept_for_exact_replay(self):
+        tap = {**self.TAP, "data": 0xE718FF00}
+        entry = robotctl.entry_from_captures([tap] * 3, [tap])
+        self.assertEqual(entry["ir"]["data"], 0xE718FF00)
+        self.assertEqual(robotd.ir_wire("x", {**robotd.CMD_DEFAULTS, **entry})["data"], 0xE718FF00)
+        with self.assertRaises(robotctl.InputError):
+            robotctl.entry_from_captures([tap, {**tap, "data": 0xE718FE01}, tap], [tap])
 
     def test_raw_timings_compared(self):
         raw = {"proto": "raw", "raw": [1000, 500, 1000, 500], "gap_us": 0}

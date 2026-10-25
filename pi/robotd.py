@@ -55,8 +55,11 @@ KINDS = ("hold", "episodic", "perpetual", "mode")
 REPEATS = ("nec", "resend", "none")
 DIRS = ("forward", "left", "right", "back")
 MAX_RAW = 120
+MAX_FRAME_US = 150_000  # bridge limits, protocol.md 2.4: a registry inside them is never refused at load
+MAX_ENTRIES = 24
+MAX_NAME_BYTES = 31
 TOP_FIELDS = {"schema", "robot", "commands", "drive", "goto"}
-IR_FIELDS = {"proto", "addr", "cmd", "bits", "raw_us", "carrier_khz"}
+IR_FIELDS = {"proto", "addr", "cmd", "bits", "raw_us", "carrier_khz", "data"}
 GOTO_DEFAULTS = {"robot_marker": 1, "goal_radius_px": 40, "area_px": [[0, 0], [640, 0], [640, 480], [0, 480]],
                  "turn_ms": 200, "forward_ms": 300, "settle_ms": 300, "turn_sign": 1}
 CMD_DEFAULTS = {"ir": None, "kind": "episodic", "repeat": "none", "period_ms": 108, "stop_via": "none",
@@ -67,16 +70,34 @@ CMD_DEFAULTS = {"ir": None, "kind": "episodic", "repeat": "none", "period_ms": 1
 # ---------------------------------------------------------------- registry
 
 
-def has_payload(ir):
-    """Return True when an IR entry has enough data for the bridge to send it."""
+def ir_errors(ir):
+    """Return why the bridge would refuse to load this IR payload (protocol.md 2.4); [] when it can send it."""
     if not isinstance(ir, dict):
-        return False
-    if ir.get("proto") == "NEC":
-        return isinstance(ir.get("addr"), int) and isinstance(ir.get("cmd"), int)
-    if ir.get("proto") == "raw":
-        raw = ir.get("raw_us")
-        return isinstance(raw, list) and 0 < len(raw) <= MAX_RAW and all(isinstance(v, int) and v > 0 for v in raw)
-    return False
+        return ["no IR payload"]
+    proto, raw = ir.get("proto"), ir.get("raw_us", [])
+    errors = []
+    if proto not in PROTOS:
+        errors.append(f"protocol {proto} refused; only NEC and raw (no toggle bit)")
+    if proto == "NEC" and not (_int_in(ir.get("addr"), 0, 0xFFFF) and _int_in(ir.get("cmd"), 0, 0xFF)):
+        errors.append("NEC needs addr 0..0xFFFF and cmd 0..0xFF")
+    if proto == "raw" and not (_int_in(ir.get("addr", 0), 0, 0xFFFFFFFF) and _int_in(ir.get("cmd", 0), 0, 0xFFFFFFFF)):
+        errors.append("addr and cmd must be unsigned ints")
+    if "data" in ir and not _int_in(ir["data"], 0, 0xFFFFFFFF):
+        errors.append("data must be an int in 0..0xFFFFFFFF")
+    if not (isinstance(raw, list) and len(raw) <= MAX_RAW and all(_int_in(v, 1, 0xFFFF) for v in raw)):
+        errors.append(f"raw_us must be a list of {MAX_RAW} or fewer ints in 1..65535")
+    elif sum(raw) > MAX_FRAME_US:
+        errors.append(f"raw_us frame is longer than {MAX_FRAME_US // 1000} ms")
+    elif proto == "raw" and not raw:
+        errors.append("a raw payload needs raw_us")
+    if not _int_in(ir.get("carrier_khz", 38), 20, 60):
+        errors.append("carrier_khz must be an int in 20..60")
+    return errors
+
+
+def has_payload(ir):
+    """Return True when the bridge can load and send this IR payload."""
+    return not ir_errors(ir)
 
 
 def normalize(doc):
@@ -132,8 +153,10 @@ def check_registry(doc):
     cmds = norm["commands"]
     for name, cmd in cmds.items():
         ir = cmd["ir"]
-        if ir is not None and ir.get("proto") not in PROTOS:
-            errors.append(f"{name}: protocol {ir.get('proto')} refused; only NEC and raw (no toggle bit)")
+        if ir is not None:
+            errors += [f"{name}: {e}" for e in ir_errors(ir)]
+        if not 0 < len(name.encode()) <= MAX_NAME_BYTES:
+            errors.append(f"{name}: a command name must be 1 to {MAX_NAME_BYTES} bytes in UTF-8")
         if cmd["kind"] not in KINDS:
             errors.append(f"{name}: kind must be one of {KINDS}")
         if cmd["repeat"] not in REPEATS:
@@ -146,7 +169,7 @@ def check_registry(doc):
             errors.append(f"{name}: max_run_ms must be an int in 1..10000")
         if cmd["natural_ms"] is not None and not _int_in(cmd["natural_ms"], 0, 60000):
             errors.append(f"{name}: natural_ms must be null or an int in 0..60000")
-        if cmd["verified"] and not has_payload(ir):
+        if cmd["verified"] and ir is None:
             errors.append(f"{name}: verified without an IR payload")
         if cmd["kind"] == "hold" and not _int_in(cmd["max_run_ms"], 1, 1000):
             errors.append(f"{name}: hold needs max_run_ms in 1..1000")
@@ -161,6 +184,8 @@ def check_registry(doc):
                 errors.append(f"{name}: a mode command can never be cloud")
             if cmd["kind"] == "episodic" and not _int_in(cmd["natural_ms"], 0, 10000):
                 errors.append(f"{name}: episodic cloud needs natural_ms <= 10000")
+    if sum(has_payload(cmd["ir"]) for cmd in cmds.values()) > MAX_ENTRIES:
+        errors.append(f"more than {MAX_ENTRIES} commands with an IR payload; the bridge keeps {MAX_ENTRIES}")
     for direction, target in norm["drive"].items():
         if target is None:
             continue
@@ -213,9 +238,12 @@ def load_registry(path):
 def ir_wire(name, cmd):
     """Return the load message for one command."""
     ir = cmd["ir"]
-    return {"name": name, "proto": ir["proto"], "addr": ir.get("addr", 0), "cmd": ir.get("cmd", 0),
+    wire = {"name": name, "proto": ir["proto"], "addr": ir.get("addr", 0), "cmd": ir.get("cmd", 0),
             "bits": ir.get("bits", 32), "raw": ir.get("raw_us", []), "khz": ir.get("carrier_khz", 38),
             "repeat": cmd["repeat"], "period_ms": cmd["period_ms"]}
+    if "data" in ir:
+        wire["data"] = ir["data"]  # the captured NEC frame, sent byte for byte
+    return wire
 
 
 # ---------------------------------------------------------------- pure helpers
@@ -499,14 +527,18 @@ class Robotd:
 
     async def connector(self):
         """Open and re-open the ESP32 link forever; a new link always starts DISARMED."""
+        last_error = None  # log each distinct failure once, not each second
         while True:
             if self.link is None:
                 try:
                     await self._open_link()
+                    last_error = None
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # any failure must leave the connector alive for the next try
-                    log.debug("esp32 open failed: %s", exc)
+                    if str(exc) != last_error:
+                        last_error = str(exc)
+                        log.warning("esp32 open failed: %s", exc)
                     self._close_link()
             await asyncio.sleep(1.0)
 
