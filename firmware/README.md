@@ -1,6 +1,6 @@
 # IR bridge firmware
 
-This folder contains the firmware for the IR bridge. The bridge is an Adafruit ESP32 Feather V2 (#5900) with an Adafruit IR transceiver (#5990). robotd sends commands to the bridge over USB serial. The bridge sends the IR frames to the toy dog.
+This folder contains the firmware for the IR bridge. The bridge is an Adafruit ESP32 Feather V2 (#5900) with an Adafruit IR transceiver (#5990). robotd sends commands to the bridge over USB serial. The bridge sends the IR frames to the toy dog. The firmware never starts WiFi or Bluetooth.
 
 `docs/design/protocol.md` section 2 gives the wire protocol. `sim/fake_esp32.py` is the reference behavior. `tests/test_conformance.py` checks the fake and the board.
 
@@ -18,12 +18,15 @@ The CI job in `.github/workflows/test.yml` uses the same versions. When you chan
 
 ## Install the toolchain
 
-1. On macOS, run `brew install arduino-cli`.
-2. On Linux, run `curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh -s 1.5.1`.
-3. On Linux, add the `bin` folder from step 2 to `PATH`.
-4. Run `arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json`.
-5. Run `arduino-cli core install esp32:esp32@3.3.12 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json`.
-6. Run `arduino-cli lib install IRremote@4.7.1 ArduinoJson@7.4.3`.
+1. Run `curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR="$HOME/.local/bin" sh -s 1.5.1`.
+2. Add `$HOME/.local/bin` to `PATH`.
+3. Run `arduino-cli version`.
+4. Make sure that the version is 1.5.1.
+5. Run `arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json`.
+6. Run `arduino-cli core install esp32:esp32@3.3.12 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json`.
+7. Run `arduino-cli lib install IRremote@4.7.1 ArduinoJson@7.4.3`.
+
+Homebrew (`brew install arduino-cli`) installs the latest version, not 1.5.1. If you use it, do steps 3 and 4.
 
 ## Compile
 
@@ -32,7 +35,7 @@ The CI job in `.github/workflows/test.yml` uses the same versions. When you chan
 
 The compiler must show no warnings. The CI job fails when a warning occurs.
 
-The last result was 952640 bytes of program storage (28 % of 3342336) and 56348 bytes of global variables (17 % of 327680).
+The last result was 341840 bytes of program storage (10 % of 3342336) and 32588 bytes of global variables (9 % of 327680).
 
 ## Connect the IR module
 
@@ -77,9 +80,10 @@ Each test opens the port, and the port open can reset the board. Thus each test 
 
 ## Calibration
 
-Two IRremote values in `ir_bridge.ino` control the capture. Keep the library values until a capture of the real remote shows a problem.
+Three values in `ir_bridge.ino` depend on the real remote and the toy. Keep the given values until a test on the real toy shows a problem.
 
-- `MARK_EXCESS_MICROS` (default 20): the receiver module makes each mark longer by this time. The firmware removes this time from captured marks.
-- `RECORD_GAP_MICROS` (default 8000): a space longer than this time ends a frame. Increase it when one button press gives two frames.
+- `MARK_EXCESS_MICROS` (IRremote, default 20): the receiver module makes each mark longer by this time. The firmware removes this time from captured marks.
+- `RECORD_GAP_MICROS` (IRremote, default 8000): a space longer than this time ends a frame. Increase it when one button press gives two frames.
+- `MIN_GAP_MS` (40): the emitter is quiet for this time before the first frame of a new command. Increase it when the toy ignores the second of two commands.
 
-To change a value, add a `#define` line before `#include <IRremote.hpp>`.
+To change an IRremote value, add a `#define` line before `#include <IRremote.hpp>`. When you change `MIN_GAP_MS`, change `MIN_GAP_S` in `sim/fake_esp32.py` too.

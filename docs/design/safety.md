@@ -60,7 +60,7 @@ An IR stop is not a dependable emergency stop. The IR path can be blocked, the t
 
 | Failure | Result | Measured in the dev stack |
 | --- | --- | --- |
-| `kill -9 robotd` during a hold | The lease ends the repeat frames. The heartbeat timeout puts the bridge in FAULT. | Last repeat 130 to 235 ms after the kill (lease 300 ms). FAULT 821 to 824 ms. Three runs, fake bridge. |
+| `kill -9 robotd` during a hold | The lease ends the repeat frames. The heartbeat timeout puts the bridge in FAULT. | Last repeat 145 to 156 ms after the kill (lease 300 ms). FAULT 958 ms, after the `stop` entry frame. Two runs, fake bridge with frame times (phase 2). |
 | robotd loop stops | systemd `WatchdogSec=2` restarts robotd. The restart starts DISARMED. | Not measured yet |
 | Ten tick errors in sequence | robotd goes to FAULT. | Unit path |
 | Loop rate under 15 Hz for 5 s | Health is `degraded`. | Unit path |
