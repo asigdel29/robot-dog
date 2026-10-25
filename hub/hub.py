@@ -1,7 +1,7 @@
 """hub: the server side of the dog, one process on 127.0.0.1:8000 behind Caddy.
 
 It holds the WebSocket link from linkd on the Pi (/device), serves the robot
-tools to Hermes Agent over the Model Context Protocol (/tools, loopback, bearer
+tools to Hermes Agent over the Model Context Protocol (/tools, bearer
 TOOLS_TOKEN) and runs the voice loop: utterance, speech to text, Hermes run,
 text to speech, audio.play. Every client is async: Hermes calls back into /tools
 while the voice loop waits on the same Hermes run, in this same process.
@@ -43,11 +43,12 @@ DEVICE_ID = "dog-01"
 DEVICE_TOKEN = os.environ.get("DEVICE_TOKEN", "")
 TOOLS_TOKEN = os.environ.get("TOOLS_TOKEN", "")
 HERMES_URL = os.environ.get("HERMES_URL", "http://127.0.0.1:8642").rstrip("/")
-HERMES_API_KEY = os.environ.get("HERMES_API_KEY", "")
+HERMES_AUTH = {"Authorization": f"Bearer {os.environ.get('HERMES_API_KEY', '')}"}
 STT_MODEL = os.environ.get("DOG_STT_MODEL", "gpt-4o-mini-transcribe")
 TTS_MODEL = os.environ.get("DOG_TTS_MODEL", "gpt-4o-mini-tts")
 TTS_VOICE = os.environ.get("DOG_TTS_VOICE", "alloy")
 STATE_DIR = os.environ.get("DOG_HUB_STATE", "/var/lib/doghub")
+USAGE_PATH = os.path.join(STATE_DIR, "usage.json")
 STT_CAP_S = float(os.environ.get("DOG_STT_MINUTES_PER_DAY", "30")) * 60
 TTS_CAP_CHARS = int(os.environ.get("DOG_TTS_CHARS_PER_DAY", "20000"))
 
@@ -60,17 +61,14 @@ MOTION_PER_MIN = 30
 SAY_MAX_CHARS = 300
 NOT_ARMED = -32001
 BUSY = -32002
-#: Stable per-channel key, so Hermes keeps one voice conversation for the dog.
-VOICE_SESSION_KEY = f"{DEVICE_ID}-voice"
 STOP_RE = re.compile(r"^\W*(stop|halt|freeze|no)\b", re.IGNORECASE)
 SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
 RUN_FAILED_EVENTS = ("run.failed", "run.cancelled", "run.interrupted")
 TTS_RATE = 24000
 #: 10 s of 24 kHz PCM16 per audio.play: well under the 2 MiB frame limit after base64.
 PLAY_CHUNK_BYTES = TTS_RATE * 2 * 10
-#: The hub waits before audio.play while more audio than this is queued at mediad.
+#: The hub waits before audio.play while more audio than this, or a full mediad queue, is ahead.
 MAX_QUEUED_AUDIO_S = 10
-#: Size of the mediad play queue; a full queue answers BUSY.
 MEDIAD_QUEUE_ITEMS = 16
 
 TOOL_RULES = inspect.cleandoc("""
@@ -94,22 +92,12 @@ def speech():
     return openai.AsyncOpenAI(timeout=30, max_retries=1)
 
 
-# ---------------------------------------------------------------- device link
-
-
-class DeviceError(Exception):
-    """A failed request to the dog; the message is written for the model to read, code is the Pi error code."""
+class DeviceError(ToolError):
+    """A failed request to the dog; a tool error, so the model reads the message. code is the Pi error code."""
 
     def __init__(self, message, code=None):
         super().__init__(message)
         self.code = code
-
-
-def _describe(error):
-    """Return the text of a JSON-RPC error from the Pi."""
-    if error.get("code") == NOT_ARMED:
-        return "the dog is not armed: ask the owner to press Start on the gamepad"
-    return f"{error.get('message', 'error')} (code {error.get('code')})"
 
 
 class Device:
@@ -119,7 +107,6 @@ class Device:
         self.ws = None
         self._ids = itertools.count(1)
         self._pending = {}
-        self._send_lock = asyncio.Lock()
 
     async def call(self, method, params=None, timeout=DEVICE_WAIT_S):
         """Send one request with sent_at to the Pi and return its result; raise DeviceError."""
@@ -132,8 +119,7 @@ class Device:
         msg = {"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params or {},
                "sent_at": int(time.time() * 1000)}
         try:
-            async with self._send_lock:
-                await ws.send_text(json.dumps(msg, separators=(",", ":"), allow_nan=False))
+            await ws.send_text(json.dumps(msg))
             return await asyncio.wait_for(future, timeout)
         except TimeoutError:
             raise DeviceError(f"the dog did not answer {method} within {timeout:.0f} s") from None
@@ -142,45 +128,48 @@ class Device:
         finally:
             self._pending.pop(msg_id, None)
 
-    def attach(self, ws):
-        """Make ws the current link and return the link it replaces, or None."""
-        old, self.ws = self.ws, ws
-        return old
-
     def detach(self, ws):
         """Forget a closed link and fail its open requests."""
         if self.ws is ws:
             self.ws = None
-        for owner, future in list(self._pending.values()):
+        for owner, future in self._pending.values():
             if owner is ws and not future.done():
                 future.set_exception(DeviceError("the dog went offline during the request"))
 
     def on_reply(self, ws, msg):
         """Complete the request that a reply from ws answers; a reply without an int id is ignored."""
         msg_id = msg.get("id")
-        if isinstance(msg_id, bool) or not isinstance(msg_id, int):
+        if type(msg_id) is not int:  # also refuses True, which equals id 1
             return
         owner, future = self._pending.get(msg_id, (None, None))
         if owner is not ws or future.done():
             return
         error = msg.get("error")
-        if isinstance(error, dict):
-            future.set_exception(DeviceError(_describe(error), error.get("code")))
-        else:
+        if not isinstance(error, dict):
             future.set_result(msg.get("result"))
+        elif error.get("code") == NOT_ARMED:
+            future.set_exception(DeviceError("the dog is not armed: ask the owner to press Start on the gamepad",
+                                             NOT_ARMED))
+        else:
+            future.set_exception(DeviceError(f"{error.get('message', 'error')} (code {error.get('code')})",
+                                             error.get("code")))
 
 
 device = Device()
 
 
-def _no_constant(name):
-    """Refuse a NaN or Infinity constant in a frame."""
+def _refuse_constant(name):
+    """Refuse NaN and Infinity in a frame from the Pi, as the Pi bus does (dogproto.decode)."""
     raise ValueError(f"{name} is not valid JSON")
 
 
-def _decode(text):
-    """Parse one frame from the Pi; NaN and Infinity are refused, as on the Pi bus (dogproto.decode)."""
-    return json.loads(text, parse_constant=_no_constant)
+async def _receive(ws):
+    """Return the next frame from the Pi as a dict, or None for a binary frame or one that is not a JSON object."""
+    try:
+        msg = json.loads(await ws.receive_text(), parse_constant=_refuse_constant)
+    except (KeyError, ValueError):  # KeyError: a binary frame has no text
+        return None
+    return msg if isinstance(msg, dict) else None
 
 
 def _bearer_ok(header, token):
@@ -188,52 +177,25 @@ def _bearer_ok(header, token):
     return bool(token) and hmac.compare_digest(header.encode(), f"Bearer {token}".encode())
 
 
-def _hello_params(text):
-    """Return the params of a valid link.hello from our device, or None."""
+def take_usage(key, amount, cap):
+    """Add amount to today's count in usage.json and return True; log and return False when it would pass cap."""
     try:
-        msg = _decode(text)
-    except ValueError:
-        return None
-    if not isinstance(msg, dict) or msg.get("method") != "link.hello":
-        return None
-    params = msg.get("params")
-    if not isinstance(params, dict) or params.get("device") != DEVICE_ID:
-        return None
-    return params
-
-
-# ---------------------------------------------------------------- speech and usage caps
-
-
-class Usage:
-    """Daily speech use in usage.json; a cap stops new speech work until the next day."""
-
-    def __init__(self, path):
-        self.path = path
-        try:
-            with open(path) as handle:
-                self.counts = json.load(handle)
-        except (OSError, ValueError):
-            self.counts = {}
-
-    def take(self, key, amount, cap):
-        """Add amount to today's count and return True; log and return False when it would pass cap."""
-        today = time.strftime("%Y-%m-%d")
-        if self.counts.get("day") != today:
-            self.counts = {"day": today}
-        used = self.counts.get(key, 0)
-        if used + amount > cap:
-            log.warning("daily cap reached: %s used %g, asked %g, cap %g", key, used, amount, cap)
-            return False
-        self.counts[key] = used + amount
-        tmp = self.path + ".tmp"
-        with open(tmp, "w") as handle:
-            json.dump(self.counts, handle)
-        os.replace(tmp, self.path)
-        return True
-
-
-usage = Usage(os.path.join(STATE_DIR, "usage.json"))
+        with open(USAGE_PATH) as handle:
+            counts = json.load(handle)
+    except (OSError, ValueError):
+        counts = {}
+    today = time.strftime("%Y-%m-%d")
+    if counts.get("day") != today:
+        counts = {"day": today}
+    used = counts.get(key, 0)
+    if used + amount > cap:
+        log.warning("daily cap reached: %s used %g, asked %g, cap %g", key, used, amount, cap)
+        return False
+    counts[key] = used + amount
+    with open(USAGE_PATH + ".tmp", "w") as handle:
+        json.dump(counts, handle)
+    os.replace(USAGE_PATH + ".tmp", USAGE_PATH)
+    return True
 
 
 async def transcribe(pcm, rate):
@@ -251,61 +213,40 @@ async def transcribe(pcm, rate):
 
 async def synthesize(text):
     """Return 24 kHz PCM16 speech for text, or None when the daily TTS cap is reached."""
-    if not usage.take("tts_chars", len(text), TTS_CAP_CHARS):
+    if not take_usage("tts_chars", len(text), TTS_CAP_CHARS):
         return None
     reply = await speech().audio.speech.create(model=TTS_MODEL, voice=TTS_VOICE, input=text, response_format="pcm")
     return reply.content
 
 
-class Speaker:
-    """Sends speech to the dog speaker and keeps the mediad play queue short.
+#: Estimated end time (monotonic) of each part queued at mediad, which reports no play progress.
+_play_ends = collections.deque()
 
-    mediad reports no play progress, so the hub estimates when each queued part
-    ends. It waits before audio.play while more than MAX_QUEUED_AUDIO_S of audio
-    or a full queue is ahead.
-    """
 
-    def __init__(self):
-        self._ends = collections.deque()
-
-    def clear(self):
-        """Forget the queued parts; mediad clears its queue on each push-to-talk press."""
-        self._ends.clear()
-
-    async def play(self, pcm):
-        """Queue PCM16 speech in parts that fit one link frame; return False when mediad dropped a part (BUSY)."""
-        complete = True
-        for start in range(0, len(pcm), PLAY_CHUNK_BYTES):
-            part = pcm[start:start + PLAY_CHUNK_BYTES]
-            await self._wait_for_room()
-            try:
-                await device.call("audio.play", {"pcm16_b64": base64.b64encode(part).decode(), "rate": TTS_RATE})
-            except DeviceError as exc:
-                if exc.code != BUSY:
-                    raise
-                log.info("audio.play dropped: %s", exc)  # push-to-talk is down, or the queue is full
-                complete = False
-                continue
-            begin = max(time.monotonic(), self._ends[-1] if self._ends else 0.0)
-            self._ends.append(begin + len(part) / 2 / TTS_RATE)
-        return complete
-
-    async def _wait_for_room(self):
-        """Wait until the parts ahead are short enough and the mediad queue has room."""
+async def play(pcm):
+    """Queue PCM16 speech in parts that fit one link frame; return False when mediad dropped a part (BUSY)."""
+    complete = True
+    for start in range(0, len(pcm), PLAY_CHUNK_BYTES):
+        part = pcm[start:start + PLAY_CHUNK_BYTES]
         while True:
             now = time.monotonic()
-            while self._ends and self._ends[0] <= now:
-                self._ends.popleft()
-            if not self._ends or (self._ends[-1] - now <= MAX_QUEUED_AUDIO_S
-                                  and len(self._ends) < MEDIAD_QUEUE_ITEMS):
-                return
-            await asyncio.sleep(self._ends[0] - now)
-
-
-speaker = Speaker()
-
-
-# ---------------------------------------------------------------- voice loop
+            while _play_ends and _play_ends[0] <= now:
+                _play_ends.popleft()
+            if not _play_ends or (_play_ends[-1] - now <= MAX_QUEUED_AUDIO_S
+                                  and len(_play_ends) < MEDIAD_QUEUE_ITEMS):
+                break
+            await asyncio.sleep(_play_ends[0] - now)
+        try:
+            await device.call("audio.play", {"pcm16_b64": base64.b64encode(part).decode(), "rate": TTS_RATE})
+        except DeviceError as exc:
+            if exc.code != BUSY:
+                raise
+            log.info("audio.play dropped: %s", exc)  # push-to-talk is down, or the queue is full
+            complete = False
+            continue
+        begin = max(time.monotonic(), _play_ends[-1] if _play_ends else 0.0)
+        _play_ends.append(begin + len(part) / 2 / TTS_RATE)
+    return complete
 
 
 def _utterance_ok(params):
@@ -321,6 +262,7 @@ class Voice:
 
     def __init__(self):
         self._turn = None
+        #: The create request of the Hermes run of the current turn, until the run ends.
         self._create = None
         self._stops = set()
 
@@ -334,7 +276,7 @@ class Voice:
 
     def cancel(self, reason):
         """End the current turn: stop its Hermes run and drop the speech not yet played."""
-        speaker.clear()
+        _play_ends.clear()  # mediad clears its queue on each push-to-talk press
         if self._turn is None or self._turn.done():
             return
         log.info("voice turn cancelled: %s", reason)
@@ -342,7 +284,6 @@ class Voice:
             self._stop_later(self._create)
             self._create = None  # the turn's own cleanup must not send a second stop
         self._turn.cancel()
-        self._turn = None
 
     def _stop_later(self, create):
         """Start a stop of the run that create makes, and keep a reference to the task."""
@@ -351,13 +292,10 @@ class Voice:
         task.add_done_callback(self._stops.discard)
 
     async def _stop_run(self, create):
-        """Stop a Hermes run as soon as its create request gives the run id.
-
-        Hermes answers a stop at once and stops the run at its next safe point.
-        """
+        """Stop a Hermes run as soon as its create request gives the run id; Hermes stops it at a safe point."""
         try:
             run_id = await create
-            reply = await http.post(f"{HERMES_URL}/v1/runs/{run_id}/stop", headers=_hermes_auth())
+            reply = await http.post(f"{HERMES_URL}/v1/runs/{run_id}/stop", headers=HERMES_AUTH)
             reply.raise_for_status()
             log.info("Hermes run %s stopped", run_id)
         except Exception as exc:
@@ -369,15 +307,19 @@ class Voice:
         marks = {"received": time.monotonic()}
         try:
             pcm = base64.b64decode(params["pcm16_b64"], validate=True)
-            if not usage.take("stt_s", len(pcm) / 2 / params["rate"], STT_CAP_S):
+            if not take_usage("stt_s", len(pcm) / 2 / params["rate"], STT_CAP_S):
                 return
             text = await transcribe(pcm, params["rate"])
             marks["stt"] = time.monotonic()
             log.info("voice %s: %d characters heard", utt_id, len(text))
             if not text:
                 return
-            if STOP_RE.match(text):
-                await self._fast_stop()
+            if STOP_RE.match(text):  # a stop must not wait for the model
+                try:
+                    await device.call("robot.stop", timeout=5)
+                    log.info("voice stop phrase: robot.stop sent")
+                except DeviceError as exc:
+                    log.warning("voice stop phrase: %s", exc)
             sentences = asyncio.Queue()
             async with asyncio.TaskGroup() as group:
                 group.create_task(self._speak(sentences, marks))
@@ -389,17 +331,10 @@ class Voice:
             stages = " ".join(f"{name}={(t - marks['received']) * 1000:.0f}" for name, t in marks.items())
             log.info("voice %s latency ms: %s", utt_id, stages)
 
-    async def _fast_stop(self):
-        """Stop the dog before Hermes hears the request; a stop must not wait for the model."""
-        try:
-            await device.call("robot.stop", timeout=5)
-            log.info("voice stop phrase: robot.stop sent")
-        except DeviceError as exc:
-            log.warning("voice stop phrase: %s", exc)
-
     async def _create_run(self, utt_id, text):
         """Start a Hermes run for the text and return its id."""
-        headers = {**_hermes_auth(), "X-Hermes-Session-Key": VOICE_SESSION_KEY, "Idempotency-Key": utt_id}
+        # A stable key per channel keeps one voice conversation; the utterance id makes a resend safe.
+        headers = {**HERMES_AUTH, "X-Hermes-Session-Key": f"{DEVICE_ID}-voice", "Idempotency-Key": utt_id}
         reply = await http.post(f"{HERMES_URL}/v1/runs", headers=headers,
                                 json={"input": f"[spoken via dog mic] {text}"})
         reply.raise_for_status()
@@ -414,7 +349,7 @@ class Voice:
         try:
             # The shield keeps the create request alive when the turn is cancelled, so cancel() can stop the run.
             run_id = await asyncio.shield(create)
-            async with http.stream("GET", f"{HERMES_URL}/v1/runs/{run_id}/events", headers=_hermes_auth()) as events:
+            async with http.stream("GET", f"{HERMES_URL}/v1/runs/{run_id}/events", headers=HERMES_AUTH) as events:
                 events.raise_for_status()
                 async for line in events.aiter_lines():
                     # Skip ":" keepalive comments, "id:" lines and the blank line after each event.
@@ -467,41 +402,22 @@ class Voice:
             if pcm is None:
                 return
             marks.setdefault("first_tts", time.monotonic())
-            await speaker.play(pcm)
+            await play(pcm)
             marks.setdefault("first_play", time.monotonic())
 
 
-def _hermes_auth():
-    return {"Authorization": f"Bearer {HERMES_API_KEY}"}
-
-
 voice = Voice()
-
-
-# ---------------------------------------------------------------- robot tools
-
-
 tools = MCPServer("dog", instructions=TOOL_RULES)
 _motion_times = collections.deque()
 
 
 def tool(read_only=False):
-    """Register a robot tool; its docstring, without indentation, is the description that Hermes reads.
-
-    read_only marks a tool that never moves or speaks; Hermes retries only those after a lost tool session.
-    """
+    """Register a robot tool; Hermes reads its dedented docstring. read_only marks a tool that never moves or speaks."""
     def register(fn):
+        """Add fn to the tool server."""
         annotations = ToolAnnotations(read_only_hint=True) if read_only else None
         return tools.tool(description=inspect.cleandoc(fn.__doc__), annotations=annotations)(fn)
     return register
-
-
-async def _device(method, params=None):
-    """Make one device request for a tool; a failure becomes a tool error for the model."""
-    try:
-        return await device.call(method, params)
-    except DeviceError as exc:
-        raise ToolError(str(exc)) from None
 
 
 async def _motion(method, params):
@@ -512,7 +428,7 @@ async def _motion(method, params):
     if len(_motion_times) >= MOTION_PER_MIN:
         raise ToolError(f"rate limit: at most {MOTION_PER_MIN} motion calls per minute; wait, then try again")
     _motion_times.append(now)
-    return await _device(method, {**params, "id": uuid.uuid4().hex})
+    return await device.call(method, {**params, "id": uuid.uuid4().hex})
 
 
 @tool(read_only=True)
@@ -524,7 +440,7 @@ async def get_state():
     """
     if device.ws is None:
         return {"link": "down"}
-    return {"link": "up", **await _device("robot.state")}
+    return {"link": "up", **await device.call("robot.state")}
 
 
 @tool()
@@ -565,7 +481,7 @@ async def look():
 
     Use it to check that a move happened.
     """
-    snap = await _device("media.snapshot", {"max_px": 640})
+    snap = await device.call("media.snapshot", {"max_px": 640})
     return [Image(data=base64.b64decode(snap["jpeg_b64"]), format="jpeg"), f"photo age: {snap['age_ms']} ms"]
 
 
@@ -581,23 +497,20 @@ async def say(text: str):
         raise ToolError(f"the speech service failed: {exc}") from None
     if pcm is None:
         raise ToolError("the daily speech limit is reached; the dog cannot speak again until tomorrow")
-    try:
-        complete = await speaker.play(pcm)
-    except DeviceError as exc:
-        raise ToolError(str(exc)) from None
-    return {"spoken": complete, "chars": len(text)}
+    return {"spoken": await play(pcm), "chars": len(text)}
 
 
 @tool()
 async def stop():
     """Stop the dog now: end IR output and cancel the running action. The dog stays armed. Never rate limited."""
-    return await _device("robot.stop")
+    return await device.call("robot.stop")
 
 
 def _require_bearer(app, token):
     """Wrap an ASGI app so that each HTTP request must carry Authorization: Bearer <token>."""
 
     async def guarded(scope, receive, send):
+        """Answer 401 to an HTTP request without the token; pass everything else to app."""
         if scope["type"] == "http":
             header = dict(scope["headers"]).get(b"authorization", b"").decode("latin-1")
             if not _bearer_ok(header, token):
@@ -608,9 +521,6 @@ def _require_bearer(app, token):
         await app(scope, receive, send)
 
     return guarded
-
-
-# ---------------------------------------------------------------- app
 
 
 @contextlib.asynccontextmanager
@@ -635,32 +545,30 @@ async def healthz():
 async def device_link(ws: WebSocket):
     """Serve the Pi link: bearer DEVICE_TOKEN, then link.hello; a new link replaces the old one."""
     if not _bearer_ok(ws.headers.get("authorization", ""), DEVICE_TOKEN):
-        await ws.close(code=1008)
+        await ws.close(code=1008)  # before accept, so the Pi gets HTTP 403
         return
     await ws.accept()
     try:
-        hello = _hello_params(await asyncio.wait_for(ws.receive_text(), HELLO_WAIT_S))
-    except (TimeoutError, WebSocketDisconnect, KeyError):  # KeyError: a binary frame has no text
-        hello = None
-    if hello is None:
+        hello = await asyncio.wait_for(_receive(ws), HELLO_WAIT_S) or {}
+    except (TimeoutError, WebSocketDisconnect):
+        hello = {}
+    params = hello.get("params")
+    if hello.get("method") != "link.hello" or not isinstance(params, dict) or params.get("device") != DEVICE_ID:
         with contextlib.suppress(RuntimeError):
             await ws.close(code=1008)
         return
-    if hello.get("api") != API_VERSION:
-        log.warning("device api %s differs from hub api %d", hello.get("api"), API_VERSION)
-    old = device.attach(ws)
+    if params.get("api") != API_VERSION:
+        log.warning("device api %s differs from hub api %d", params.get("api"), API_VERSION)
+    old, device.ws = device.ws, ws
     if old is not None:
         device.detach(old)
         with contextlib.suppress(RuntimeError, OSError):
             await old.close(code=4000, reason="replaced")
-    log.info("device %s up, version %s", DEVICE_ID, hello.get("version"))
+    log.info("device %s up, version %s", DEVICE_ID, params.get("version"))
     try:
         while True:
-            try:
-                msg = _decode(await ws.receive_text())
-            except (ValueError, KeyError):  # KeyError: a binary frame has no text
-                continue
-            if not isinstance(msg, dict):
+            msg = await _receive(ws)
+            if msg is None:
                 continue
             method = msg.get("method")
             if method is None:
@@ -676,11 +584,11 @@ async def device_link(ws: WebSocket):
         log.warning("device %s link down", DEVICE_ID)
 
 
-def main(argv=None):
+def main():
     """Check the environment (/etc/doghub/hub.env) and serve on loopback."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--port", type=int, default=8000)
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
     missing = [name for name in ("DEVICE_TOKEN", "TOOLS_TOKEN", "HERMES_API_KEY", "OPENAI_API_KEY")
                if not os.environ.get(name)]
     if missing:
@@ -690,8 +598,8 @@ def main(argv=None):
     logging.basicConfig(level=os.environ.get("DOG_LOG", "INFO"), force=True,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
     uvicorn.run(app, host="127.0.0.1", port=args.port, ws_max_size=FRAME_LIMIT,
-                ws_ping_interval=PING_S, ws_ping_timeout=PING_S, log_level="info")
+                ws_ping_interval=PING_S, ws_ping_timeout=PING_S)
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    main()
