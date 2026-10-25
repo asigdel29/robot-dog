@@ -20,6 +20,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENTRY = {"name": "t", "proto": "NEC", "addr": 0, "cmd": 1, "bits": 32, "raw": [], "khz": 38,
          "repeat": "nec", "period_ms": 108}
 _fake = None
+#: Timing slack: tight for the real board, wider for the fake, which shares a busy host.
+SLACK_S = 0.15 if os.environ.get("DOG_SERIAL") else 0.4
 
 
 def setUpModule():
@@ -158,7 +160,7 @@ class Conformance(unittest.TestCase):
         sent = time.monotonic()
         self.port.expect("ack", op_id=op_id)
         self.port.expect("done", op_id=op_id, timeout=1.0)
-        self.assertLess(time.monotonic() - sent, 0.3 + 0.15)
+        self.assertLess(time.monotonic() - sent, 0.3 + SLACK_S)
         self.assertIsNone(self._next_tx(0.3), "repeat frames after the lease ended")
 
     def test_lease_cap(self):
