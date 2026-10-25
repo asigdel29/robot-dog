@@ -2,7 +2,7 @@
 
 It speaks the same NDJSON protocol as firmware/ir_bridge/ir_bridge.ino, so
 robotd keeps one code path and only the device path changes. The simulated toy
-drives on an image-space floor of 640 x 480 px and writes its pose to
+starts at the floor center of 640 x 480 px and writes its pose to
 sim_pose.json for the fake camera. Each line in and out goes to fake_esp32.log
 with a monotonic timestamp, so tests can measure latency. SIGUSR1 simulates a
 board reset.
@@ -71,19 +71,19 @@ def frame_s(entry, full):
 class FakeBridge:
     """Firmware state machine plus a toy that moves while drive commands arrive."""
 
-    def __init__(self, master_fd, run_dir, start_pose):
+    def __init__(self, master_fd, run_dir):
         self.fd = master_fd
         self.run_dir = run_dir
         self.boot = 0
         self.log = open(os.path.join(run_dir, "fake_esp32.log"), "a", buffering=1)
-        self.pose = list(start_pose)
+        self.pose = [FLOOR[0] / 2, FLOOR[1] / 2, 0.0]
         self.capture = None  # timer handles of the open capture window
-        self.reset()
         self._buf = b""
         self._next_pose_write = 0.0
+        self.reset()
 
     def reset(self):
-        """Return to the power-on state; the board forgets its session and registry."""
+        """Return to the power-on state, which forgets the session and the registry, and send hello with sid 0."""
         self.boot += 1
         self._cancel_capture()
         self.state = "DISARMED"
@@ -98,23 +98,26 @@ class FakeBridge:
         self.timed = None  # (name, until) for a send that moves the toy
         self.last_hb = time.monotonic()
         self.max_loop_us = 0
+        self.emit(ev="hello", sid=0, boot=self.boot, fw=FW, state=self.state)
 
     # ---- output
 
     def emit(self, **event):
+        """Write one event line to the pty and the log."""
         line = json.dumps(event, separators=(",", ":"))
         self.log.write(f"{time.monotonic_ns()} out {line}\n")
         try:
             os.write(self.fd, (line + "\n").encode())
-        except (BlockingIOError, OSError):
+        except OSError:
             pass  # nobody reads the pty; a real UART also drops bytes
 
     # ---- input
 
     def readable(self):
+        """Queue each JSON object line from robotd, then run the board loop."""
         try:
             data = os.read(self.fd, 4096)
-        except (BlockingIOError, OSError):
+        except OSError:
             return
         self._buf += data
         *lines, self._buf = self._buf.split(b"\n")
@@ -167,6 +170,7 @@ class FakeBridge:
         return name if isinstance(name, str) and name in self.entries else None
 
     def op_load(self, msg, now):
+        """load: add or replace one entry; DISARMED only."""
         if self.state != "DISARMED":
             return "not disarmed"
         if not entry_ok(msg):
@@ -177,6 +181,7 @@ class FakeBridge:
         self.emit(ev="ack", id=msg["id"])
 
     def op_arm(self, msg, now):
+        """arm: n must equal the entry count; DISARMED or FAULT go to READY."""
         n = msg.get("n")
         if not isinstance(n, int) or isinstance(n, bool) or n != len(self.entries):
             return "entry count"
@@ -188,6 +193,7 @@ class FakeBridge:
         self.emit(ev="ack", id=msg["id"])
 
     def op_send(self, msg, now):
+        """send: one full frame after the gap; later ops wait behind it. READY only."""
         if self.state != "READY":
             return "not ready"
         name = self._entry_name(msg)
@@ -197,6 +203,7 @@ class FakeBridge:
         self.send = (name, msg["id"])
 
     def op_hold(self, msg, now):
+        """hold: repeat a command until the lease ends; READY or EXECUTING."""
         if self.state not in ("READY", "EXECUTING"):
             return "not ready"
         name = self._entry_name(msg)
@@ -214,17 +221,18 @@ class FakeBridge:
         self.emit(ev="ack", id=msg["id"])
 
     def op_stop(self, msg, now):
+        """stop: end the hold; stay armed."""
         self._end_hold()
         self.timed = None
         self.emit(ev="ack", id=msg["id"])
 
     def op_disarm(self, msg, now):
-        self._end_hold()
-        self.timed = None
+        """disarm: stop, then go to DISARMED."""
+        self.op_stop(msg, now)
         self.state = "DISARMED"
-        self.emit(ev="ack", id=msg["id"])
 
     def op_capture(self, msg, now):
+        """capture: report one NEC tap, and repeat frames for a long window; DISARMED only."""
         if self.state != "DISARMED":
             return "capture needs DISARMED"
         if self.capture:
@@ -245,6 +253,7 @@ class FakeBridge:
         self.capture.append(loop.call_later(ms / 1000, self._capture_done, msg["id"]))
 
     def _capture_done(self, op_id):
+        """Close the capture window with done."""
         self.capture = None
         self.emit(ev="done", id=op_id)
 
@@ -255,6 +264,7 @@ class FakeBridge:
         self.capture = None
 
     def _end_hold(self):
+        """End the hold with done and leave EXECUTING."""
         if self.hold is not None:
             self.emit(ev="done", id=self.hold["id"])
             self.hold = None
@@ -333,6 +343,7 @@ class FakeBridge:
         self.max_loop_us = max(self.max_loop_us, int((time.thread_time() - start) * 1e6))
 
     def _write_pose(self):
+        """Replace sim_pose.json atomically."""
         path = os.path.join(self.run_dir, "sim_pose.json")
         tmp = path + ".tmp"
         with open(tmp, "w") as handle:
@@ -345,7 +356,6 @@ async def main():
     """Create the pty, print its path, and run the fake until killed."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--run-dir", default=os.environ.get("DOG_RUN_DIR", "/tmp/dog"))
-    parser.add_argument("--pose", default="320,240,0", help="start x,y,heading_rad")
     args = parser.parse_args()
     os.makedirs(args.run_dir, exist_ok=True)
     master, slave = os.openpty()
@@ -356,13 +366,11 @@ async def main():
     if os.path.lexists(link):
         os.unlink(link)
     os.symlink(slave_name, link)
-    bridge = FakeBridge(master, args.run_dir, [float(v) for v in args.pose.split(",")])
+    bridge = FakeBridge(master, args.run_dir)
     loop = asyncio.get_running_loop()
     loop.add_reader(master, bridge.readable)
-    loop.add_signal_handler(signal.SIGUSR1, lambda: (bridge.reset(), bridge.emit(
-        ev="hello", sid=0, boot=bridge.boot, fw=FW, state=bridge.state)))
+    loop.add_signal_handler(signal.SIGUSR1, bridge.reset)
     print(f"PTY {slave_name}", flush=True)
-    bridge.emit(ev="hello", sid=0, boot=bridge.boot, fw=FW, state=bridge.state)
     last = time.monotonic()
     while True:
         await asyncio.sleep(TICK_S)

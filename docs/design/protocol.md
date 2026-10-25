@@ -10,6 +10,7 @@ The code is in `pi/dogproto.py`.
 - The transport is a unix socket in `/run/dog/`. The `DOG_RUN_DIR` variable changes this directory for tests.
 - There is no broker. Each daemon serves its own sockets.
 - `API_VERSION` is 1. A peer with a different value is logged. It is not refused.
+- The line limit is 64 KiB for robotd and 2 MiB for mediad. A longer line gets PARSE_ERROR (-32700), and the daemon closes the connection.
 
 ### 1.1 Two sockets for each daemon
 
@@ -32,20 +33,21 @@ File permissions (mode 0660 and the group) decide who can connect. A cloud socke
 The `PARAMS` table in `dogproto.py` is the reference for each method and its fields.
 
 - An unknown method gets METHOD_NOT_FOUND (-32601).
-- An unknown field, an absent field or a wrong type gets INVALID_PARAMS (-32602).
+- An unknown field, an absent field or a wrong type gets INVALID_PARAMS (-32602). A bool is not a number.
 - A field name with a final `?` in the table is optional.
+- The bus refuses `NaN` and `Infinity`, because a clamp changes `NaN` into full motion. A line with `NaN` gets PARSE_ERROR. A number such as `1e999` gets INVALID_PARAMS.
 
 ### 1.4 Error codes
 
-| Code | Name | Meaning |
+| Code | Name | Description |
 | --- | --- | --- |
 | -32001 | NOT_ARMED | The dog is not armed. A person at the Pi must press Start. |
-| -32002 | BUSY | An action is in progress, or the local stick has control. |
-| -32003 | FAULT | robotd or the bridge is in FAULT. |
-| -32004 | UNAVAILABLE | The command is not verified, not enabled for remote use, or the bridge link is down. |
+| -32002 | BUSY | An action or a capture is in progress, the local stick has control, or the method needs DISARMED. |
+| -32003 | FAULT | robotd or the bridge is in FAULT, or the bridge refused an op. |
+| -32004 | UNAVAILABLE | The registry is not ready, the command is not verified or not enabled for remote use, or the bridge link is down. |
 | -32005 | STALE | The request is too old (linkd only). |
 | -32006 | TIMEOUT | The bridge did not answer. |
-| -32007 | PREEMPTED | A stop, a disarm or the local stick ended the action. |
+| -32007 | PREEMPTED | A stop, a disarm or the local stick ended the action, or a disarm overtook `robot.enable`. |
 
 ### 1.5 robotd methods
 
@@ -53,15 +55,15 @@ The `PARAMS` table in `dogproto.py` is the reference for each method and its fie
 | --- | --- | --- | --- |
 | `robot.move {vx, vyaw}` | Notification | No | Values in [-1, 1]. Deadman: 500 ms. |
 | `robot.observe {t_mono_ns, markers}` | Notification | No | From `mediad`. `markers` maps an ArUco id to `[cx, cy, heading_rad]`. |
-| `robot.enable` | Request | No | Arms the dog. Clears a FAULT when the link is healthy. |
+| `robot.enable` | Request | No | Arms the dog and clears a FAULT. Needs a ready registry and the bridge link. |
 | `robot.disarm` | Request | Yes | Cancels the action and disarms. |
 | `robot.stop` | Request | Yes | Stops IR output now. Cancels the action. The dog stays armed. |
 | `robot.do {trick, id}` | Request | Yes | Replies when the trick ends. |
 | `robot.drive {dir, ms, id}` | Request | Yes | `dir` is forward, back, left or right. `ms` is 50 to the command `max_run_ms`. |
 | `robot.goto {marker, id}` | Request | Yes | 30 s limit. Needs verified forward and one turn. |
-| `robot.state` | Request | Yes | A cloud caller sees only cloud tricks. |
-| `robot.capture {ms}` | Request | No | DISARMED only. Returns the IR frames that the receiver saw. |
-| `robot.test {name, ms}` | Request | No | Armed only. Accepts a command that is not verified. |
+| `robot.state` | Request | Yes | A cloud caller sees only cloud tricks and cloud capabilities. |
+| `robot.capture {ms}` | Request | No | DISARMED only, one at a time. `ms` is 100 to 10000. Returns the IR frames that the receiver saw. |
+| `robot.test {name, ms}` | Request | No | Armed only. `ms` is 50 to 1000. Accepts a command that is not verified. |
 | `robot.reload` | Request | No | DISARMED only. Reads the registry again and loads the bridge again. |
 
 An action result has this shape:
@@ -87,7 +89,7 @@ The firmware is `firmware/ir_bridge/ir_bridge.ino`. The fake is `sim/fake_esp32.
 | Op | Fields | Rule |
 | --- | --- | --- |
 | `hello` | `sid` | Starts a new link. The bridge goes to DISARMED. It forgets its entries, its hold and its capture, and sends no `done` for them. |
-| `load` | `id, name, proto, addr, cmd, bits, raw, khz, repeat, period_ms`, optional `data` | DISARMED only. Adds one entry to bridge RAM, or replaces the entry with the same name. See 2.4 for the limits. |
+| `load` | `id, name, proto, addr, cmd, raw, khz, repeat, period_ms`, optional `data` | DISARMED only. Adds one entry to bridge RAM, or replaces the entry with the same name. See 2.4 for the limits. |
 | `arm` | `id, n` | `n` must equal the number of loaded entries. From DISARMED or FAULT, the bridge goes to READY. An armed bridge keeps its state. Refused while a capture runs. |
 | `send` | `id, name` | READY only. Sends one full frame after the gap (2.3 rule 7). The bridge applies the next op after the `done` of the send. |
 | `hold` | `id, name, lease_ms` | READY or EXECUTING. `lease_ms` is an integer from 1 to 400. A hold of the same name extends the lease. A hold of another name replaces the hold. See 2.3 rule 8. |
@@ -98,7 +100,7 @@ The firmware is `firmware/ir_bridge/ir_bridge.ino`. The fake is `sim/fake_esp32.
 
 ### 2.2 Events (bridge to robotd)
 
-| Event | Fields | Meaning |
+| Event | Fields | Description |
 | --- | --- | --- |
 | `hello` | `sid, boot, fw, state` | Reply to `hello`. After a reset, the bridge sends one `hello` with `sid` 0. `boot` changes at each reset. |
 | `ack` / `nack` | `id` (and `why`) | The op was accepted or refused. |
@@ -117,7 +119,7 @@ The firmware is `firmware/ir_bridge/ir_bridge.ino`. The fake is `sim/fake_esp32.
 5. robotd sends the registry to the bridge at each handshake. A new capture never needs a new firmware.
 6. The receiver runs only during a capture. A capture needs DISARMED, and `arm` is refused while a capture runs. Thus the bridge never decodes its own frames.
 7. Before the first frame of a new command, the emitter is quiet for 40 ms or more. Thus the toy sees a new press. A new command is a `send`, the first frame of a hold, or the watchdog `stop`.
-8. The first frame of a hold always goes out, also when the lease is shorter than the frame. A hold of another name keeps the frame times of the hold that it replaces.
+8. The bridge always sends the first frame of a hold, also when the lease is shorter than the frame. A hold of another name keeps the frame times of the hold that it replaces.
 9. The bridge sends no `done` in these cases:
    - A `hello` ends a hold or a capture.
    - The watchdog ends a hold or a `send` that waits for the gap.
@@ -126,7 +128,7 @@ The firmware is `firmware/ir_bridge/ir_bridge.ino`. The fake is `sim/fake_esp32.
 
 ### 2.4 Entry limits
 
-The bridge refuses a `load` that it cannot store or send. The `why` is `table full` or `bad entry`. Each field except `data` must be present with the correct JSON type. A number with a fraction, a negative number, a string or `null` gives `bad entry`. The bridge does not read `bits`.
+The bridge refuses a `load` that it cannot store or send. The `why` is `table full` or `bad entry`. Each field except `data` must be present with the correct JSON type. A number with a fraction, a negative number, a string or `null` gives `bad entry`. The bridge ignores other fields.
 
 | Field | Limit |
 | --- | --- |
@@ -140,7 +142,7 @@ The bridge refuses a `load` that it cannot store or send. The `why` is `table fu
 | `repeat` | `nec`, `resend` or `none` |
 | `period_ms` | Integer from 20 to 1000 |
 
-robotd checks the same limits when it reads the registry (`check_registry`). Thus the bridge never refuses a `load` from robotd.
+robotd checks the same limits when it reads the registry (`check_registry`). Thus the bridge never refuses a `load` from robotd. With these limits, each `load` line is shorter than 1024 bytes.
 
 ### 2.5 Captured frames
 

@@ -105,6 +105,7 @@ def sock_path(service, cloud=False):
 
 
 def _type_ok(value, expected):
+    """Return True when value has the expected type; a bool is no number, and a number must be finite."""
     if isinstance(value, bool) and expected is not bool:
         return False
     if isinstance(value, float) and not math.isfinite(value):
@@ -113,6 +114,7 @@ def _type_ok(value, expected):
 
 
 def _no_constant(name):
+    """Refuse NaN and Infinity in json.loads."""
     raise ValueError(f"{name} is not valid JSON")
 
 
@@ -175,12 +177,9 @@ class Conn:
 
 
 async def serve(path, handlers, *, cloud=False, limit=SMALL_LIMIT, group=None):
-    """Serve handlers on a unix socket and return the asyncio server.
+    """Serve handlers, {method: async handler(params, conn)}, on a unix socket; return the asyncio server.
 
-    handlers maps a method name to ``async def handler(params, conn)``. A request
-    runs in its own task, so a stop can overtake a long action on the same
-    connection. When the connection closes, its open requests are cancelled and
-    each ``conn.on_close`` callback runs.
+    Each request runs in its own task, so a stop can overtake a long action on the same connection.
     """
     with contextlib.suppress(FileNotFoundError):
         os.unlink(path)
@@ -198,13 +197,14 @@ async def serve(path, handlers, *, cloud=False, limit=SMALL_LIMIT, group=None):
 
 
 async def _client(reader, writer, handlers, cloud):
+    """Serve one connection; on close, cancel its open requests and run its on_close callbacks."""
     conn = Conn(writer, cloud)
     tasks = set()
     try:
         while True:
             try:
                 line = await reader.readline()
-            except (ValueError, asyncio.LimitOverrunError):
+            except ValueError:  # the line passes the limit
                 conn.send(_error(None, RpcError(PARSE_ERROR, "line too long")))
                 break
             if not line:
@@ -228,6 +228,7 @@ async def _client(reader, writer, handlers, cloud):
 
 
 def _error(msg_id, err):
+    """Return the JSON-RPC error reply for err."""
     return {"jsonrpc": "2.0", "id": msg_id, "error": err.to_obj()}
 
 
@@ -245,10 +246,8 @@ def _dispatch(line, conn, handlers):
     method = msg["method"]
     is_request = "id" in msg
     try:
-        if conn.cloud and method not in CLOUD_METHODS:
-            raise RpcError(METHOD_NOT_FOUND, f"unknown method {method}")
         handler = handlers.get(method)
-        if handler is None:
+        if handler is None or (conn.cloud and method not in CLOUD_METHODS):
             raise RpcError(METHOD_NOT_FOUND, f"unknown method {method}")
         params = validate(method, msg.get("params"))
     except RpcError as err:
@@ -261,14 +260,13 @@ def _dispatch(line, conn, handlers):
 
 
 async def _run(handler, params, conn, msg_id, is_request):
+    """Run one handler and send its reply when the message is a request."""
     try:
         result = await handler(params, conn)
     except RpcError as err:
         if is_request:
             conn.send(_error(msg_id, err))
         return
-    except asyncio.CancelledError:
-        raise
     except Exception as exc:
         log.exception("handler failed")
         if is_request:
@@ -322,6 +320,7 @@ class Client:
             await self._task
 
     async def _read(self):
+        """Route replies to their requests and notifications to on_notify, until the connection closes."""
         try:
             while True:
                 line = await self._reader.readline()
@@ -366,16 +365,15 @@ async def call_once(path, method, params=None, timeout=5.0):
 async def keep_connected(path, on_connect, retry_s=1.0):
     """Keep one client connection to path open forever; on_connect(client) receives each new one.
 
-    A daemon that restarts is reached again within retry_s. Callers check
-    client.closed before they use the client they were given last.
+    A restarted daemon is reached again within retry_s. Callers check client.closed before each use.
     """
     while True:
         try:
             client = await Client.connect(path)
         except OSError:
-            await asyncio.sleep(retry_s)
-            continue
-        log.info("connected to %s", path)
-        on_connect(client)
-        await client.closed.wait()
+            pass
+        else:
+            log.info("connected to %s", path)
+            on_connect(client)
+            await client.closed.wait()
         await asyncio.sleep(retry_s)

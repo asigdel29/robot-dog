@@ -80,7 +80,7 @@ Each test opens the port, and the port open can reset the board. Thus each test 
 
 ## Calibration
 
-Three values in `ir_bridge.ino` depend on the real remote and the toy. Keep the given values until a test on the real toy shows a problem.
+Three values depend on the real remote and the toy. Keep the given values until a test on the real toy shows a problem.
 
 - `MARK_EXCESS_MICROS` (IRremote, default 20): the receiver module makes each mark longer by this time. The firmware removes this time from captured marks.
 - `RECORD_GAP_MICROS` (IRremote, default 8000): a space longer than this time ends a frame. Increase it when one button press gives two frames.

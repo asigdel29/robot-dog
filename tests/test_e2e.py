@@ -2,16 +2,18 @@
 
 Each check maps to a row of the verification table in the plan: stop latency,
 watchdog after a robotd crash, cloud refusals, arm rules, duplicates, the
-simulated goto (with a pose feeder and with mediad's fake camera) and the pose
-rate and age. Numbers are printed so a run can go into docs/test-log.md.
+simulated goto through mediad's fake camera and the pose rate and age. Numbers
+are printed so a run can go into docs/test-log.md.
 """
 
 import asyncio
 import contextlib
+import copy
 import json
 import math
 import os
 import random
+import signal
 import statistics
 import sys
 import threading
@@ -24,7 +26,7 @@ sys.path.insert(0, os.path.join(ROOT, "pi"))
 sys.path.insert(0, os.path.join(ROOT, "sim"))
 
 import dogproto  # noqa: E402
-from devstack import Stack  # noqa: E402
+from devstack import DEMO_REGISTRY, Stack  # noqa: E402
 
 #: Shared CI machines (2 cores for a private repo) stall a process for 100-300 ms now and then.
 #: There the latency gates only catch a gross regression: a stop path that waits for the 300 ms
@@ -42,12 +44,11 @@ class RobotdStack(unittest.TestCase):
 
     def setUp(self):
         self.stack = Stack()
+        self.addCleanup(self.stack.stop)
         self.stack.start()
 
-    def tearDown(self):
-        self.stack.stop()
-
     def arm(self):
+        """Arm the dog from the local socket."""
         self.assertTrue(self.stack.call("robot.enable")["armed"])
 
     def test_cloud_socket_refuses_arm_and_stick(self):
@@ -62,12 +63,6 @@ class RobotdStack(unittest.TestCase):
             self.stack.call("robot.drive", {"dir": "forward", "ms": 300, "id": aid()}, cloud=True)
         self.assertEqual(ctx.exception.code, dogproto.NOT_ARMED)
 
-    def test_cloud_trick_reaches_bridge(self):
-        self.arm()
-        result = self.stack.call("robot.do", {"trick": "bark", "id": aid()}, cloud=True, timeout=5)
-        self.assertTrue(result["transmitted"])
-        self.assertEqual([m["name"] for _, m in self.stack.wait_ops("send", 1)], ["bark"])
-
     def test_cloud_sees_only_cloud_tricks(self):
         names = {t["name"] for t in self.stack.call("robot.state", cloud=True)["tricks"]}
         self.assertNotIn("program", names)
@@ -76,13 +71,14 @@ class RobotdStack(unittest.TestCase):
         with self.assertRaises(dogproto.RpcError):
             self.stack.call("robot.do", {"trick": "program", "id": aid()}, cloud=True)
 
-    def test_duplicate_id_moves_once(self):
+    def test_cloud_trick_reaches_bridge_once_per_id(self):
         self.arm()
         action = aid()
         first = self.stack.call("robot.do", {"trick": "bark", "id": action}, cloud=True)
         second = self.stack.call("robot.do", {"trick": "bark", "id": action}, cloud=True)
+        self.assertTrue(first["transmitted"])
         self.assertEqual(first, second)
-        self.assertEqual(len(self.stack.wait_ops("send", 2, timeout=0.3)), 1)
+        self.assertEqual([m["name"] for _, m in self.stack.wait_ops("send", 2, timeout=0.3)], ["bark"])
 
     def test_over_cap_refused(self):
         self.arm()
@@ -192,7 +188,7 @@ class RobotdStack(unittest.TestCase):
 
     def test_bridge_reset_disarms(self):
         self.arm()
-        self.stack.procs["fake_esp32"].send_signal(__import__("signal").SIGUSR1)
+        self.stack.procs["fake_esp32"].send_signal(signal.SIGUSR1)
         self.stack.wait_for(lambda: not self.stack.call("robot.state")["armed"], "disarm after bridge reset")
         self.stack.wait_for(lambda: self.stack.call("robot.state")["esp"] == "DISARMED", "link up again")
 
@@ -218,7 +214,7 @@ class RobotdStack(unittest.TestCase):
 
 
 class PoseFeeder(threading.Thread):
-    """Stands in for mediad: turns the fake toy pose into robot.observe with a goal marker."""
+    """Stands in for mediad: turns the fake toy pose into robot.observe with a goal marker (used by test_link)."""
 
     def __init__(self, stack, goal):
         super().__init__(daemon=True)
@@ -227,9 +223,11 @@ class PoseFeeder(threading.Thread):
         self.halt = threading.Event()
 
     def run(self):
+        """Feed poses until halt is set."""
         asyncio.run(self._feed())
 
     async def _feed(self):
+        """Send one robot.observe each 100 ms from sim_pose.json."""
         client = await dogproto.Client.connect(self.stack.sock("robotd"))
         path = os.path.join(self.stack.run_dir, "sim_pose.json")
         try:
@@ -247,35 +245,30 @@ class PoseFeeder(threading.Thread):
             await client.close()
 
 
-def random_goal(rng, pose, margin=40):
-    """Return a goal 100 to 220 px from the toy pose and at least margin px inside the 640 x 480 floor."""
+class BadRegistry(unittest.TestCase):
+    """A registry that breaks a rule."""
+
+    def test_link_comes_up_and_arming_is_refused(self):
+        registry = copy.deepcopy(DEMO_REGISTRY)
+        registry["commands"]["x" * 32] = registry["commands"]["bark"]  # a name that the bridge refuses
+        stack = Stack(registry=registry)
+        self.addCleanup(stack.stop)
+        stack.start()  # waits for the bridge link
+        self.assertFalse(stack.call("robot.state")["registry_ready"])
+        with self.assertRaises(dogproto.RpcError) as ctx:
+            stack.call("robot.enable")
+        self.assertEqual(ctx.exception.code, dogproto.UNAVAILABLE)
+
+
+def random_goal(rng, pose):
+    """Return a goal 100 to 220 px from the toy pose and 80 px or more inside the 640 x 480 floor.
+
+    The detector drops a marker whose white border touches the image edge, on a real camera too.
+    """
     angle = rng.uniform(-math.pi, math.pi)
     dist = rng.uniform(100, 220)
-    return (min(640 - margin, max(margin, pose["x"] + dist * math.cos(angle))),
-            min(480 - margin, max(margin, pose["y"] + dist * math.sin(angle))))
-
-
-class SimGoto(unittest.TestCase):
-    """Simulated goto: 9 of 10 random goals reached."""
-
-    def test_goto_random_goals(self):
-        rng = random.Random(7)
-        reached = 0
-        with Stack() as stack:
-            stack.call("robot.enable")
-            for seed in range(10):
-                goal = random_goal(rng, stack.sim_pose())
-                feeder = PoseFeeder(stack, goal)
-                feeder.start()
-                time.sleep(0.3)
-                try:
-                    result = stack.call("robot.goto", {"marker": 2, "id": aid()}, cloud=True, timeout=40)
-                finally:
-                    feeder.halt.set()
-                    feeder.join()
-                reached += result["reached"]
-                print(f"\ngoto {seed}: {result['reason']} in {result['steps']} steps")
-        self.assertGreaterEqual(reached, 9)
+    return (min(560, max(80, pose["x"] + dist * math.cos(angle))),
+            min(400, max(80, pose["y"] + dist * math.sin(angle))))
 
 
 class CameraPose(unittest.TestCase):
@@ -284,28 +277,21 @@ class CameraPose(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.stack = Stack(media=True)
+        cls.addClassCleanup(cls.stack.stop)
         cls.stack.start()
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.stack.stop()
-
-    def test_goto_random_goals_camera(self):
-        """9 of 10 random goals reached with poses from the camera path.
-
-        The goals stay 80 px inside the image: the detector drops a marker whose
-        white margin touches the image edge, on a real camera too.
-        """
+    def test_goto_random_goals(self):
+        """9 of 10 random goals reached with poses from the camera path."""
         rng = random.Random(7)
         reached = 0
         self.stack.call("robot.enable")
         for seed in range(10):
-            goal = random_goal(rng, self.stack.sim_pose(), margin=80)
+            goal = random_goal(rng, self.stack.sim_pose())
             self.stack.set_goal_markers({"2": list(goal)})
             time.sleep(0.3)
             result = self.stack.call("robot.goto", {"marker": 2, "id": aid()}, cloud=True, timeout=40)
             reached += result["reached"]
-            print(f"\ncamera goto {seed}: {result['reason']} in {result['steps']} steps")
+            print(f"\ngoto {seed}: {result['reason']} in {result['steps']} steps")
         self.assertGreaterEqual(reached, 9)
 
     def test_pose_rate_and_age(self):

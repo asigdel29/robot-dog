@@ -25,37 +25,39 @@ This document owns the registry format, its rules and the capture procedure. Whe
 
 ### 2.1 Command fields
 
-| Field | Values | Meaning |
+| Field | Values | Description |
 | --- | --- | --- |
 | `ir.proto` | `NEC` or `raw` | `raw` replays `raw_us` timings. Protocols with a toggle bit are refused. |
+| `ir.addr`, `ir.cmd`, `ir.raw_us`, `ir.carrier_khz` | Limits in `protocol.md` section 2.4 | NEC address and command, raw timings in µs, carrier frequency in kHz. |
 | `ir.data` | integer, optional | The 32 NEC bits that the capture saw. With `data`, the bridge sends these bits, not `addr` and `cmd`. |
+| `ir.bits` | integer | The number of bits that the capture saw. robotd does not use it. |
 | `kind` | `hold`, `episodic`, `perpetual`, `mode` | `hold`: motion while frames repeat. `episodic`: one routine with a natural end. `perpetual`: continues until a stop command. `mode`: changes a toy setting. |
 | `repeat` | `nec`, `resend`, `none` | How the remote repeats a held button. |
-| `period_ms` | integer | Time between repeat frames. |
+| `period_ms` | integer, 20 to 1000 | Time between repeat frames. |
 | `stop_via` | `release`, a command name, `none` | How the motion ends. |
-| `natural_ms` | integer or null | Measured time of one episodic routine. |
-| `max_run_ms` | integer | Limit for a hold or perpetual command. |
+| `natural_ms` | integer, 0 to 60000, or null | Measured time of one episodic routine. |
+| `max_run_ms` | integer, 1 to 10000 | Limit for a hold or perpetual command, and for the `ms` of `robot.drive`. |
 | `interruptible` | true, false, null | Result of the stop test. |
-| `verified` | bool | True only after capture and a physical replay test. |
-| `cloud` | bool | True permits Hermes to use the command. |
+| `verified` | true or false | True only after capture and a physical replay test. |
+| `cloud` | true or false | True permits Hermes to use the command. |
 | `say` | text | Short description for Hermes. |
 | `notes` | text | Evidence: date, distance, surface, results. |
 
 ### 2.2 goto fields
 
-| Field | Meaning |
-| --- | --- |
-| `robot_marker` | ArUco id on the dog. Attach it with its top edge toward the nose. |
-| `goal_radius_px` | The goal is reached inside this radius. |
-| `area_px` | The dog must stay inside this polygon (image pixels). |
-| `turn_ms`, `forward_ms`, `settle_ms` | Pulse and wait times. Calibrate them on the real floor. |
-| `turn_sign` | 1 when the camera looks straight down. Use -1 for a mirrored view. |
+| Field | Values | Description |
+| --- | --- | --- |
+| `robot_marker` | integer, 0 to 999 | ArUco id on the dog. Attach it with its top edge toward the nose. |
+| `goal_radius_px` | number more than 0 | The goal is reached inside this radius. |
+| `area_px` | list of three or more `[x, y]` points | The dog must stay inside this polygon (image pixels). |
+| `turn_ms`, `forward_ms`, `settle_ms` | integer, 0 to 1000 | Pulse and wait times. Calibrate them on the real floor. The `max_run_ms` of the command also limits each pulse. |
+| `turn_sign` | 1 or -1 | 1 when the camera looks straight down. Use -1 for a mirrored view. |
 
 ## 3. Rules at load time
 
-When a rule fails, robotd runs, but `registry_ready` is false and robotd refuses to arm.
+When a rule fails, robotd runs, but `registry_ready` is false. robotd then loads no entry into the bridge and refuses to arm.
 
-1. Refuse unknown fields.
+1. Refuse unknown fields. `schema` must be 1. The registry, `commands`, each command, `drive` and `goto` must be JSON objects.
 2. A verified command must have an IR payload.
 3. A verified `perpetual` command must have a `stop_via` that names a verified command.
 4. A `hold` command must have `max_run_ms` from 1 to 1000.
@@ -64,7 +66,8 @@ When a rule fails, robotd runs, but `registry_ready` is false and robotd refuses
 7. A `mode` command can never be a cloud command.
 8. Each `drive` entry must name a `hold` command. An entry that names a command that is not verified is not an error. That direction is only not available.
 9. `goto` is available only when forward and one turn are verified.
-10. Each IR payload and each command name must be inside the bridge limits in `protocol.md` section 2.4. Thus the bridge never refuses a `load`.
+10. Each IR payload, each command name and the payload count must be inside the bridge limits (`protocol.md` section 2.4). Thus the bridge never refuses a `load`.
+11. `kind`, `repeat`, `period_ms`, `natural_ms`, `max_run_ms`, `stop_via`, `verified`, `cloud` and each goto field must have a value from the tables in section 2.
 
 These rules replace "refuse to arm without stop" from the old plan. A toy with no stop button is safe when each enabled command is a hold command or a bounded episodic command.
 
@@ -75,12 +78,12 @@ Do these steps for each of the 12 remote buttons.
 1. Disarm the dog.
 2. Run `robotctl registry capture <name>`.
 3. Press the button once when the tool tells you. Do this three times.
-4. Hold the button down for 4 s when the tool tells you.
+4. Push and hold the button for 4 s when the tool tells you.
 5. Arm the dog with gamepad Start.
 6. Run `robotctl registry test <name> --ms 300`. Watch the dog.
 7. Disarm the dog. robotd reads a new registry only while it is DISARMED.
 8. Record the behavior with `robotctl registry verify <name> --kind <kind> --natural-ms <ms> --interruptible <yes|no> --notes "<evidence>"`.
-9. Add `--cloud yes` only after the stop test passes at operating distance.
+9. Add `--cloud yes` only after the stop test passes at the distance of normal operation.
 10. For a drive button, run `robotctl registry map <dir> <name>`.
 
 When the dog is armed, `verify` and `map` write the file and report `reload: pending`. Disarm the dog. Then run `robotctl registry reload`.
