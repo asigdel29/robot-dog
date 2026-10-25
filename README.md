@@ -8,12 +8,22 @@ This project gives a voice and an agent to a toy robot dog. A Raspberry Pi sends
 ## Contents
 
 - [Overview](#overview)
+- [Features](#features)
 - [Architecture](#architecture)
+- [Hardware](#hardware)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
+- [Usage](#usage)
+- [Configuration](#configuration)
+- [Deployment](#deployment)
 - [Tests](#tests)
+- [Project structure](#project-structure)
 - [Safety](#safety)
 - [Documentation](#documentation)
+- [Contributions](#contributions)
+- [Security](#security)
+- [License](#license)
+- [Acknowledgements](#acknowledgements)
 
 ## Overview
 
@@ -31,6 +41,16 @@ The software architecture follows [microduck](https://github.com/pollen-robotics
 This repo copies no microduck code.
 
 Status: the software works against a simulated IR bridge and a simulated toy. The hardware phases are open. The GitHub issues give the full plan and its order.
+
+## Features
+
+- Voice: hold a gamepad button, speak, and hear the reply from the dog speaker.
+- Remote chat: send text or voice notes to the dog through Telegram.
+- Web tasks: Hermes Agent uses its own tools for search and other internet tasks.
+- Tricks and motion: Hermes starts only verified tricks and bounded moves.
+- Navigation: the dog drives to a printed ArUco marker with camera feedback.
+- Local control: a wired gamepad and a LAN web page arm, stop and drive the dog.
+- Safe updates: a release that does not become healthy rolls back by itself.
 
 ## Architecture
 
@@ -67,6 +87,22 @@ flowchart LR
 | `pi/robotctl.py` | Pi | Command-line control, registry capture and release updates. |
 | `firmware/ir_bridge/` | ESP32 | Records and sends IR frames, with leases and a heartbeat watchdog. |
 | `hub/hub.py` | Droplet | Holds the Pi link, gives seven robot tools to Hermes, and runs the voice loop. |
+
+## Hardware
+
+| Part | Job |
+| --- | --- |
+| SUPIREO Y8359 robot dog and its remote | The robot. The remote is necessary to record the IR codes. |
+| Raspberry Pi 5 (2 GB), 27 W power supply, case with fan, 32 GB microSD | Runs the Pi daemons. |
+| Adafruit ESP32 Feather V2 (#5900) | IR bridge. |
+| Adafruit IR transceiver (#5990) and JST PH 4-pin cable (#3950) | IR receiver and emitter. |
+| USB-A to USB-C data cable | Connects the Feather to the Pi. |
+| Logitech C270 webcam and a stand | Camera for the marker pose. |
+| Wired USB gamepad (Logitech F310 class) | Local arm, stop, drive and push-to-talk. |
+| USB speaker | Voice output. The Pi 5 has no audio jack. |
+| Printed ArUco markers (DICT_4X4_50) | One marker on the dog, one marker for each goal. |
+
+Connect the IR module to the Feather as `firmware/README.md` shows. Check each connection with the labels on the pads, not with the wire colors.
 
 ## Requirements
 
@@ -122,6 +158,66 @@ This procedure runs the full Pi stack on a development computer. A simulated IR 
    .venv/bin/python pi/robotctl.py --config /dev/null do bark
    ~~~
 
+## Usage
+
+### Gamepad
+
+| Control | Action |
+| --- | --- |
+| Start | Arm the dog. |
+| B | Stop. |
+| Hold Select for 1 s | Disarm the dog. |
+| Left stick | Drive forward, back, left or right. |
+| Hold A | Record speech for the agent (push-to-talk). |
+| X, Y, LB, RB | Start the tricks in `[padd.bindings]` of `dog.toml`. |
+
+### robotctl on the Pi
+
+| Command | Action |
+| --- | --- |
+| `robotctl state` | Shows the arm state, the health, the tricks and the capabilities. |
+| `robotctl enable`, `robotctl disarm`, `robotctl stop` | Arms, disarms or stops the dog. |
+| `robotctl do <trick>` | Starts one verified trick. |
+| `robotctl drive <dir> <ms>` | Drives in one direction for a bounded time. |
+| `robotctl goto <marker>` | Drives to an ArUco marker. |
+| `robotctl registry capture <name>` | Records one remote button. |
+| `robotctl registry test <name>` | Sends one recorded button. The dog must be armed. |
+| `robotctl registry verify <name> ...` | Records the tested behavior and marks the button as verified. |
+| `robotctl update apply`, `rollback`, `status` | Installs a release, goes back to the previous release, or shows the releases. |
+
+From the development computer, run each command over SSH, for example `ssh robot-pi robotctl state`.
+
+### Voice and chat
+
+1. Arm the dog with Start.
+2. Hold A and speak. Release A to send the speech.
+3. Listen to the reply from the dog speaker.
+
+Telegram messages go to the same Hermes Agent. Motion from Telegram works only while a person at the Pi keeps the dog armed.
+
+## Configuration
+
+| File | Location on the Pi | Content |
+| --- | --- | --- |
+| `config/dog.toml` | `/etc/dog/dog.toml` | Device paths, ALSA devices, marker ids, console port, gamepad bindings. |
+| `config/registry.json` | `/etc/dog/registry.json` | The recorded IR commands and their tested limits. Only `robotctl` writes it. |
+| `deploy/pi/link.env.example` | `/etc/dog/link.env` | `DOG_HUB_URL`, `DOG_DEVICE_TOKEN`, `DOG_DEVICE`. |
+| `deploy/pi/console.env.example` | `/etc/dog/console.env` | `DOG_CONSOLE_TOKEN` (32 characters or more). |
+| `deploy/hub/hub.env.example` | `/etc/doghub/hub.env` on the server | Hub tokens, the Hermes URL and key, OpenAI key and models, daily caps. |
+| `deploy/hub/hermes-config.yaml` | `~hermes/.hermes/config.yaml` on the server | Model, API server, robot tool server, Docker terminal, approvals, voice. |
+
+Keep each env file out of git. Each one has mode 0600 or 0640.
+
+## Deployment
+
+`docs/runbook.md` gives the full procedures. The short form:
+
+1. Create the droplet with your SSH key and a DNS record for `dog.<domain>`.
+2. Run `scripts/deploy-hub.sh <ssh-target> <domain>` from the development computer.
+3. Write Raspberry Pi OS Lite to the SD card. Use hostname `robot-pi` and user `robot`.
+4. Run `scripts/install-pi.sh` on the Pi one time.
+5. Run `scripts/deploy-pi.sh` from the development computer for each later release.
+
 ## Tests
 
 | Command | Content |
@@ -131,6 +227,22 @@ This procedure runs the full Pi stack on a development computer. A simulated IR 
 | `arduino-cli compile --fqbn esp32:esp32:adafruit_feather_esp32_v2 --warnings all firmware/ir_bridge` | Compiles the firmware. A warning is an error. |
 
 CI runs the Python tests on Python 3.11 and 3.13, compiles the firmware, and checks the deploy files. CI machines are shared, so CI latency gates only find a large regression. `docs/test-log.md` records the measured values.
+
+## Project structure
+
+~~~text
+robot-dog/
+  pi/            Pi daemons: robotd, mediad, padd, linkd, robotctl, and the bus (dogproto)
+  firmware/      ESP32 IR bridge firmware
+  hub/           Server process: device link, robot tools, voice loop
+  sim/           Simulated IR bridge, simulated Hermes, dev stack
+  tests/         Unit, conformance and end-to-end tests
+  config/        dog.toml and the registry template
+  deploy/        systemd units and templates for the Pi and the server
+  hooks/         Release hooks that run before and after an update
+  scripts/       Package, install and deploy scripts
+  docs/          Design documents, runbook and test log
+~~~
 
 ## Safety
 
@@ -158,3 +270,30 @@ CI runs the Python tests on Python 3.11 and 3.13, compiles the firmware, and che
 | `firmware/README.md` | Toolchain, flash procedure and wire connections. |
 
 Each design document owns one mechanism. When a document and the code disagree, correct the document first.
+
+## Contributions
+
+1. Open a GitHub issue for the change.
+2. Make a branch from the top of the pull request stack.
+3. Keep each pull request near 200 lines, with its tests.
+4. Write `Closes #<issue>` in the pull request body.
+5. Use these body sections: Why, What, How to Review, Test Evidence.
+6. Run the tests before you push.
+
+## Security
+
+Do not open a public issue for a security problem. Send a private report through [GitHub security advisories](https://github.com/asigdel29/robot-dog/security/advisories/new).
+
+Never commit a token, a key or an env file. The hub and Hermes listen only on loopback. Caddy makes only `/device` and `/healthz` public.
+
+## License
+
+This project uses the MIT License. See [LICENSE](LICENSE).
+
+## Acknowledgements
+
+- [microduck](https://github.com/pollen-robotics/microduck) by Pollen Robotics (Apache-2.0): the architecture model.
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous Research (MIT): the agent on the server.
+- [Arduino-IRremote](https://github.com/Arduino-IRremote/Arduino-IRremote) and [ArduinoJson](https://arduinojson.org/): IR and JSON on the ESP32.
+- [OpenCV](https://opencv.org/): ArUco marker detection.
+- [Model Context Protocol Python SDK](https://github.com/modelcontextprotocol/python-sdk): the robot tool server.
