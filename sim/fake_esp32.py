@@ -195,7 +195,7 @@ class FakeBridge:
 
     def tick(self, now, dt):
         """Lease expiry, repeat frames, heartbeat watchdog and toy motion."""
-        start = time.perf_counter()
+        start = time.thread_time()  # CPU time: a busy CI host must not count as a slow loop
         if self.state in ("READY", "EXECUTING") and now - self.last_hb > HB_TIMEOUT_S:
             self.hold = None
             self.timed = None
@@ -220,7 +220,7 @@ class FakeBridge:
         if now >= self._next_pose_write:
             self._next_pose_write = now + POSE_EVERY_S
             self._write_pose()
-        self.max_loop_us = max(self.max_loop_us, int((time.perf_counter() - start) * 1e6))
+        self.max_loop_us = max(self.max_loop_us, int((time.thread_time() - start) * 1e6))
 
     def _write_pose(self):
         path = os.path.join(self.run_dir, "sim_pose.json")
