@@ -12,6 +12,7 @@ import contextlib
 import itertools
 import json
 import logging
+import math
 import os
 import shutil
 
@@ -106,7 +107,18 @@ def sock_path(service, cloud=False):
 def _type_ok(value, expected):
     if isinstance(value, bool) and expected is not bool:
         return False
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
     return isinstance(value, expected)
+
+
+def _no_constant(name):
+    raise ValueError(f"{name} is not valid JSON")
+
+
+def decode(line):
+    """Parse one wire line; NaN and Infinity are refused, because a clamp turns NaN into full motion."""
+    return json.loads(line, parse_constant=_no_constant)
 
 
 def validate(method, params):
@@ -134,7 +146,7 @@ def validate(method, params):
 
 def encode(obj):
     """Return one wire line for obj."""
-    return (json.dumps(obj, separators=(",", ":")) + "\n").encode()
+    return (json.dumps(obj, separators=(",", ":"), allow_nan=False) + "\n").encode()
 
 
 class Conn:
@@ -179,8 +191,9 @@ async def serve(path, handlers, *, cloud=False, limit=SMALL_LIMIT, group=None):
         try:
             shutil.chown(path, group=group)
         except (LookupError, PermissionError) as exc:
-            # Fails closed: the socket keeps this process's own group.
-            log.warning("chown %s to group %s failed: %s", path, group, exc)
+            # Fail closed: only this process's user may connect, whatever its primary group is.
+            os.chmod(path, 0o600)
+            log.warning("chown %s to group %s failed, socket is owner-only: %s", path, group, exc)
     return server
 
 
@@ -221,7 +234,7 @@ def _error(msg_id, err):
 def _dispatch(line, conn, handlers):
     """Run one inbound line; return the task of a request, or None."""
     try:
-        msg = json.loads(line)
+        msg = decode(line)
     except ValueError:
         conn.send(_error(None, RpcError(PARSE_ERROR, "invalid json")))
         return None
@@ -315,8 +328,10 @@ class Client:
                 if not line:
                     break
                 try:
-                    msg = json.loads(line)
+                    msg = decode(line)
                 except ValueError:
+                    continue
+                if not isinstance(msg, dict):
                     continue
                 if "method" in msg and "id" not in msg:
                     if self._on_notify is not None:
