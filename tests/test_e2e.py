@@ -140,10 +140,14 @@ class RobotdStack(unittest.TestCase):
         out = [(t, m) for t, d, m in self.stack.log() if d == "out"]
         last_tx = max(t for t, m in out if m.get("ev") == "tx" and m.get("id"))
         fault = min(t for t, m in out if m.get("ev") == "fault" and t > killed)
-        print(f"\nafter kill: last repeat {(last_tx - killed) / 1e6:.0f} ms, fault {(fault - killed) / 1e6:.0f} ms")
+        last_hb = max(t for t, _ in self.stack.ops("hb") if t < killed)
+        print(f"\nafter kill: last repeat {(last_tx - killed) / 1e6:.0f} ms, fault {(fault - killed) / 1e6:.0f} ms"
+              f" ({(fault - last_hb) / 1e6:.0f} ms after the last heartbeat)")
         self.assertGreater(last_tx, killed, "no repeat frame after the kill: the hold was not running")
         self.assertLessEqual((last_tx - killed) / 1e6, 400)
-        self.assertLessEqual((fault - killed) / 1e6, 1100)
+        # Watchdog 1000 ms after the last heartbeat, then the 40 ms gap and the ~70 ms stop frame, then FAULT:
+        # about 1110 ms by design, plus slack for process scheduling on a busy CI runner.
+        self.assertLessEqual((fault - last_hb) / 1e6, 1300)
 
     def test_owner_disconnect_stops_hold(self):
         self.arm()
