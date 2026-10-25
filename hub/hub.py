@@ -31,10 +31,13 @@ from typing import Literal
 import httpx2
 import openai
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route, WebSocketRoute
+from starlette.websockets import WebSocketDisconnect
 
 log = logging.getLogger("hub")
 
@@ -530,19 +533,12 @@ async def _lifespan(app):
         yield
 
 
-app = FastAPI(lifespan=_lifespan, docs_url=None, redoc_url=None, openapi_url=None)
-app.mount("/tools", _require_bearer(
-    tools.streamable_http_app(streamable_http_path="/", stateless_http=True, json_response=True), TOOLS_TOKEN))
-
-
-@app.get("/healthz")
-async def healthz():
+async def healthz(request):
     """Liveness for Caddy and the deploy check."""
-    return {"ok": True}
+    return JSONResponse({"ok": True})
 
 
-@app.websocket("/device")
-async def device_link(ws: WebSocket):
+async def device_link(ws):
     """Serve the Pi link: bearer DEVICE_TOKEN, then link.hello; a new link replaces the old one."""
     if not _bearer_ok(ws.headers.get("authorization", ""), DEVICE_TOKEN):
         await ws.close(code=1008)  # before accept, so the Pi gets HTTP 403
@@ -582,6 +578,14 @@ async def device_link(ws: WebSocket):
     finally:
         device.detach(ws)
         log.warning("device %s link down", DEVICE_ID)
+
+
+app = Starlette(lifespan=_lifespan, routes=[
+    Route("/healthz", healthz),
+    WebSocketRoute("/device", device_link),
+    Mount("/tools", _require_bearer(
+        tools.streamable_http_app(streamable_http_path="/", stateless_http=True, json_response=True), TOOLS_TOKEN)),
+])
 
 
 def main():

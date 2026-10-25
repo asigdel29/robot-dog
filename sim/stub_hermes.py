@@ -18,10 +18,11 @@ import uuid
 
 import httpx2
 import uvicorn
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import StreamingResponse
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.routing import Route
 
 #: What a test can change: STT text, reply deltas, delays (s), event stream status, raw SSE lines, TTS length (s).
 config = {"transcript": "hello dog", "reply": ["Sure,", " I can do that.", " Here I go!"], "delta_delay": 0.05,
@@ -30,7 +31,6 @@ TOOLS_TOKEN = os.environ.get("TOOLS_TOKEN", "")
 requests = []
 #: Run id to (input text, stop event).
 runs = {}
-app = FastAPI()
 
 
 def record(path, **fields):
@@ -43,40 +43,38 @@ def hermes_headers(request):
     return {name: request.headers.get(name) for name in ("authorization", "idempotency-key", "x-hermes-session-key")}
 
 
-@app.post("/_stub/config")
-async def set_config(request: Request):
+async def set_config(request):
     """Change config values."""
     config.update(await request.json())
+    return Response()
 
 
-@app.get("/_stub/requests")
-async def get_requests():
+async def get_requests(request):
     """Return each recorded request, oldest first."""
-    return requests
+    return JSONResponse(requests)
 
 
-@app.post("/v1/runs", status_code=202)
-async def create_run(request: Request):
+async def create_run(request):
     """Start a run, as Hermes does: 202 with a run id, after create_delay seconds."""
     body = await request.json()
     run_id = f"run_{uuid.uuid4().hex}"
     runs[run_id] = (body["input"], asyncio.Event())
     record("/v1/runs", headers=hermes_headers(request), body=body, run_id=run_id)
     await asyncio.sleep(config["create_delay"])
-    return {"run_id": run_id, "status": "started"}
+    return JSONResponse({"run_id": run_id, "status": "started"}, status_code=202)
 
 
-@app.post("/v1/runs/{run_id}/stop")
-async def stop_run(run_id: str, request: Request):
+async def stop_run(request):
     """Stop a run; its stream ends with run.cancelled."""
+    run_id = request.path_params["run_id"]
     record("/v1/runs/stop", headers=hermes_headers(request), run_id=run_id)
     runs[run_id][1].set()
-    return {"run_id": run_id, "status": "stopping"}
+    return JSONResponse({"run_id": run_id, "status": "stopping"})
 
 
-@app.get("/v1/runs/{run_id}/events")
-async def run_events(run_id: str):
+async def run_events(request):
     """Stream the run events in the Hermes SSE format, or answer with events_status."""
+    run_id = request.path_params["run_id"]
     record("/v1/runs/events", run_id=run_id)
     if config["events_status"] != 200:
         return Response(status_code=config["events_status"])
@@ -116,21 +114,30 @@ async def call_tool(name, arguments):
     record(f"tool:{name}", is_error=result.is_error, text=text)
 
 
-@app.post("/v1/audio/transcriptions")
-async def transcriptions(request: Request):
+async def transcriptions(request):
     """Return the configured transcript for any audio file."""
     form = await request.form()
     audio = await form["file"].read()
     record("/v1/audio/transcriptions", model=form.get("model"), wav=audio[:4] == b"RIFF",
            authorization=request.headers.get("authorization"))
-    return {"text": config["transcript"]}
+    return JSONResponse({"text": config["transcript"]})
 
 
-@app.post("/v1/audio/speech")
-async def speech(request: Request):
+async def speech(request):
     """Return speech_seconds of silent 24 kHz PCM16 for any text."""
     record("/v1/audio/speech", body=await request.json())
     return Response(content=b"\x00\x00" * int(24000 * config["speech_seconds"]), media_type="audio/pcm")
+
+
+app = Starlette(routes=[
+    Route("/_stub/config", set_config, methods=["POST"]),
+    Route("/_stub/requests", get_requests),
+    Route("/v1/runs", create_run, methods=["POST"]),
+    Route("/v1/runs/{run_id}/stop", stop_run, methods=["POST"]),
+    Route("/v1/runs/{run_id}/events", run_events),
+    Route("/v1/audio/transcriptions", transcriptions, methods=["POST"]),
+    Route("/v1/audio/speech", speech, methods=["POST"]),
+])
 
 
 def main():
