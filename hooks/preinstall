@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# preinstall: checks that the Pi can run this release and creates the dog users and groups.
+# robotctl update apply runs it as root from the new release, before the current symlink changes.
+# A failure here stops the update with no change to the running release.
+set -euo pipefail
+
+ADMIN_USER=robot
+# scripts/install-pi.sh reads this line, so the list is in one place.
+APT_PACKAGES=(python3-venv python3-opencv python3-numpy python3-evdev alsa-utils)
+MIN_FREE_KB=$((200 * 1024))
+
+# fail prints a reason and stops the hook.
+fail() {
+	echo "preinstall: $*" >&2
+	exit 1
+}
+
+python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' || fail "python3 3.11 or later is necessary"
+
+missing=()
+for pkg in "${APT_PACKAGES[@]}"; do
+	if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+		missing+=("$pkg")
+	fi
+done
+if ((${#missing[@]})); then
+	fail "missing apt packages: ${missing[*]}; run: sudo apt-get install ${missing[*]}"
+fi
+
+# mediad needs cv2.aruco.ArucoDetector (OpenCV 4.7 or later): Raspberry Pi OS based on Debian 13 Trixie has it.
+python3 -c 'import cv2; cv2.aruco.ArucoDetector' 2>/dev/null ||
+	fail "python3-opencv has no cv2.aruco.ArucoDetector; OpenCV 4.7 or later is necessary (Debian 13 Trixie)"
+
+free_kb=$(df --output=avail -k /opt | tail -n 1)
+((free_kb >= MIN_FREE_KB)) || fail "only ${free_kb} KiB free on /opt; 200 MiB is necessary"
+
+# The dog groups and users. Each command runs only when the item is absent, so the hook is idempotent.
+for group in dog doglink dialout video audio input; do
+	getent group "$group" >/dev/null || groupadd --system "$group"
+done
+if ! id -u doglink >/dev/null 2>&1; then
+	useradd --system --gid doglink --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin doglink
+fi
+if ! id -u dog >/dev/null 2>&1; then
+	useradd --system --gid dog --home-dir /var/lib/dog --no-create-home --shell /usr/sbin/nologin dog
+fi
+usermod --append --groups dialout,video,audio,input,doglink dog
+if id -u "$ADMIN_USER" >/dev/null 2>&1; then
+	usermod --append --groups dog "$ADMIN_USER"
+fi

@@ -1,0 +1,69 @@
+# hermes-config.yaml: template for ~hermes/.hermes/config.yaml on the droplet.
+# scripts/deploy-hub.sh copies it only when no config.yaml exists. The secrets are in ~hermes/.hermes/.env.
+# Each key below is in the Hermes Agent docs (https://hermes-agent.nousresearch.com/docs/, read 2026-10-25).
+# A line with "NOT VERIFIED" names a key or behavior that the docs do not confirm; check it with
+# `hermes config check` and `hermes doctor` before you rely on it.
+#
+# The API server is configured in .env (API_SERVER_ENABLED, API_SERVER_HOST, API_SERVER_PORT, API_SERVER_KEY),
+# because the API server page says that API_SERVER_* are environment variables.
+
+# Model: OpenRouter. The owner selects a model that accepts images, because the `look` tool returns a JPEG.
+# Doc: user-guide/configuring-models, "What gets written to config.yaml".
+model:
+  provider: openrouter
+  default: "REPLACE-WITH-VISION-MODEL"   # for example a vendor/model id from openrouter.ai/models with image input
+
+# Iteration cap of one conversation turn. The docs give different defaults (unlimited and 500), so set it here.
+# Doc: user-guide/configuration, "Iteration Budget".
+agent:
+  max_turns: 40
+
+# Terminal commands run in a Docker container. The daemon is rootless Docker of the hermes user, because a
+# member of the normal docker group has root access. Doc: user-guide/configuration, "Docker Backend".
+# NOT VERIFIED: the docs do not describe rootless Docker. deploy-hub.sh makes the "rootless" CLI context the
+# default of user hermes, so the docker CLI that Hermes runs uses the rootless daemon.
+terminal:
+  backend: docker
+  container_cpu: 1        # CPU cores
+  container_memory: 1024  # MB; the droplet has 4 GB for Hermes, the hub and Caddy
+  docker_network: true    # web tasks need egress; set false to air-gap the container
+
+# Approvals. Doc: user-guide/security, "Approval Modes".
+# The docs say that dangerous-command checks are skipped on the docker backend ("container is boundary").
+approvals:
+  mode: smart
+  unattended_mode: deny   # API server runs with no person to answer get a deny, not a wait
+  cron_mode: deny
+
+# Speech for Telegram voice notes. The key is VOICE_TOOLS_OPENAI_KEY in .env.
+# Doc: user-guide/configuration, "Speech-to-Text" and "TTS Configuration".
+stt:
+  enabled: true
+  provider: openai
+  openai:
+    model: gpt-4o-mini-transcribe
+tts:
+  provider: openai
+  openai:
+    model: gpt-4o-mini-tts
+    voice: alloy
+
+# Telegram access. The allowlist is TELEGRAM_ALLOWED_USERS in .env.
+# "pair" replies to an unknown DM with a pairing code. After the owner is paired, change it to "ignore",
+# so a DM from another account gets no answer. Doc: user-guide/configuration, "Unauthorized DM Behavior".
+unauthorized_dm_behavior: pair
+
+# The robot tools of the hub, on loopback. Doc: reference/mcp-config-reference.
+# ${TOOLS_TOKEN} comes from .env; when it is not set, the connection fails closed.
+# trust stays "full": "untrusted" makes each motion tool wait for an approval that a voice run cannot give.
+# Time limits from the inside out: robotd goto 30 s, hub wait 35 s, this timeout 60 s.
+mcp_servers:
+  dog:
+    url: "http://127.0.0.1:8000/tools/"
+    headers:
+      Authorization: "Bearer ${TOOLS_TOKEN}"
+    trust: full
+    timeout: 60
+    connect_timeout: 10
+    sampling:
+      enabled: false

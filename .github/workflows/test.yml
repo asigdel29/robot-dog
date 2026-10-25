@@ -53,3 +53,41 @@ jobs:
         run: |
           arduino-cli compile --fqbn esp32:esp32:adafruit_feather_esp32_v2 --warnings all firmware/ir_bridge 2>&1 | tee build.log
           if grep -n "warning:" build.log; then exit 1; fi
+  deploy:
+    # Checks of the deploy files: shell scripts, systemd units, tmpfiles, the Caddyfile and a real Pi install.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck the scripts, hooks and launcher
+        run: shellcheck scripts/*.sh hooks/preinstall hooks/postinstall deploy/pi/robotctl
+      - name: Create the users and venv paths that the units name
+        run: |
+          sudo groupadd --system dog
+          sudo groupadd --system doglink
+          sudo useradd --system --gid dog --no-create-home dog
+          sudo useradd --system --gid doglink --no-create-home doglink
+          sudo useradd --system --user-group --no-create-home doghub
+          for venv in /opt/dog/current/.venv /opt/doghub/.venv; do
+            sudo mkdir -p "$venv/bin"
+            sudo ln -s /usr/bin/python3 "$venv/bin/python"
+          done
+      - name: Verify the systemd units
+        # verify only warns about an unknown key, so a warning that names one of these units also fails the step.
+        run: |
+          systemd-analyze verify deploy/pi/dog.target deploy/pi/*.service deploy/hub/doghub.service 2>&1 | tee verify.log
+          if grep -E 'dog\.target|(robotd|mediad|padd|linkd|doghub)\.service' verify.log; then exit 1; fi
+      - name: Create the dog directories from the tmpfiles entry
+        run: |
+          sudo systemd-tmpfiles --create "$PWD/deploy/pi/dog-tmpfiles.conf"
+          sudo stat -c '%U:%G %a %n' /run/dog /var/lib/dog /var/lib/dog/captures
+      - name: Validate the Caddyfile with the Ubuntu caddy package (the droplet version)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y caddy
+          DOG_DOMAIN=example.com caddy validate --adapter caddyfile --config deploy/hub/Caddyfile
+      - name: Install the real release in Debian 13 and check the commit and the rollback
+        # Real hooks, robotctl and robotd; shims for systemctl and systemd-run (scripts/check-pi-install.sh).
+        run: |
+          tarball=$(scripts/package.sh)
+          docker run --rm -v "$PWD":/repo:ro -w /repo debian:trixie bash scripts/check-pi-install.sh "$tarball"

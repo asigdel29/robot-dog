@@ -9,7 +9,7 @@ The software architecture follows [microduck](https://github.com/pollen-robotics
 | Part | Where | Job |
 | --- | --- | --- |
 | `pi/robotd.py` | Pi | Only process that talks to the IR bridge. 20 Hz loop, registry, arm state, actions, safety. |
-| `pi/robotctl.py` | Pi | Command-line control and the only writer of the registry. |
+| `pi/robotctl.py` | Pi | Command-line control, the only writer of the registry, and the release update. |
 | `pi/mediad.py` | Pi | Camera, ArUco pose, microphone, speaker and the LAN console. Only writer of the pose. |
 | `pi/padd.py` | Pi | Wired USB gamepad: arm, stop, drive, push-to-talk and bound tricks. |
 | `pi/dogproto.py` | Pi | The local bus: JSON-RPC 2.0, one object per line, two sockets for each daemon. |
@@ -23,6 +23,22 @@ The design documents in `docs/design/` own the mechanisms:
 - `safety.md`: arm rules, limits, stop semantics, watchdogs.
 - `registry.md`: the trick registry and the capture procedure.
 - `media.md`: the camera, the markers, the pose, audio, the LAN console and the gamepad.
+- `release.md`: the release file, the update, the health gate and the rollback.
+
+## Deploy
+
+`docs/runbook.md` gives the full procedures for the droplet and the Pi.
+
+| Command | Where | Job |
+| --- | --- | --- |
+| `scripts/package.sh` | Laptop | Makes `dist/dog-<version>.tar.gz` and its `.sha256` file. |
+| `scripts/install-pi.sh` | Pi, one time | Installs the apt packages and applies the first release. |
+| `scripts/deploy-pi.sh` | Laptop | Makes a release, copies it to `robot-pi` and applies it with the health gate. |
+| `robotctl update status`, `robotctl update rollback` | Pi | Shows the releases, or makes the previous release current again. |
+| `scripts/deploy-hub.sh <ssh-target> <domain>` | Laptop | Installs Caddy, ufw, the hub, rootless Docker and Hermes Agent on the droplet. |
+| `scripts/check-pi-install.sh <tarball>` | CI, Docker | Installs a real release in a Debian 13 container and measures a rollback. |
+
+The units and templates are in `deploy/pi/` and `deploy/hub/`. The release hooks are in `hooks/`.
 
 ## Run the tests
 

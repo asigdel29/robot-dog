@@ -1,0 +1,37 @@
+# mediad.service: runs mediad (camera, ArUco pose, microphone, speaker and the LAN console).
+# It needs the video and audio groups and the LAN for the console, so it keeps inet sockets.
+
+[Unit]
+Description=Robot dog camera, audio and LAN console (mediad)
+PartOf=dog.target
+After=robotd.service
+StartLimitIntervalSec=0
+
+[Service]
+User=dog
+Group=dog
+EnvironmentFile=/etc/dog/console.env
+ExecStart=/opt/dog/current/.venv/bin/python /opt/dog/current/pi/mediad.py --config /etc/dog/dog.toml
+Restart=always
+RestartSec=1
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run/dog
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# The camera (video4linux) and the microphone and speaker (alsa) only.
+DevicePolicy=closed
+DeviceAllow=char-video4linux rw
+DeviceAllow=char-alsa rw
+# The filter also blocks ptrace, so mediad cannot reach into robotd, which runs as the same user.
+SystemCallFilter=@system-service
