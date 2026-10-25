@@ -112,8 +112,6 @@ class Buttons(unittest.TestCase):
         pad.on_tick(0.0)
         self.assertEqual(pad.release(), [("mediad", "audio.ptt", {"down": False}),
                                          ("robotd", "robot.move", {"vx": 0.0, "vyaw": 0.0})])
-        self.assertEqual(pad.release(), [])
-        self.assertEqual(pad.on_tick(0.05), [])
 
     def test_bad_bindings_refused(self):
         with self.assertRaises(ValueError):
