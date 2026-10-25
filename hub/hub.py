@@ -1,7 +1,7 @@
 """hub: the server side of the dog, one process on 127.0.0.1:8000 behind Caddy.
 
 It holds the WebSocket link from linkd on the Pi (/device), serves the robot
-tools to Hermes Agent over the Model Context Protocol (/tools, bearer
+tools to Hermes Agent over the Model Context Protocol (/tools, loopback, bearer
 TOOLS_TOKEN) and runs the voice loop: utterance, speech to text, Hermes run,
 text to speech, audio.play. Every client is async: Hermes calls back into /tools
 while the voice loop waits on the same Hermes run, in this same process.

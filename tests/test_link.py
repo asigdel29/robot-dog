@@ -122,6 +122,7 @@ class StubMediad(threading.Thread):
     def notify(self, method, params):
         """Send one notification to each subscriber; callable from the test thread."""
         def send():
+            """Notify each subscriber; runs on the server loop."""
             for conn in self.subscribers:
                 conn.notify(method, params)
         self.loop.call_soon_threadsafe(send)
@@ -191,6 +192,7 @@ class LinkStack(Stack):
     def tools(self, work):
         """Run work(client) with a Model Context Protocol client on /tools, as Hermes does."""
         async def session():
+            """Open the client, run work and return its result."""
             headers = {"Authorization": f"Bearer {TOOLS_TOKEN}"}
             async with httpx2.AsyncClient(headers=headers, timeout=httpx2.Timeout(10, read=60)) as http:
                 async with Client(streamable_http_client(f"{self.hub_url}/tools/", http_client=http)) as client:
