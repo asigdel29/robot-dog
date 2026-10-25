@@ -179,7 +179,7 @@ class Conformance(unittest.TestCase):
         self.port.state()
         last_hb = time.monotonic()
         self.port.expect("fault", timeout=2.0)
-        self.assertLess(time.monotonic() - last_hb, 1.1)
+        self.assertLess(time.monotonic() - last_hb, 1.1 if _fake is None else 1.0 + SLACK_S)
 
     def test_capture_refused_when_ready(self):
         self.port.ready()
