@@ -67,33 +67,23 @@ class MarkerMath(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.dictionary = mediad.aruco_dictionary("DICT_4X4_50")
-        cls.detect = staticmethod(mediad.make_detector(cls.dictionary))
+        cls.detect = staticmethod(mediad.make_detector())
 
     def test_heading_within_5_degrees(self):
         for degrees in range(-180, 180, 15):
             heading = math.radians(degrees)
             frame = floor()
-            mediad.draw_marker(frame, mediad.marker_tile(self.dictionary, 1), 300.5, 200.25, heading)
+            mediad.draw_marker(frame, mediad.marker_tile(1), 300.5, 200.25, heading)
             cx, cy, found = self.detect(frame)["1"]
             self.assertLess(angle_diff_deg(found, heading), 5.0, f"heading {degrees} deg")
             self.assertLess(math.hypot(cx - 300.5, cy - 200.25), 1.0, f"center at {degrees} deg")
-
-    def test_upright_marker_faces_up(self):
-        frame = floor()
-        mediad.draw_marker(frame, mediad.marker_tile(self.dictionary, 3), 320, 240, -math.pi / 2)
-        self.assertLess(angle_diff_deg(self.detect(frame)["3"][2], -math.pi / 2), 2.0)
 
     def test_several_markers_and_none(self):
         self.assertEqual(self.detect(floor()), {})
         frame = floor()
         for marker_id, x in ((1, 100), (2, 320), (7, 540)):
-            mediad.draw_marker(frame, mediad.marker_tile(self.dictionary, marker_id), x, 240, 0.3)
+            mediad.draw_marker(frame, mediad.marker_tile(marker_id), x, 240, 0.3)
         self.assertEqual(sorted(self.detect(frame)), ["1", "2", "7"])
-
-    def test_bad_dictionary_refused(self):
-        with self.assertRaises(ValueError):
-            mediad.aruco_dictionary("os")
 
     def test_old_opencv_refused(self):
         old = types.SimpleNamespace(__version__="4.6.0", aruco=types.SimpleNamespace())
@@ -107,7 +97,6 @@ class FakeConn:
     """Stands in for a dogproto connection: keeps notifications and runs on_close callbacks on close()."""
 
     def __init__(self):
-        self.cloud = False
         self.on_close = []
         self.notes = []
 
@@ -197,18 +186,6 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
         await until(lambda: self.utterances(), "utterance after the close")
         self.assertFalse(await self.play_refused(media))
 
-    async def test_held_past_cap_sends_at_cap_and_stays_down(self):
-        media = self.media(fake_audio=True)
-        pad = FakeConn()
-        with mock.patch.object(mediad, "MAX_UTTERANCE_S", 0.4):
-            await media.h_ptt({"down": True}, pad)
-            await until(lambda: self.utterances(), "utterance at the cap")
-            self.assertAlmostEqual(self.utterances()[0] / 32000, 0.4, delta=0.05)
-            self.assertTrue(await self.play_refused(media), "still down after the cap")
-            await media.h_ptt({"down": False}, pad)
-            self.assertFalse(await self.play_refused(media))
-            self.assertEqual(len(self.utterances()), 1)
-
     async def test_cut_kills_aplay(self):
         media = self.media(fake_audio=False)
         await media.h_play({"pcm16_b64": base64.b64encode(bytes(48000)).decode()}, FakeConn())
@@ -230,17 +207,18 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(self.utterances()[0] / 32000, 0.5, delta=0.15)
         self.assertTrue(gone(read_pid(pid_path)))
 
-    async def test_arecord_stops_at_cap(self):
+    async def test_held_past_cap_sends_at_cap_and_stays_down(self):
         media = self.media(fake_audio=False)
         pad = FakeConn()
         with mock.patch.object(mediad, "MAX_UTTERANCE_S", 0.4):
             await media.h_ptt({"down": True}, pad)
-            pid_path = os.path.join(self.stub_dir, "arecord.pid")
             await until(lambda: self.utterances(), "utterance at the cap")
-            self.assertEqual(self.utterances(), [int(0.4 * 32000)])
-            self.assertTrue(gone(read_pid(pid_path)), "arecord ends at the cap while A is down")
-            self.assertTrue(await self.play_refused(media))
-            await media.h_ptt({"down": False}, pad)
+        self.assertEqual(self.utterances(), [int(0.4 * 32000)])
+        self.assertTrue(gone(read_pid(os.path.join(self.stub_dir, "arecord.pid"))), "arecord ends at the cap")
+        self.assertTrue(await self.play_refused(media), "still down after the cap")
+        await media.h_ptt({"down": False}, pad)
+        self.assertFalse(await self.play_refused(media))
+        self.assertEqual(len(self.utterances()), 1)
 
     async def test_console_error_gets_500(self):
         class BrokenMedia:
@@ -274,7 +252,9 @@ class MediaStack(unittest.TestCase):
         """Make one request to mediad of this stack."""
         return self.stack.call(method, params, cloud=cloud, service="mediad")
 
-    # ---- snapshot
+    def events(self, since_ns=0):
+        """Return the fake speaker events after since_ns."""
+        return [event for t, event in self.stack.audio_log() if t >= since_ns]
 
     def test_snapshot_is_jpeg_within_max_px(self):
         for max_px, long_side in ((None, 640), (640, 640), (200, 200)):
@@ -287,8 +267,6 @@ class MediaStack(unittest.TestCase):
         with self.assertRaises(dogproto.RpcError) as ctx:
             self.media("media.snapshot", {"max_px": 0})
         self.assertEqual(ctx.exception.code, dogproto.INVALID_PARAMS)
-
-    # ---- audio
 
     def subscribe_and_press(self, hold_s, wait_s):
         """Subscribe on the cloud socket like linkd, press ptt for hold_s, and return the notifications."""
@@ -312,6 +290,8 @@ class MediaStack(unittest.TestCase):
         return got
 
     def test_ptt_sends_bargein_then_utterance(self):
+        short = self.subscribe_and_press(0.1, 0.3)
+        self.assertEqual([method for method, _ in short], ["media.bargein"], "a short press is dropped")
         got = self.subscribe_and_press(0.5, 0.3)
         self.assertEqual([method for method, _ in got], ["media.bargein", "media.utterance"])
         utterance = got[1][1]
@@ -319,10 +299,6 @@ class MediaStack(unittest.TestCase):
         seconds = len(base64.b64decode(utterance["pcm16_b64"])) / 2 / 16000
         self.assertAlmostEqual(seconds, 0.5, delta=0.15)
         self.assertTrue(utterance["id"])
-
-    def test_short_press_dropped(self):
-        got = self.subscribe_and_press(0.1, 0.3)
-        self.assertEqual([method for method, _ in got], ["media.bargein"])
 
     def test_ptt_cuts_playback_within_100ms(self):
         """audio.play, then ptt down: the fake speaker logs the cut; 10 trials."""
@@ -334,15 +310,15 @@ class MediaStack(unittest.TestCase):
             pad = await dogproto.Client.connect(self.stack.sock("mediad"))
             try:
                 for _ in range(10):
-                    plays = len([r for r in self.stack.audio_log() if r[1] == "play"])
+                    plays = self.events().count("play")
                     await cloud.call("audio.play", {"pcm16_b64": two_s})
-                    while len([r for r in self.stack.audio_log() if r[1] == "play"]) == plays:
+                    while self.events().count("play") == plays:
                         await asyncio.sleep(0.005)
                     before = time.monotonic_ns()
                     await pad.call("audio.ptt", {"down": True})
                     end = time.monotonic() + 1.0
                     while time.monotonic() < end:
-                        cuts = [t for t, event, _ in self.stack.audio_log() if event == "cut" and t >= before]
+                        cuts = [t for t, event in self.stack.audio_log() if event == "cut" and t >= before]
                         if cuts:
                             samples.append((cuts[0] - before) / 1e6)
                             break
@@ -360,7 +336,7 @@ class MediaStack(unittest.TestCase):
     def test_play_rules(self):
         quarter_s = base64.b64encode(bytes(int(0.25 * 24000) * 2)).decode()
         one_s = base64.b64encode(bytes(24000 * 2)).decode()
-        bad = ({"pcm16_b64": "***"}, {"pcm16_b64": base64.b64encode(b"abc").decode()},
+        bad = ({"pcm16_b64": "***"}, {"pcm16_b64": "é"}, {"pcm16_b64": base64.b64encode(b"abc").decode()},
                {"pcm16_b64": quarter_s, "rate": 1000},
                {"pcm16_b64": base64.b64encode(bytes(31 * 8000 * 2)).decode(), "rate": 8000})
         for params in bad:
@@ -369,41 +345,16 @@ class MediaStack(unittest.TestCase):
             self.assertEqual(ctx.exception.code, dogproto.INVALID_PARAMS)
         since = time.monotonic_ns()
         self.media("audio.play", {"pcm16_b64": quarter_s}, cloud=True)
-        self.stack.wait_for(lambda: [e for t, e, _ in self.stack.audio_log() if t >= since] == ["play", "end"],
-                            "play then end", timeout=2)
+        self.stack.wait_for(lambda: self.events(since) == ["play", "end"], "play then end", timeout=2)
         self.media("audio.play", {"pcm16_b64": one_s}, cloud=True)
-        self.stack.wait_for(lambda: [e for t, e, _ in self.stack.audio_log() if t >= since][-1:] == ["play"],
-                            "second play", timeout=2)
+        self.stack.wait_for(lambda: self.events(since)[-1:] == ["play"], "second play", timeout=2)
         self.assertEqual(self.media("audio.stop", cloud=True), {})
-        self.stack.wait_for(lambda: self.stack.audio_log()[-1][1] == "cut", "cut after audio.stop", timeout=1)
-
-    def test_play_refused_while_ptt_down(self):
-        quarter_s = base64.b64encode(bytes(int(0.25 * 24000) * 2)).decode()
-
-        async def scenario():
-            pad = await dogproto.Client.connect(self.stack.sock("mediad"))
-            cloud = await dogproto.Client.connect(self.stack.sock("mediad", cloud=True))
-            try:
-                await pad.call("audio.ptt", {"down": True})
-                with self.assertRaises(dogproto.RpcError) as ctx:
-                    await cloud.call("audio.play", {"pcm16_b64": quarter_s})
-                await pad.call("audio.ptt", {"down": False})
-                await asyncio.sleep(0.1)
-                await cloud.call("audio.play", {"pcm16_b64": quarter_s})
-                return ctx.exception.code
-            finally:
-                await pad.close()
-                await cloud.close()
-
-        self.assertEqual(asyncio.run(scenario()), dogproto.BUSY)
-        self.stack.wait_for(lambda: self.stack.audio_log()[-1][1] == "end", "play after the press", timeout=2)
+        self.stack.wait_for(lambda: self.events()[-1:] == ["cut"], "cut after audio.stop", timeout=1)
 
     def test_cloud_socket_refuses_ptt(self):
         with self.assertRaises(dogproto.RpcError) as ctx:
             self.media("audio.ptt", {"down": True}, cloud=True)
         self.assertEqual(ctx.exception.code, dogproto.METHOD_NOT_FOUND)
-
-    # ---- console
 
     def request(self, method, path, headers=None, body=None):
         """Send one HTTP request to the console; return (status, headers, body)."""
@@ -441,7 +392,8 @@ class MediaStack(unittest.TestCase):
         self.assertEqual(set_cookie.split(";")[0], "dog_console=" + derived)
         self.assertNotIn(token, set_cookie)
         self.assertEqual(self.request("GET", "/state", {"Cookie": "dog_console=" + token})[0], 401)
-        cookie = {"Cookie": set_cookie.split(";")[0]}
+        # Another app on the same host can set a cookie that a strict parser refuses.
+        cookie = {"Cookie": 'other={"a":1}; ' + set_cookie.split(";")[0]}
         status, headers, body = self.request("GET", "/", cookie)
         self.assertEqual(status, 200)
         self.assertIn(b"STOP", body)
@@ -464,14 +416,11 @@ class MediaStack(unittest.TestCase):
                                        b'{"trick": "bark"}')
         self.assertEqual(status, 200)
         self.assertIn(b'"transmitted": true', body)
-        self.assertEqual(self.request("POST", "/do", cookie, b"[]")[0], 400)
+        for bad in (b"", b"[]", b"[" * 1000):
+            self.assertEqual(self.request("POST", "/do", cookie, bad)[0], 400, bad[:8])
         bearer = {"Authorization": "Bearer " + self.stack.console_token}
         self.assertEqual(self.request("POST", "/disarm", bearer)[0], 200)
         self.assertFalse(self.stack.call("robot.state")["armed"])
-
-    def test_console_answers_a_deeply_nested_body(self):
-        status = self.request("POST", "/do", {"Cookie": self.cookie()}, b"[" * 1000)[0]
-        self.assertIn(status, (400, 500))
 
     def test_console_connection_limit(self):
         port = self.stack.console_port

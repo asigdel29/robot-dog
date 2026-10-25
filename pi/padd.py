@@ -1,15 +1,8 @@
 """padd: the wired USB gamepad of the robot dog.
 
-It reads a Logitech F310 class pad (XInput mode) with python-evdev and turns
-its events into local bus calls: robot.move notifications to robotd at 20 Hz
-from the left stick, Start to arm, B to stop, Select held for 1 s to disarm, A
-held for push-to-talk on mediad, and X, Y, LB and RB for the tricks in
-[padd.bindings] of dog.toml. When the pad is lost or padd stops, padd
-releases push-to-talk and the stick; if padd dies, the robotd deadman
-(500 ms) stops the motion and mediad releases push-to-talk when the
-connection closes. A request is sent once and never sent again. evdev is
-imported only on the Pi, so the mapping tests run anywhere.
-docs/design/media.md owns the mapping.
+It maps a Logitech F310 class pad (XInput mode, read with python-evdev) to local
+bus calls on robotd and mediad. On a lost pad or a stop it releases push-to-talk
+and the stick. docs/design/media.md owns the mapping.
 """
 
 import argparse
@@ -44,11 +37,7 @@ TRICK_BUTTONS = {"X": BTN_X, "Y": BTN_Y, "LB": BTN_LB, "RB": BTN_RB}
 
 
 class PadMapper:
-    """Pure mapping from evdev-style events and 20 Hz ticks to bus actions.
-
-    An action is (service, method, params). It touches no device and no socket,
-    so tests drive it with plain numbers.
-    """
+    """Pure mapping from evdev events and 20 Hz ticks to bus actions (service, method, params); no I/O."""
 
     def __init__(self, absinfo, bindings):
         """absinfo maps ABS_X and ABS_Y to (min, max); bindings maps X, Y, LB or RB to a trick name."""
@@ -107,15 +96,12 @@ class PadMapper:
         return actions
 
     def release(self):
-        """Return the actions that end held controls, for a lost pad or a stop of padd."""
+        """Return the actions that end held controls, for a lost pad or a stop of padd; the mapper is then done."""
         actions = []
         if self._ptt_down:
             actions.append(("mediad", "audio.ptt", {"down": False}))
         if self._moving:
             actions.append(("robotd", "robot.move", {"vx": 0.0, "vyaw": 0.0}))
-        self._axes = {ABS_X: 0.0, ABS_Y: 0.0}
-        self._moving = self._ptt_down = False
-        self._select_since = None
         return actions
 
 
@@ -197,21 +183,16 @@ async def run(bindings):
             keeper.cancel()
 
 
-def load_bindings(path):
-    """Return the [padd.bindings] table of dog.toml, or {} when the file is absent."""
-    try:
-        with open(path, "rb") as handle:
-            return tomllib.load(handle).get("padd", {}).get("bindings", {})
-    except FileNotFoundError:
-        return {}
-
-
 def main(argv=None):
-    """Start padd; refuse a bad [padd.bindings] before the pad is open."""
+    """Start padd; refuse a bad [padd.bindings] of dog.toml before the pad is open."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", default=os.environ.get("DOG_CONFIG", "/etc/dog/dog.toml"))
     args = parser.parse_args(argv)
-    bindings = load_bindings(args.config)
+    try:
+        with open(args.config, "rb") as handle:
+            bindings = tomllib.load(handle).get("padd", {}).get("bindings", {})
+    except FileNotFoundError:
+        bindings = {}
     PadMapper({ABS_X: (-1, 1), ABS_Y: (-1, 1)}, bindings)
     with contextlib.suppress(asyncio.CancelledError, KeyboardInterrupt):
         asyncio.run(run(bindings))

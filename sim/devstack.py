@@ -146,22 +146,13 @@ class Stack:
             json.dump(markers, handle)
         os.replace(path + ".tmp", path)
 
-    def console_url(self, path="/"):
-        """Return the URL of a LAN console path of this stack."""
-        return f"http://127.0.0.1:{self.console_port}{path}"
-
     def audio_log(self):
-        """Return the fake speaker log as (t_mono_ns, "play"|"end"|"cut", fields) tuples."""
+        """Return the fake speaker log as (t_mono_ns, "play"|"end"|"cut") tuples."""
         try:
             with open(os.path.join(self.run_dir, "audio_out.log")) as handle:
-                lines = handle.read().splitlines()
+                return [(int(t_ns), event) for t_ns, event in (line.split() for line in handle)]
         except FileNotFoundError:
             return []
-        rows = []
-        for line in lines:
-            t_ns, event, fields = line.split(" ", 2)
-            rows.append((int(t_ns), event, json.loads(fields)))
-        return rows
 
     def log(self):
         """Return the fake bridge log as (t_mono_ns, "in"|"out", message) tuples.
@@ -215,7 +206,7 @@ def main():
     with Stack(media=True) as stack:
         print(f"run dir: {stack.run_dir}")
         print(f"robotctl: DOG_RUN_DIR={stack.run_dir} python pi/robotctl.py --config /dev/null state")
-        print(f"console: {stack.console_url('/?token=' + stack.console_token)}")
+        print(f"console: http://127.0.0.1:{stack.console_port}/?token={stack.console_token}")
         try:
             while all(p.poll() is None for p in stack.procs.values()):
                 time.sleep(0.5)
