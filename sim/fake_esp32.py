@@ -10,6 +10,7 @@ board reset.
 
 import argparse
 import asyncio
+import collections
 import json
 import math
 import os
@@ -20,11 +21,15 @@ import tty
 FW = "fake-1"
 LINE_LIMIT = 1024
 HB_TIMEOUT_S = 1.0
-FRAME_S = 0.07
+FRAME_S = 0.07  # one full NEC frame on the air; the board runs nothing else meanwhile
+REPEAT_FRAME_S = 0.012  # one NEC repeat frame
+MIN_GAP_S = 0.04  # quiet time before the first frame of a new command (firmware MIN_GAP_MS)
 MAX_LEASE_MS = 400
 MAX_ENTRIES = 24  # the firmware's RAM table
 MAX_RAW = 120
-NAME_LEN = 32  # firmware name buffer, with its terminating zero
+MAX_FRAME_US = 150_000
+NAME_LEN = 32  # firmware name buffer in bytes, with its terminating zero
+REPEATS = ("nec", "resend", "none")
 TICK_S = 0.01
 POSE_EVERY_S = 0.1
 FLOOR = (640.0, 480.0)
@@ -32,20 +37,35 @@ FLOOR = (640.0, 480.0)
 MOTION = {"forward": (120.0, 0.0), "back": (-80.0, 0.0),
           "left": (0.0, -math.radians(90)), "right": (0.0, math.radians(90))}
 NEC_FRAME_US = [9000, 4500] + [560, 560] * 16 + [560, 1690] * 16 + [560]
+NEC_DATA = 0xE718FF00  # address 0, command 0x18, LSB first as IRremote decodes it
+
+
+def _uint(value, high):
+    """Return True for an int (not a bool) in 0..high, as ArduinoJson's is<uintN_t>() decides."""
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= high
 
 
 def entry_ok(msg):
     """Return True when the firmware can store and send this load entry; it refuses the rest as "bad entry"."""
-    name, raw = msg.get("name"), msg.get("raw", [])
-    if not (isinstance(name, str) and 0 < len(name) < NAME_LEN and isinstance(raw, list) and len(raw) <= MAX_RAW):
+    name, raw, data = msg.get("name"), msg.get("raw"), msg.get("data")
+    nec = msg.get("proto") == "NEC"
+    if not (isinstance(name, str) and 0 < len(name.encode()) < NAME_LEN and msg.get("repeat") in REPEATS):
         return False
-    if not (20 <= msg.get("khz", 38) <= 60 and 10 <= msg.get("period_ms", 108) <= 1000):
+    if not (_uint(msg.get("addr"), 0xFFFF if nec else 0xFFFFFFFF) and _uint(msg.get("cmd"), 0xFF if nec else 0xFFFFFFFF)):
         return False
-    if msg.get("repeat") not in ("nec", "resend", "none") or not all(isinstance(v, int) and 0 < v <= 0xFFFF for v in raw):
+    if not (_uint(msg.get("khz"), 60) and msg["khz"] >= 20 and _uint(msg.get("period_ms"), 1000)
+            and msg["period_ms"] >= 20 and (data is None or _uint(data, 0xFFFFFFFF))):
         return False
-    if msg.get("proto") == "NEC":
-        return 0 <= msg.get("addr", 0) <= 0xFFFF and 0 <= msg.get("cmd", 0) <= 0xFF
-    return msg.get("proto") == "raw" and len(raw) > 0
+    if not (isinstance(raw, list) and len(raw) <= MAX_RAW and all(_uint(v, 0xFFFF) and v > 0 for v in raw)):
+        return False
+    return sum(raw) <= MAX_FRAME_US and (nec or (msg.get("proto") == "raw" and len(raw) > 0))
+
+
+def frame_s(entry, full):
+    """Return how long one frame of an entry keeps the board busy."""
+    if not full and entry["repeat"] == "nec":
+        return REPEAT_FRAME_S
+    return FRAME_S if entry["proto"] == "NEC" else sum(entry["raw"]) / 1e6
 
 
 class FakeBridge:
@@ -70,7 +90,11 @@ class FakeBridge:
         self.sid = None
         self.last_id = 0
         self.entries = {}
-        self.hold = None  # dict(name, id, lease_end, next_frame)
+        self.hold = None  # dict(name, id, lease_end, next_frame, first)
+        self.send = None  # (name, id) of a send that waits for the gap; later ops wait behind it
+        self.air = None  # (end, events) of the frame on the air; the board does nothing else until end
+        self.frame_end = -math.inf  # end of the last frame, for the gap
+        self.queue = collections.deque()  # ops received and not yet applied
         self.timed = None  # (name, until) for a send that moves the toy
         self.last_hb = time.monotonic()
         self.max_loop_us = 0
@@ -103,14 +127,14 @@ class FakeBridge:
                 msg = json.loads(raw)
             except ValueError:
                 continue
-            self.log.write(f"{time.monotonic_ns()} in {raw.decode(errors='replace')}\n")
+            self.log.write(f"{time.monotonic_ns()} in {raw.decode(errors='replace')}\n")  # arrival time
             if isinstance(msg, dict):
-                self.on_op(msg)
+                self.queue.append(msg)
+        self.step(time.monotonic())
 
-    def on_op(self, msg):
+    def on_op(self, msg, now):
         """Apply one op with the same rules as the firmware."""
         op = msg.get("op")
-        now = time.monotonic()
         if op == "hello":
             self.state = "DISARMED"
             self.sid = msg.get("sid")
@@ -127,7 +151,7 @@ class FakeBridge:
         op_id = msg.get("id")
         if self.sid is None:
             return self.emit(ev="nack", id=op_id, why="no hello")
-        if not isinstance(op_id, int) or op_id <= self.last_id:
+        if not isinstance(op_id, int) or isinstance(op_id, bool) or op_id <= self.last_id:
             return self.emit(ev="nack", id=op_id, why="old id")
         self.last_id = op_id
         handler = getattr(self, f"op_{op}", None)
@@ -136,6 +160,11 @@ class FakeBridge:
         why = handler(msg, now)
         if why:
             self.emit(ev="nack", id=op_id, why=why)
+
+    def _entry_name(self, msg):
+        """Return the op's name when it names a loaded entry, else None."""
+        name = msg.get("name")
+        return name if isinstance(name, str) and name in self.entries else None
 
     def op_load(self, msg, now):
         if self.state != "DISARMED":
@@ -148,7 +177,8 @@ class FakeBridge:
         self.emit(ev="ack", id=msg["id"])
 
     def op_arm(self, msg, now):
-        if msg.get("n") != len(self.entries):
+        n = msg.get("n")
+        if not isinstance(n, int) or isinstance(n, bool) or n != len(self.entries):
             return "entry count"
         if self.capture:
             return "capturing"
@@ -158,31 +188,28 @@ class FakeBridge:
         self.emit(ev="ack", id=msg["id"])
 
     def op_send(self, msg, now):
-        if self.state not in ("READY", "EXECUTING") or self.hold is not None:
+        if self.state != "READY":
             return "not ready"
-        if msg.get("name") not in self.entries:
+        name = self._entry_name(msg)
+        if name is None:
             return "unknown name"
         self.emit(ev="ack", id=msg["id"])
-        name = msg["name"]
-        self.timed = (name, now + 0.3) if name in MOTION else None
-        asyncio.get_running_loop().call_later(FRAME_S, self._sent, msg["id"])
-
-    def _sent(self, op_id):
-        self.emit(ev="tx", id=op_id, frames=1)
-        self.emit(ev="done", id=op_id)
+        self.send = (name, msg["id"])
 
     def op_hold(self, msg, now):
         if self.state not in ("READY", "EXECUTING"):
             return "not ready"
-        if msg.get("name") not in self.entries:
+        name = self._entry_name(msg)
+        if name is None:
             return "unknown name"
         lease = msg.get("lease_ms")
-        if not isinstance(lease, int) or not 0 < lease <= MAX_LEASE_MS:
+        if not isinstance(lease, int) or isinstance(lease, bool) or not 0 < lease <= MAX_LEASE_MS:
             return "lease"
-        if self.hold is not None and self.hold["name"] == msg["name"]:
-            self.hold.update(id=msg["id"], lease_end=now + lease / 1000)
-        else:
-            self.hold = {"name": msg["name"], "id": msg["id"], "lease_end": now + lease / 1000, "next_frame": now}
+        hold = self.hold or {"next_frame": now}  # another name keeps the cadence of the hold it replaces
+        if hold.get("name") != name:
+            hold.update(name=name, first=True)
+        hold.update(id=msg["id"], lease_end=now + lease / 1000)
+        self.hold = hold
         self.state = "EXECUTING"
         self.emit(ev="ack", id=msg["id"])
 
@@ -202,15 +229,18 @@ class FakeBridge:
             return "capture needs DISARMED"
         if self.capture:
             return "capturing"
-        ms = msg.get("ms", 0)
+        ms = msg.get("ms")
+        if not _uint(ms, 0xFFFFFFFF):
+            return "bad ms"
         self.emit(ev="ack", id=msg["id"])
         loop = asyncio.get_running_loop()
         first = min(0.2, ms / 2000)
-        frames = [(first, {"proto": "NEC", "addr": 0, "cmd": 0x18, "bits": 32, "raw": NEC_FRAME_US, "gap_us": 0,
-                           "repeat": False})]
+        frames = [(first, {"proto": "NEC", "addr": 0, "cmd": 0x18, "bits": 32, "data": NEC_DATA, "raw": NEC_FRAME_US,
+                           "gap_us": 0, "repeat": False})]
         if ms >= 4000:  # a long capture window stands for a held button: NEC repeat frames
-            frames += [(first + i * 0.108, {"proto": "NEC", "addr": 0, "cmd": 0x18, "bits": 0, "raw": [9000, 2250, 560],
-                                            "gap_us": 108000, "repeat": True}) for i in range(1, 6)]
+            frames += [(first + i * 0.108, {"proto": "NEC", "addr": 0, "cmd": 0x18, "bits": 0, "data": 0,
+                                            "raw": [9000, 2250, 560], "gap_us": 108000, "repeat": True})
+                       for i in range(1, 6)]
         self.capture = [loop.call_later(t, lambda f=f: self.emit(ev="cap", **f)) for t, f in frames]
         self.capture.append(loop.call_later(ms / 1000, self._capture_done, msg["id"]))
 
@@ -233,25 +263,63 @@ class FakeBridge:
 
     # ---- time
 
+    def step(self, now):
+        """One pass of the board loop: end the frame on the air, watchdog, ops, the send, hold frames."""
+        if self.air is not None:
+            if now < self.air[0]:
+                return
+            end, events = self.air
+            self.air = None
+            self.frame_end = end
+            for event in events:
+                self.emit(**event)
+        self._watchdog(now)
+        while self.queue and self.send is None and self.air is None:
+            self.on_op(self.queue.popleft(), now)
+        if self.send is not None and self.air is None and now >= self.frame_end + MIN_GAP_S:
+            name, op_id = self.send
+            self.send = None
+            self.timed = (name, now + 0.3) if name in MOTION else None
+            self.air = (now + frame_s(self.entries[name], True),
+                        [{"ev": "tx", "id": op_id, "frames": 1}, {"ev": "done", "id": op_id}])
+        if self.air is None:
+            self._service_hold(now)
+
+    def _watchdog(self, now):
+        """robotd silent while armed: stop output, send the stop entry once after the gap, then FAULT."""
+        if self.state not in ("READY", "EXECUTING") or now - self.last_hb <= HB_TIMEOUT_S:
+            return
+        self.hold = None  # no done: robotd is gone
+        self.send = None
+        self.timed = None
+        self.state = "FAULT"
+        fault = {"ev": "fault", "why": "heartbeat"}
+        if "stop" in self.entries:
+            start = max(now, self.frame_end + MIN_GAP_S)
+            self.air = (start + frame_s(self.entries["stop"], True), [{"ev": "tx", "id": 0, "frames": 1}, fault])
+        else:
+            self.emit(**fault)
+
+    def _service_hold(self, now):
+        """Lease expiry and hold frames; the first frame of a command waits for the gap and always goes out."""
+        hold = self.hold
+        if hold is None:
+            return
+        if not hold["first"] and now > hold["lease_end"]:
+            return self._end_hold()
+        entry = self.entries[hold["name"]]
+        if now < hold["next_frame"] or (not hold["first"] and entry["repeat"] == "none"):
+            return
+        if hold["first"] and now < self.frame_end + MIN_GAP_S:
+            return
+        self.air = (now + frame_s(entry, hold["first"]), [{"ev": "tx", "id": hold["id"], "frames": 1}])
+        hold["first"] = False
+        hold["next_frame"] = now + entry["period_ms"] / 1000
+
     def tick(self, now, dt):
-        """Lease expiry, repeat frames, heartbeat watchdog and toy motion."""
+        """The board loop, then toy motion."""
         start = time.perf_counter()
-        if self.state in ("READY", "EXECUTING") and now - self.last_hb > HB_TIMEOUT_S:
-            self.hold = None
-            self.timed = None
-            if "stop" in self.entries:
-                self.emit(ev="tx", id=0, frames=1)
-            self.state = "FAULT"
-            self.emit(ev="fault", why="heartbeat")
-        if self.hold is not None:
-            if now > self.hold["lease_end"]:
-                self._end_hold()
-            elif now >= self.hold["next_frame"]:
-                self.emit(ev="tx", id=self.hold["id"], frames=1)
-                entry = self.entries[self.hold["name"]]
-                # A remote that repeats nothing for a held button gets one frame only.
-                period = math.inf if entry["repeat"] == "none" else entry.get("period_ms", 108) / 1000
-                self.hold["next_frame"] = now + period
+        self.step(now)
         moving = self.hold["name"] if self.hold else (self.timed[0] if self.timed and now < self.timed[1] else None)
         speed, turn = MOTION.get(moving, (0.0, 0.0))
         x, y, heading = self.pose

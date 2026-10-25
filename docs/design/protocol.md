@@ -87,14 +87,14 @@ The firmware is `firmware/ir_bridge/ir_bridge.ino`. The fake is `sim/fake_esp32.
 | Op | Fields | Rule |
 | --- | --- | --- |
 | `hello` | `sid` | Starts a new link. The bridge goes to DISARMED. It forgets its entries, its hold and its capture, and sends no `done` for them. |
-| `load` | `id, name, proto, addr, cmd, bits, raw, khz, repeat, period_ms` | DISARMED only. Adds one entry to bridge RAM, or replaces the entry with the same name. See 2.4 for the limits. |
+| `load` | `id, name, proto, addr, cmd, bits, raw, khz, repeat, period_ms`, optional `data` | DISARMED only. Adds one entry to bridge RAM, or replaces the entry with the same name. See 2.4 for the limits. |
 | `arm` | `id, n` | `n` must equal the number of loaded entries. From DISARMED or FAULT, the bridge goes to READY. An armed bridge keeps its state. Refused while a capture runs. |
-| `send` | `id, name` | READY only. Sends one frame. |
-| `hold` | `id, name, lease_ms` | READY or EXECUTING. `lease_ms` is 1 to 400. A hold of the same name extends the lease. With `repeat` `none`, the hold sends one frame only. |
+| `send` | `id, name` | READY only. Sends one full frame after the gap (2.3 rule 7). The bridge applies the next op after the `done` of the send. |
+| `hold` | `id, name, lease_ms` | READY or EXECUTING. `lease_ms` is an integer from 1 to 400. A hold of the same name extends the lease. A hold of another name replaces the hold. See 2.3 rule 8. |
 | `stop` | `id` | Stops repeat frames. |
 | `disarm` | `id` | Stops repeat frames. The bridge goes to DISARMED. |
 | `hb` | `seq` | Heartbeat. robotd sends it each 200 ms. |
-| `capture` | `id, ms` | DISARMED only. Records frames for `ms`. One capture at a time. |
+| `capture` | `id, ms` | DISARMED only. Records frames for `ms`, an integer (`why` `bad ms` when not). One capture at a time. |
 
 ### 2.2 Events (bridge to robotd)
 
@@ -103,38 +103,50 @@ The firmware is `firmware/ir_bridge/ir_bridge.ino`. The fake is `sim/fake_esp32.
 | `hello` | `sid, boot, fw, state` | Reply to `hello`. After a reset, the bridge sends one `hello` with `sid` 0. `boot` changes at each reset. |
 | `ack` / `nack` | `id` (and `why`) | The op was accepted or refused. |
 | `tx` | `id, frames` | Frames sent for that op. |
-| `done` | `id` | A `send` frame, a hold or a capture ended. |
-| `state` | `s, max_loop_us, seq` | Reply to `hb`. `s` is DISARMED, READY, EXECUTING, STOPPING or FAULT. |
+| `done` | `id` | A `send` frame, a hold or a capture ended. Rule 9 gives the cases with no `done`. |
+| `state` | `s, max_loop_us, seq` | Reply to `hb`. `s` is DISARMED, READY, EXECUTING or FAULT. |
 | `fault` | `why` | The bridge went to FAULT. |
-| `cap` | `proto, addr, cmd, bits, raw, gap_us, repeat` | One captured frame. See 2.5. |
+| `cap` | `proto, addr, cmd, bits, data, raw, gap_us, repeat` | One captured frame. See 2.5. |
 
 ### 2.3 Bridge rules
 
 1. When a lease expires, the bridge stops the repeat frames. This is the firmware deadman.
-2. When no `hb` arrives for 1000 ms while armed, the bridge stops output. It sends the entry with the name `stop` if one is loaded, in the state STOPPING. Then it goes to FAULT.
+2. When no `hb` arrives for 1000 ms while armed, the bridge stops output. It sends the entry with the name `stop` once if one is loaded (`tx` with `id` 0). Then it goes to FAULT and sends `fault`.
 3. Only `arm` moves the bridge from FAULT to READY. `hello` and `disarm` move it to DISARMED.
 4. A port open toggles DTR and resets the Feather. This is acceptable, because a new link always starts DISARMED.
 5. robotd sends the registry to the bridge at each handshake. A new capture never needs a new firmware.
 6. The receiver runs only during a capture. A capture needs DISARMED, and `arm` is refused while a capture runs. Thus the bridge never decodes its own frames.
+7. Before the first frame of a new command, the emitter is quiet for 40 ms or more. Thus the toy sees a new press. A new command is a `send`, the first frame of a hold, or the watchdog `stop`.
+8. The first frame of a hold always goes out, also when the lease is shorter than the frame. A hold of another name keeps the frame times of the hold that it replaces.
+9. The bridge sends no `done` in these cases:
+   - A `hello` ends a hold or a capture.
+   - The watchdog ends a hold or a `send` that waits for the gap.
+   - A hold of another name replaces a hold.
+10. One frame blocks the bridge for its full time, 150 ms or less. Ops that arrive meanwhile wait in the serial buffer. Their order does not change.
 
 ### 2.4 Entry limits
 
-The bridge refuses a `load` that it cannot store or send. The `why` is `table full` or `bad entry`.
+The bridge refuses a `load` that it cannot store or send. The `why` is `table full` or `bad entry`. Each field except `data` must be present with the correct JSON type. A number with a fraction, a negative number, a string or `null` gives `bad entry`. The bridge does not read `bits`.
 
 | Field | Limit |
 | --- | --- |
 | Entries | 24 (`table full`) |
-| `name` | 1 to 31 characters |
+| `name` | String of 1 to 31 bytes in UTF-8 |
 | `proto` | `NEC` or `raw` |
-| `addr`, `cmd` | For `NEC`: `addr` 0 to 0xFFFF, `cmd` 0 to 0xFF |
-| `raw` | 120 durations or fewer, each 1 to 65535 µs. A `raw` entry needs one or more. |
-| `khz` | 20 to 60 |
+| `addr`, `cmd` | Unsigned integers. For `NEC`: `addr` 0 to 0xFFFF, `cmd` 0 to 0xFF |
+| `data` | Optional. Unsigned 32-bit integer. For `NEC`, the bridge sends these 32 bits as captured, not `addr` and `cmd`. |
+| `raw` | Array of 120 durations or fewer, each an integer from 1 to 65535 µs. The total is 150 ms or less. A `raw` entry needs one or more. |
+| `khz` | Integer from 20 to 60 |
 | `repeat` | `nec`, `resend` or `none` |
-| `period_ms` | 10 to 1000 |
+| `period_ms` | Integer from 20 to 1000 |
+
+robotd checks the same limits when it reads the registry (`check_registry`). Thus the bridge never refuses a `load` from robotd.
 
 ### 2.5 Captured frames
 
 - `proto` is `NEC`, another protocol name from the IRremote decoder, or `raw` when the decoder does not know the protocol.
+- `data` is the decoded data. For `NEC`, it is the 32 bits on the air, least significant bit first. robotctl keeps it, so the replay is exact also for an extended address.
 - `raw` gives the mark and space durations in microseconds. The first value is a mark. `raw` is empty when the frame has more than 120 durations.
+- The receiver clips each mark and space at 12750 µs. A space longer than 8 ms ends a frame.
 - `gap_us` is the time from the start of the frame before to the start of this frame. It is 0 for the first frame of a capture. robotctl uses it as `period_ms`.
 - `repeat` is true for a short repeat frame with no data bits, for example the NEC repeat frame. A full frame that the remote sends again has `repeat` false.
