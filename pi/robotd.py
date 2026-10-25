@@ -140,8 +140,6 @@ def check_registry(doc):
             errors.append(f"{name}: repeat must be one of {REPEATS}")
         if not all(isinstance(cmd[flag], bool) for flag in ("verified", "cloud")):
             errors.append(f"{name}: verified and cloud must be true or false")
-        if not isinstance(cmd["stop_via"], str):
-            errors.append(f"{name}: stop_via must be a string")
         if not _int_in(cmd["period_ms"], 20, 1000):
             errors.append(f"{name}: period_ms must be an int in 20..1000")
         if not _int_in(cmd["max_run_ms"], 1, 10000):
@@ -152,8 +150,9 @@ def check_registry(doc):
             errors.append(f"{name}: verified without an IR payload")
         if cmd["kind"] == "hold" and not _int_in(cmd["max_run_ms"], 1, 1000):
             errors.append(f"{name}: hold needs max_run_ms in 1..1000")
-        via = cmds.get(cmd["stop_via"]) if isinstance(cmd["stop_via"], str) else None
-        if cmd["kind"] == "perpetual" and cmd["verified"] and not (via and via["verified"]):
+        if not isinstance(cmd["stop_via"], str):
+            errors.append(f"{name}: stop_via must be a string")
+        elif cmd["kind"] == "perpetual" and cmd["verified"] and not cmds.get(cmd["stop_via"], {}).get("verified"):
             errors.append(f"{name}: perpetual needs stop_via naming a verified command")
         if cmd["cloud"]:
             if not cmd["verified"]:
@@ -292,11 +291,9 @@ class EspLink:
             raise OSError("short serial write")
 
     def close(self):
-        """Stop to read and close the tty."""
-        if self._fd is not None:
-            asyncio.get_running_loop().remove_reader(self._fd)
-            os.close(self._fd)
-            self._fd = None
+        """Stop to read and close the tty; robotd drops the link object after this."""
+        asyncio.get_running_loop().remove_reader(self._fd)
+        os.close(self._fd)
 
     def _readable(self):
         """Read the tty and pass each JSON object line on; boot text and too long lines are dropped."""
@@ -397,17 +394,13 @@ class Robotd:
             elif self._hello is not None and not self._hello.done():
                 # The handshake repeats hello, so a slow bridge can answer twice; our own sid is never a reset.
                 self._hello.set_result(msg)
-        elif ev in ("ack", "nack"):
-            future = self._acks.get(msg.get("id"))
+        elif ev in ("ack", "nack", "done"):
+            future = (self._dones if ev == "done" else self._acks).get(msg.get("id"))
             if future is not None and not future.done():
                 future.set_result(msg)
         elif ev == "tx":
             if self.action is not None and msg.get("id") in self.action.esp_ids:
                 self.action.frames += msg.get("frames", 1)
-        elif ev == "done":
-            future = self._dones.get(msg.get("id"))
-            if future is not None and not future.done():
-                future.set_result(msg)
         elif ev == "state":
             self.esp_state = msg.get("s", "?")
             self.esp_max_loop_us = msg.get("max_loop_us")
@@ -538,11 +531,11 @@ class Robotd:
     def _cancel_action(self, reason):
         """Cancel the running action; return True when one was running."""
         action = self.action
-        if action is not None and action.task is not None and not action.task.done():
-            action.reason = reason
-            action.task.cancel()
-            return True
-        return False
+        if action is None or action.task.done():
+            return False
+        action.reason = reason
+        action.task.cancel()
+        return True
 
     def _disarm(self, reason):
         """Disarm now; a running action first sends its stop_via, and _run_action then sends the bridge disarm."""
@@ -682,8 +675,7 @@ class Robotd:
             self._remember(aid, False, (dogproto.INTERNAL_ERROR, str(exc)))
             raise RpcError(dogproto.INTERNAL_ERROR, str(exc)) from exc
         finally:
-            if self.action is action:
-                self.action = None
+            self.action = None  # the only action: BUSY refuses a second one
             self._touch()
             if not self.armed:
                 self._esp_quiet("disarm")  # after the body cleanup, which needs READY for stop_via

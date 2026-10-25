@@ -227,11 +227,9 @@ class FakeBridge:
         self.emit(ev="ack", id=msg["id"])
 
     def op_disarm(self, msg, now):
-        """disarm: end the hold and go to DISARMED."""
-        self._end_hold()
-        self.timed = None
+        """disarm: stop, then go to DISARMED."""
+        self.op_stop(msg, now)
         self.state = "DISARMED"
-        self.emit(ev="ack", id=msg["id"])
 
     def op_capture(self, msg, now):
         """capture: report one NEC tap, and repeat frames for a long window; DISARMED only."""
