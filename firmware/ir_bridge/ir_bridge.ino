@@ -9,10 +9,15 @@
 // dog moving. robotd sends the IR registry to RAM at each handshake, so a new
 // capture never needs a new flash. The firmware never starts WiFi or Bluetooth.
 
+// IRremote reads this before its include. The spare room past MAX_RAW lets a longer frame
+// show as too long. The receiver calibration knobs also go here (firmware/README.md).
+#define RAW_BUFFER_LENGTH 124
+
 #include <IRremote.hpp>
 #include <ArduinoJson.h>
 
 static const char FW_VERSION[] = "ir_bridge-1";  ///< reported in hello, so robotd logs which build runs
+static const uint8_t IR_IN_PIN = 33;   ///< IRin pad: receiver output into the ESP32
 static const uint8_t IR_OUT_PIN = 27;  ///< IRout pad: ESP32 output into the emitter driver
 static const size_t LINE_LIMIT = 1024;  ///< longest line in either direction; longer input lines are discarded
 static const uint32_t HB_TIMEOUT_MS = 1000;  ///< robotd silence that trips the watchdog while armed
@@ -64,6 +69,15 @@ struct PendingSend {
   int64_t id;     ///< the send op, which tx and done report
 };
 
+/** The one capture window; the receiver runs only inside it, so it never decodes our own frames. */
+struct Capture {
+  bool active;              ///< the receiver runs
+  int64_t id;               ///< the capture op, which done reports
+  uint32_t end;             ///< millis() at which the window closes
+  bool first;               ///< no frame yet, so gap_us is 0
+  uint32_t prevFrameTicks;  ///< length of the last frame, for the start-to-start gap
+};
+
 static State state = DISARMED;     ///< start-up never moves the dog
 static bool haveSession = false;   ///< false until the first hello; ops before it are refused
 static int64_t lastId = 0;         ///< ids must grow within a session, so a replayed op is refused
@@ -72,6 +86,7 @@ static Entry entries[MAX_ENTRIES]; ///< the registry, loaded by robotd at each h
 static uint8_t entryCount = 0;     ///< loaded part of entries; arm checks it
 static Hold hold = {};             ///< the one held command
 static PendingSend pendingSend = {};  ///< the send that waits for the gap
+static Capture capture = {};       ///< the one capture window
 static uint32_t frameEndMs = 0;    ///< millis() at the end of the last frame, for the gap
 static uint32_t lastHbMs = 0;      ///< millis() of the last hb or arm, for the watchdog
 static uint32_t maxLoopUs = 0;     ///< worst loop pass since boot, reported in state
@@ -169,9 +184,20 @@ static void endHold() {
   }
 }
 
+/** Stop the receiver and clear its frame state, so the next capture does not start inside an old frame. */
+static void stopCapture() {
+  if (capture.active) {
+    IrReceiver.stop();
+    IrReceiver.irparams.StateForISR = IR_REC_STATE_IDLE;  // the timer is off, so the ISR cannot race this
+    IrReceiver.irparams.TickCounterForISR = 0;
+    capture.active = false;
+  }
+}
+
 /** hello: start a new session. The bridge forgets entries, ids, the hold and the capture, without done. */
 static void opHello(JsonObjectConst in) {
   hold.active = false;
+  stopCapture();
   entryCount = 0;
   lastId = 0;
   state = DISARMED;
@@ -281,6 +307,9 @@ static const char *opArm(JsonObjectConst in, int64_t id) {
   if (!n.is<int>() || n.as<int>() != entryCount) {
     return "entry count";
   }
+  if (capture.active) {
+    return "capturing";
+  }
   if (state == DISARMED || state == FAULT) {
     state = READY;
   }
@@ -350,6 +379,27 @@ static const char *opDisarm(int64_t id) {
   return nullptr;
 }
 
+/** capture: run the receiver for ms and report each frame. DISARMED only, so nothing transmits meanwhile. */
+static const char *opCapture(JsonObjectConst in, int64_t id) {
+  if (state != DISARMED) {
+    return "capture needs DISARMED";
+  }
+  if (capture.active) {
+    return "capturing";
+  }
+  JsonVariantConst ms = in["ms"];
+  if (!ms.is<uint32_t>()) {
+    return "bad ms";
+  }
+  emitId("ack", id);
+  capture.active = true;
+  capture.id = id;
+  capture.end = millis() + ms.as<uint32_t>();
+  capture.first = true;
+  IrReceiver.begin(IR_IN_PIN, ENABLE_LED_FEEDBACK);
+  return nullptr;
+}
+
 /** Apply one line with the rules of the fake: session check, then id check, then the op. */
 static void handleLine(const char *line, size_t len) {
   JsonDocument doc;
@@ -390,6 +440,8 @@ static void handleLine(const char *line, size_t len) {
     why = opStop(id);
   } else if (strcmp(op, "disarm") == 0) {
     why = opDisarm(id);
+  } else if (strcmp(op, "capture") == 0) {
+    why = opCapture(in, id);
   } else {
     why = "unknown op";
   }
@@ -484,12 +536,58 @@ static void serviceHold() {
   emitTx(hold.id);
 }
 
+/** Report one received frame as a cap event; raw is in microseconds with the receiver's mark stretch removed. */
+static void emitCap() {
+  const IRData &d = IrReceiver.decodedIRData;
+  JsonDocument event;
+  event["ev"] = "cap";
+  event["proto"] = d.protocol == UNKNOWN ? "raw" : getProtocolString(d.protocol);
+  event["addr"] = d.address;
+  event["cmd"] = d.command;
+  event["bits"] = d.numberOfBits;
+  event["data"] = d.decodedRawData;  // for NEC, the 32 bits on the air, for a byte-exact replay
+  JsonArray raw = event["raw"].to<JsonArray>();
+  bool fits = d.rawlen <= MAX_RAW + 1;  // rawbuf[0] is unused; a longer frame was cut by the buffer
+  uint32_t frameTicks = 0;
+  for (IRRawlenType i = 1; i < d.rawlen; i++) {
+    int32_t ticks = IrReceiver.irparams.rawbuf[i];
+    frameTicks += ticks;
+    if (fits) {
+      int32_t us = ticks * MICROS_PER_TICK;
+      raw.add(i & 1 ? us - MARK_EXCESS_MICROS : us + MARK_EXCESS_MICROS);  // odd index: mark
+    }
+  }
+  // Start-to-start time, the value robotctl uses as period_ms; ISR ticks, so loop jitter does not count.
+  event["gap_us"] = capture.first ? 0 : (capture.prevFrameTicks + d.initialGapTicks) * MICROS_PER_TICK;
+  // A repeat is a short frame without data bits (the NEC repeat frame); a full frame sent again is not.
+  event["repeat"] = (d.flags & IRDATA_FLAGS_IS_REPEAT) != 0 && d.numberOfBits == 0;
+  capture.first = false;
+  capture.prevFrameTicks = frameTicks;
+  emit(event);
+}
+
+/** Report frames while the capture window is open, then stop the receiver and send done. */
+static void serviceCapture() {
+  if (!capture.active) {
+    return;
+  }
+  if (IrReceiver.decode()) {
+    emitCap();
+    IrReceiver.resume();
+  }
+  if (reached(millis(), capture.end)) {
+    stopCapture();
+    emitId("done", capture.id);
+  }
+}
+
 /** Boot: emitter off, serial up, then one hello with sid 0. Start-up never transmits. */
 void setup() {
   pinMode(IR_OUT_PIN, OUTPUT);
   digitalWrite(IR_OUT_PIN, LOW);
   IrSender.begin(IR_OUT_PIN);
   Serial.setRxBufferSize(1024);  // ops wait here while a frame of up to 150 ms is on the air
+  Serial.setTxBufferSize(2048);  // a cap line must not block the loop
   Serial.begin(115200);
   bootId = esp_random() >> 1;  // differs at each reset, so robotd can see one
   emitHello(0);
@@ -502,6 +600,7 @@ void loop() {
   readSerial();
   serviceSend();
   serviceHold();
+  serviceCapture();
   uint32_t took = micros() - start;
   if (took > maxLoopUs) {
     maxLoopUs = took;
