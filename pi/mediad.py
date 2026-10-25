@@ -49,6 +49,7 @@ def make_detector():
     The heading is the angle from the marker center to the midpoint of its top
     edge (corners 0 and 1), with image y down.
     """
+    cv2.setNumThreads(1)  # detection on all cores would starve robotd and the bridge link
     params = cv2.aruco.DetectorParameters()
     params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
     detector = cv2.aruco.ArucoDetector(aruco_dict(), params)
