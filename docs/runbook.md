@@ -6,9 +6,9 @@ This runbook gives the procedures for phase 4 (the droplet) and phase 6 (the Pi)
 - All other steps are for the implementer.
 - Each secret goes from the owner to the implementer through the password manager. Never send a secret by email or chat.
 
-`docs/design/release.md` owns the release mechanism. This runbook only tells you how to use it.
+`docs/design/release.md` owns the release mechanism. This runbook tells you only how to use it.
 
-Merge order: merge the phase 4 branch after the phase 3 branches. The mediad, padd and linkd units start daemons that only the phase 3 branches contain. Before that merge, those three units restart in a loop on the Pi.
+Merge the phase 4 branch after the phase 3 branches. The mediad, padd and linkd units start daemons that only the phase 3 branches contain. Before that merge, those three units restart in a loop on the Pi.
 
 ## 1. Phase 4: install the droplet
 
@@ -27,41 +27,46 @@ Merge order: merge the phase 4 branch after the phase 3 branches. The mediad, pa
 
 The OpenRouter credit limit is the only hard cost limit. The OpenAI budget and the hub daily caps are soft limits.
 
-### 1.2 Provision the droplet
+### 1.2 Install the droplet software
 
-The script `scripts/deploy-hub.sh` installs Caddy, ufw, the hub, rootless Docker and Hermes Agent. It is idempotent: a second run changes only the code and the units. It never replaces a file that holds secrets or owner values.
+`scripts/deploy-hub.sh` installs Caddy, ufw, the hub, rootless Docker and Hermes Agent. It is idempotent: a second run changes only the code and the units. It never replaces a file that holds secrets or owner values.
 
-1. Make sure that `hub/hub.py` and `hub/requirements.txt` are in your work tree.
-2. Make sure that `dig +short dog.<domain>` gives the droplet IP address.
-3. Run `scripts/deploy-hub.sh root@<droplet-ip> <domain>` on the laptop.
-4. Read the list of manual steps that the script prints at the end.
+1. Make sure that `dig +short dog.<domain>` gives the droplet IP address.
+2. On the laptop, run `scripts/deploy-hub.sh root@<droplet-ip> <domain>`.
+3. When the script completes, do sections 1.4 to 1.6.
 
 The script does these steps on the droplet:
 
-- It installs `caddy`, `ufw`, `python3-venv`, `uidmap`, `dbus-user-session` and Docker from the Docker apt repository.
-- It stops the root Docker daemon. A member of the `docker` group has root access, and root Docker bypasses ufw.
+- It installs Caddy, ufw, the packages for rootless Docker, and Docker from the Docker apt repository.
+- It stops when `/etc/caddy/Caddyfile` is not the Ubuntu default and not an earlier dog Caddyfile. This check occurs before all other changes.
+- It stops and disables the root Docker daemon. A member of the `docker` group has root access, and root Docker bypasses ufw.
 - It creates the users `doghub` (system user, no login) and `hermes` (normal user, no password).
-- It lets ports 22, 80 and 443 through ufw. When ufw is already active, the script adds these ports and keeps the default policies.
+- It opens ports 22, 80 and 443 in ufw. When ufw is already active, the script keeps its default policies.
 - It runs `loginctl enable-linger hermes` and starts rootless Docker for `hermes`.
 - It creates `/etc/doghub/hub.env` and `~hermes/.hermes/.env` with new random values for `DEVICE_TOKEN`, `TOOLS_TOKEN` and the API server key.
+- It never writes an empty token. A secret never appears in a process argument list.
 - It copies `hermes-config.yaml` and `SOUL.md` into `~hermes/.hermes/` before the Hermes installer runs. Hermes keeps a `SOUL.md` that is already there.
-- It downloads `scripts/install.sh` of the pinned Hermes release tag and checks its sha256. Then it runs that file as `hermes` with `--non-interactive` and the pinned commit, and installs the gateway as a user service.
-- It copies `hub/` to `/opt/doghub/hub/`, makes `/opt/doghub/.venv` and installs `hub/requirements.txt`.
-- It installs `doghub.service`, the Caddyfile and a Caddy drop-in that sets `DOG_DOMAIN`. It replaces only the Ubuntu default Caddyfile (kept as `/etc/caddy/Caddyfile.ubuntu-default`) or an earlier dog Caddyfile. It stops before it changes another Caddyfile.
-- It writes each new secret through a here-doc, so a secret never appears in a process argument list. It stops when a new token is empty.
+- It downloads `scripts/install.sh` of the pinned Hermes release tag and checks its sha256. It runs that file as `hermes` with `--non-interactive` and the pinned commit.
+- It installs the Hermes gateway as a user service.
+- It copies `hub/` to `/opt/doghub/hub/` as root, makes `/opt/doghub/.venv` and installs `hub/requirements.txt`.
+- It installs `doghub.service`, the Caddyfile and a Caddy drop-in that sets `DOG_DOMAIN`. It keeps the Ubuntu default as `/etc/caddy/Caddyfile.ubuntu-default`.
+- It starts `doghub` only when `OPENAI_API_KEY` in `hub.env` has a value.
 
 ### 1.3 Update the Hermes pin
 
 `scripts/deploy-hub.sh` installs one pinned Hermes release. Three values at the top of the script give the pin. Change them together:
 
 1. Find the new release tag on the NousResearch/hermes-agent releases page, for example `v0.23.0`.
-2. Run `curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/<tag>/scripts/install.sh | sha256sum`.
-3. Read the downloaded `install.sh` before you trust it. Examine its new flags and its new downloads.
-4. Run `gh api repos/NousResearch/hermes-agent/commits/<tag> --jq .sha` to get the commit of the tag.
-5. Write the tag in `HERMES_TAG`, the hash in `HERMES_INSTALLER_SHA256` and the commit in `HERMES_COMMIT`.
-6. Make a commit of the change.
+2. Run `curl -fsSL -o install.sh https://raw.githubusercontent.com/NousResearch/hermes-agent/<tag>/scripts/install.sh`.
+3. Run `sha256sum install.sh`.
+4. Examine the new flags and the new downloads in `install.sh` before you trust it.
+5. Run `gh api repos/NousResearch/hermes-agent/commits/<tag> --jq .sha` to get the commit of the tag.
+6. Write the tag in `HERMES_TAG`.
+7. Write the hash in `HERMES_INSTALLER_SHA256`.
+8. Write the commit in `HERMES_COMMIT`.
+9. Make a commit of the change.
 
-The pin applies to a new install only. On a droplet that already has Hermes, run `sudo -iu hermes hermes update`. Then run the phase 4 checks again.
+The pin applies to a new install only. On a droplet that already has Hermes, run `sudo -iu hermes hermes update`. Then do the phase 4 checks again.
 
 ### 1.4 Add the keys
 
@@ -73,12 +78,12 @@ Do these steps on the droplet. `sudoedit` keeps the file owner and mode.
 4. Write the bot token after `TELEGRAM_BOT_TOKEN=`.
 5. Open the hub env file: `sudoedit /etc/doghub/hub.env`.
 6. Write the OpenAI key after `OPENAI_API_KEY=`.
-7. Open `sudoedit -u hermes /home/hermes/.hermes/config.yaml`.
+7. Open the Hermes configuration: `sudoedit -u hermes /home/hermes/.hermes/config.yaml`.
 8. Replace `REPLACE-WITH-VISION-MODEL` with an OpenRouter model id that accepts images.
 9. Run `sudo systemctl restart doghub`.
 10. Run `sudo -iu hermes systemctl --user restart hermes-gateway`.
 
-The `look` tool returns a JPEG image. A model that accepts only text cannot see that image, so the model must accept images.
+The `look` tool returns a JPEG image. A model that accepts only text cannot see that image.
 
 ### 1.5 Pair the owner in Telegram
 
@@ -100,7 +105,7 @@ Do each check. Write each result in `docs/test-log.md`, with the date, the comma
 | --- | --- | --- |
 | TLS | `curl -sS https://dog.<domain>/healthz` | A reply from the hub with a valid certificate. |
 | Other paths are closed | `curl -s -o /dev/null -w '%{http_code}\n' https://dog.<domain>/tools/` | `404`. |
-| Firewall | `sudo ufw status` | Only 22, 80 and 443 are allowed. |
+| Firewall | `sudo ufw status` | Only 22, 80 and 443 are open. |
 | Loopback binds | `sudo ss -tlnp` | Ports 8000 and 8642 listen on 127.0.0.1 only. |
 | Hermes health | `sudo -iu hermes hermes doctor` | Exit code 0. |
 | Hermes values | `sudo -iu hermes hermes config check` | No error. |
@@ -141,16 +146,16 @@ The Bookworm release of Raspberry Pi OS is not correct for this project. Its Ope
 
 ### 2.2 First install
 
-1. On the laptop, add a `Host robot-pi` entry to `~/.ssh/config` with `User robot`.
+1. On the laptop, add a `Host robot-pi` entry with `User robot` to `~/.ssh/config`.
 2. Run `ssh robot-pi true`. It must complete with no password prompt.
 3. Run `scripts/package.sh`. The script prints the tarball path, for example `dist/dog-v0.4.0.tar.gz`.
 4. Run `scp dist/dog-<version>.tar.gz dist/dog-<version>.tar.gz.sha256 scripts/install-pi.sh robot-pi:`.
 5. Run `ssh -t robot-pi sudo bash install-pi.sh dog-<version>.tar.gz`.
-6. Make sure that the last output line shows `health` with the value `degraded` or `ok`.
+6. Make sure that the output shows `"health"` with the value `"degraded"` or `"ok"`.
 
-`install-pi.sh` installs the apt packages. Then it runs `robotctl update apply` from the new tarball. The hooks create the users, the directories, the units and the `/etc/dog` files. The health gate commits approximately 10 s after the restart.
+`install-pi.sh` installs the apt packages. Then it runs `robotctl update apply` from the tarball. The hooks create the users, the directories, the units and the `/etc/dog` files. The health gate commits approximately 10 s after the restart.
 
-When the first install fails, no release is current and `dog.target` is stopped. Correct the fault and run step 5 again with the same tarball.
+When the first install fails, no release is current, and `dog.target` is stopped and disabled. Correct the fault. Then do step 5 again with the same tarball.
 
 ### 2.3 Configure the Pi
 
@@ -197,7 +202,7 @@ The LAN console of mediad is plain HTTP on `console_port` in the `[mediad]` sect
 2. Run `scripts/deploy-pi.sh`.
 3. To make the previous release current again, run `ssh robot-pi sudo robotctl update rollback`.
 
-When the SSH connection stops during an update, the update continues on the Pi. Connect again and run `robotctl update status`.
+When the SSH connection stops during an update, the update continues on the Pi. To see the result, connect again and run `robotctl update status`.
 
 ### 2.7 Logs
 
@@ -211,17 +216,17 @@ When the SSH connection stops during an update, the update continues on the Pi. 
 
 ## 3. Hermes values that the docs do not confirm
 
-The Hermes docs were read on 2026-10-25 (`https://hermes-agent.nousresearch.com/docs/`). The docs confirm each key in `deploy/hub/hermes-config.yaml` and `deploy/hub/hermes.env.example`. These items are not confirmed. Check each one on the droplet before you rely on it.
+The Hermes docs were read on 2026-10-25 (`https://hermes-agent.nousresearch.com/docs/`). They confirm each key in `deploy/hub/hermes-config.yaml` and `deploy/hub/hermes.env.example`. They do not confirm the items in this table. Check each item on the droplet before you rely on it.
 
 | Item | Where it is used | Status and check |
 | --- | --- | --- |
-| Rootless Docker as the terminal backend | `terminal.backend: docker` with the `rootless` CLI context of `hermes` | The docs do not describe rootless Docker. Check that `sudo -iu hermes docker info` shows `rootless`, and do the terminal checks in section 1.6. |
-| `install.sh --non-interactive --commit <sha>` | `deploy-hub.sh` | The docs give `--non-interactive`. `--commit` is in the usage text of `install.sh`, not in the docs. Check that `~hermes/.local/bin/hermes` exists after the script. |
-| `hermes gateway install --if-missing` | `deploy-hub.sh` | The flag is in `install.sh`, not in the CLI reference. Check `sudo -iu hermes systemctl --user status hermes-gateway`. |
+| Rootless Docker as the terminal backend | `terminal.backend: docker` with the `rootless` CLI context of `hermes` | The docs do not describe rootless Docker. Make sure that `sudo -iu hermes docker info` shows `rootless`. Do the terminal checks in section 1.6. |
+| `install.sh --non-interactive --commit <sha>` | `deploy-hub.sh` | The docs give `--non-interactive`. `--commit` is in the usage text of `install.sh`, not in the docs. Make sure that `~hermes/.local/bin/hermes` exists after the script. |
+| `hermes gateway install --if-missing` | `deploy-hub.sh` | The flag is in `install.sh`, not in the CLI reference. Run `sudo -iu hermes systemctl --user status hermes-gateway`. |
 | Default of `agent.max_turns` | `hermes-config.yaml` sets 40 | The docs give two defaults (unlimited and 500). The template sets an explicit value, so the default does not apply. |
 | Default of the tool server `timeout` | `hermes-config.yaml` sets 60 | The docs give 300 in a table and 120 in an example. The template sets an explicit value. |
 | `gateway.api_server` keys in `config.yaml` | Not used | The API server page contradicts itself. The template uses the `API_SERVER_*` environment values in `.env`, which the docs confirm. |
 | OpenAI text-to-speech with `OPENAI_API_KEY` | Not used | The docs confirm this fallback only for speech-to-text. The template uses `VOICE_TOOLS_OPENAI_KEY`. |
-| Default sandbox image | Not set | The docs give two different images. Check `sudo -iu hermes hermes config get terminal.docker_image`. |
+| Default sandbox image | Not set | The docs give two different images. Run `sudo -iu hermes hermes config get terminal.docker_image`. |
 | A switch that disables cron | Not used | The docs have no such switch. Cron runs only the jobs that you create, and the template creates none. |
-| The unattended-mode key | `approvals.unattended_mode: deny` | The docs confirm the key. The plan says to check it with `hermes config` before you rely on it: run `sudo -iu hermes hermes config get approvals.unattended_mode`. |
+| The unattended-mode key | `approvals.unattended_mode: deny` | The docs confirm the key. The plan says to check it with `hermes config` before you rely on it. Run `sudo -iu hermes hermes config get approvals.unattended_mode`. |

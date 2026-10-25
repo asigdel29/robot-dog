@@ -1,11 +1,8 @@
 # hermes-config.yaml: template for ~hermes/.hermes/config.yaml on the droplet.
 # scripts/deploy-hub.sh copies it only when no config.yaml exists. The secrets are in ~hermes/.hermes/.env.
-# Each key below is in the Hermes Agent docs (https://hermes-agent.nousresearch.com/docs/, read 2026-10-25).
-# A line with "NOT VERIFIED" names a key or behavior that the docs do not confirm; check it with
-# `hermes config check` and `hermes doctor` before you rely on it.
-#
-# The API server is configured in .env (API_SERVER_ENABLED, API_SERVER_HOST, API_SERVER_PORT, API_SERVER_KEY),
-# because the API server page says that API_SERVER_* are environment variables.
+# Each key is in the Hermes Agent docs (https://hermes-agent.nousresearch.com/docs/, read 2026-10-25).
+# "NOT VERIFIED" marks behavior that the docs do not confirm; docs/runbook.md section 3 tells how to check it.
+# The API server keys (API_SERVER_*) are in .env, because the API server page names them as environment values.
 
 # Model: OpenRouter. The owner selects a model that accepts images, because the `look` tool returns a JPEG.
 # Doc: user-guide/configuring-models, "What gets written to config.yaml".
@@ -20,8 +17,7 @@ agent:
 
 # Terminal commands run in a Docker container. The daemon is rootless Docker of the hermes user, because a
 # member of the normal docker group has root access. Doc: user-guide/configuration, "Docker Backend".
-# NOT VERIFIED: the docs do not describe rootless Docker. deploy-hub.sh makes the "rootless" CLI context the
-# default of user hermes, so the docker CLI that Hermes runs uses the rootless daemon.
+# NOT VERIFIED: the docs do not describe rootless Docker. deploy-hub.sh makes "rootless" the default CLI context.
 terminal:
   backend: docker
   container_cpu: 1        # CPU cores

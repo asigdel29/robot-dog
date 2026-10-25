@@ -14,7 +14,6 @@ EnvironmentFile=/etc/dog/console.env
 ExecStart=/opt/dog/current/.venv/bin/python /opt/dog/current/pi/mediad.py --config /etc/dog/dog.toml
 Restart=always
 RestartSec=1
-Environment=PYTHONUNBUFFERED=1
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/run/dog

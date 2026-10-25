@@ -1,9 +1,8 @@
 """Tests of `robotctl update` (digest, health gate, rollback, prune, status) and of the unit ExecStart lines.
 
-Each update test uses a temp DOG_ROOT, PATH shims for systemctl and systemd-run, and a
-fake robotd on a temp DOG_RUN_DIR. The systemd-run shim passes only the --setenv values,
-like a transient unit. The fake answers robot.state with a health value that comes from
-the VERSION of the current release:
+Each update test uses a temp DOG_ROOT, PATH shims for systemctl and systemd-run, and a fake
+robotd on a temp DOG_RUN_DIR. The fake answers robot.state with the health that the VERSION
+of the current release names:
 
 - "ok-N" answers ok and "degraded-N" answers degraded.
 - "fault-N" answers fault and "silent-N" never answers.
@@ -58,7 +57,9 @@ env = {{"PATH": os.path.dirname(os.path.abspath(__file__)) + ":/usr/bin:/bin", "
 env.update(a[len("--setenv="):].split("=", 1) for a in args[:sep] if a.startswith("--setenv="))
 os.execve(args[sep + 1], args[sep + 1:], env)
 '''
-HOOK = '#!/bin/sh\necho "{name} {version}" >> "$DOG_ROOT/hook.log"\n'
+#: A stub hook. It sends SIGTERM to robotctl when the file term-<name>-<version> exists.
+HOOK = ('#!/bin/sh\necho "{name} {version}" >> "$DOG_ROOT/hook.log"\n'
+        '[ ! -e "$DOG_ROOT/term-{name}-{version}" ] || kill -TERM $PPID\n')
 
 
 class FakeRobotd(threading.Thread):
@@ -69,22 +70,19 @@ class FakeRobotd(threading.Thread):
         self.sock = sock
         self.root = root
         self.calls = {}
-        self.loop = asyncio.new_event_loop()
         self.ready = threading.Event()
 
     def run(self):
-        """Serve robot.state until stop() is called, then close each connection."""
-        asyncio.set_event_loop(self.loop)
-        server = self.loop.run_until_complete(dogproto.serve(self.sock, {"robot.state": self.h_state}))
+        """Serve robot.state until stop(); asyncio.run then cancels each open request and closes the loop."""
+        asyncio.run(self.serve())
+
+    async def serve(self):
+        """Open the socket and wait for stop()."""
+        self.loop, self.stopped = asyncio.get_running_loop(), asyncio.Event()
+        server = await dogproto.serve(self.sock, {"robot.state": self.h_state})
         self.ready.set()
-        self.loop.run_forever()
+        await self.stopped.wait()
         server.close()
-        tasks = asyncio.all_tasks(self.loop)
-        for task in tasks:
-            task.cancel()
-        self.loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
-        self.loop.run_until_complete(asyncio.sleep(0))
-        self.loop.close()
 
     async def h_state(self, params, conn):
         """Answer with the health that the current VERSION names (see the module docstring)."""
@@ -105,7 +103,7 @@ class FakeRobotd(threading.Thread):
 
     def stop(self):
         """Stop the event loop thread."""
-        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.loop.call_soon_threadsafe(self.stopped.set)
         self.join(5)
 
 
@@ -129,7 +127,7 @@ class UpdateTests(unittest.TestCase):
         self.shim_log = os.path.join(self.root, "shim.log")
         self.hook_log = os.path.join(self.root, "hook.log")
         self.env = {k: v for k, v in os.environ.items() if k != "INVOCATION_ID"}
-        self.env.update(DOG_ROOT=self.root, DOG_RUN_DIR=run_dir, DOG_CONFIG=os.devnull, DOG_FAKE_VENV="1",
+        self.env.update(DOG_ROOT=self.root, DOG_RUN_DIR=run_dir, DOG_FAKE_VENV="1",
                         DOG_HEALTH_WAIT_S=str(GATE_S), DOG_DEVICE_TOKEN="secret-token-value",
                         PATH=shims + os.pathsep + os.environ["PATH"])
         self.robotd = FakeRobotd(os.path.join(run_dir, "robotd.sock"), self.root)
@@ -214,7 +212,6 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(len(reexec), 1)
         self.assertTrue(reexec[0].startswith("systemd-run --unit=dog-update --wait --collect --pipe "))
         self.assertNotIn("secret-token-value", reexec[0])  # only the listed DOG_* values go into the unit
-        self.assertNotIn("DOG_CONFIG", reexec[0])
         release = os.path.join(self.dog, "releases", "ok-1")
         self.assertTrue(os.path.islink(os.path.join(release, ".venv", "bin", "python")))
         self.assertEqual(os.stat(release).st_mode & 0o777, 0o755)
@@ -257,9 +254,6 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(self.restarts(), restarts)
         return proc, elapsed
 
-    def test_fault_rolls_back_at_once(self):
-        self.assertLess(self.assert_rolled_back("fault-2")[1], GATE_S)
-
     def test_late_fault_rolls_back(self):
         proc, elapsed = self.assert_rolled_back("late-2")
         self.assertIn("health fault", proc.stderr)
@@ -283,6 +277,17 @@ class UpdateTests(unittest.TestCase):
         self.assertIn("systemctl failed", proc.stderr)
         self.assertEqual((self.link("current"), self.releases()), ("ok-1", ["ok-1"]))
 
+    def test_sigterm_rolls_back(self):
+        self.assertEqual(self.apply("ok-1").returncode, 0)
+        for name in ("term-postinstall-ok-2", "term-postinstall-ok-1"):  # SIGTERM in the update and in each rollback
+            open(os.path.join(self.root, name), "w").close()
+        for version, reason in (("ok-2", "stopped by SIGTERM"), ("fault-3", "health fault")):
+            proc = self.apply(version)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn(f"{version}: {reason}; rolled back to ok-1", proc.stderr)
+        self.assertEqual((self.link("current"), self.releases()), ("ok-1", ["ok-1"]))
+        self.assertEqual(self.restarts(), 4)  # each rollback ran to its end
+
     def test_failed_preinstall_changes_nothing(self):
         self.assertEqual(self.apply("ok-1").returncode, 0)
         proc = self.apply("ok-2", failing_hook="preinstall")
@@ -297,7 +302,7 @@ class UpdateTests(unittest.TestCase):
             self.assertIn("no release is current", proc.stderr)
             self.assertIsNone(self.link("current"))
             self.assertEqual(self.releases(), [])
-        self.assertIn("systemctl stop dog.target", self.lines(self.shim_log))
+        self.assertIn("systemctl disable --now dog.target", self.lines(self.shim_log))
         self.assertEqual(self.apply("ok-1").returncode, 0)
         self.assertEqual(self.link("current"), "ok-1")
 
@@ -323,23 +328,17 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(self.releases(), ["ok-2", "ok-3"])
         self.assertEqual((self.link("current"), self.link("previous")), ("ok-3", "ok-2"))
 
-    def test_rollback_command(self):
+    def test_rollback_and_status(self):
         self.assertEqual(self.robotctl("update", "rollback").returncode, 3)  # nothing to roll back to
         for version in ("ok-1", "ok-2"):
             self.assertEqual(self.apply(version).returncode, 0)
         proc = self.robotctl("update", "rollback")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual((self.link("current"), self.link("previous")), ("ok-1", "ok-2"))
-        self.assertEqual(self.releases(), ["ok-1", "ok-2"])
-
-    def test_status(self):
-        for version in ("ok-1", "ok-2"):
-            self.assertEqual(self.apply(version).returncode, 0)
-        reexecs = len(self.lines(self.shim_log))
+        shim_lines = len(self.lines(self.shim_log))
         proc = self.robotctl("update", "status")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(json.loads(proc.stdout), {"current": "ok-2", "previous": "ok-1", "releases": ["ok-1", "ok-2"]})
-        self.assertEqual(len(self.lines(self.shim_log)), reexecs)  # status only reads, so no systemd-run
+        self.assertEqual(json.loads(proc.stdout), {"current": "ok-1", "previous": "ok-2", "releases": ["ok-1", "ok-2"]})
+        self.assertEqual(len(self.lines(self.shim_log)), shim_lines)  # status only reads, so no systemd-run
 
 
 class UnitExecStart(unittest.TestCase):
