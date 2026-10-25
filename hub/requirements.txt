@@ -1,2 +1,4 @@
 # Python packages of the hub on the droplet (hub/hub.py). uvicorn serves the /device WebSocket with websockets.
+starlette==1.10.0
+uvicorn==0.54.0
 websockets==17.3
