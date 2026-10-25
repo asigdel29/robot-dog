@@ -267,7 +267,7 @@ class Voice:
 
     def __init__(self):
         self._turn = None
-        self._run_id = None
+        self._create = None
         self._stops = set()
 
     def start(self, params):
@@ -283,21 +283,25 @@ class Voice:
         if self._turn is None or self._turn.done():
             return
         log.info("voice turn cancelled: %s", reason)
-        # ponytail: a cancel during POST /v1/runs (no run id yet) leaves that run going; it ends on its own.
-        if self._run_id is not None:
-            task = asyncio.ensure_future(self._stop_run(self._run_id))
+        if self._create is not None:
+            task = asyncio.ensure_future(self._stop_run(self._create))
             self._stops.add(task)
             task.add_done_callback(self._stops.discard)
         self._turn.cancel()
         self._turn = None
 
-    async def _stop_run(self, run_id):
-        """Ask Hermes to stop a run; Hermes answers at once and stops at its next safe point."""
+    async def _stop_run(self, create):
+        """Stop the Hermes run of a cancelled turn, as soon as its create request gives the run id.
+
+        Hermes answers a stop at once and stops the run at its next safe point.
+        """
         try:
+            run_id = await create
             reply = await http.post(f"{HERMES_URL}/v1/runs/{run_id}/stop", headers=_hermes_auth())
             reply.raise_for_status()
-        except httpx2.HTTPError as exc:
-            log.warning("stop of Hermes run %s failed: %s", run_id, exc)
+            log.info("Hermes run %s stopped", run_id)
+        except (httpx2.HTTPError, KeyError, ValueError) as exc:
+            log.warning("stop of a cancelled Hermes run failed: %s", exc)
 
     async def _run_turn(self, params):
         """Run one turn and log the time of each stage for the latency budget."""
@@ -333,16 +337,23 @@ class Voice:
         except DeviceError as exc:
             log.warning("voice stop phrase: %s", exc)
 
-    async def _hermes(self, utt_id, text, sentences, marks):
-        """Start a Hermes run for the text and put each whole sentence of the reply in sentences."""
+    async def _create_run(self, utt_id, text):
+        """Start a Hermes run for the text and return its id."""
         headers = {**_hermes_auth(), "X-Hermes-Session-Key": VOICE_SESSION_KEY, "Idempotency-Key": utt_id}
         reply = await http.post(f"{HERMES_URL}/v1/runs", headers=headers,
                                 json={"input": f"[spoken via dog mic] {text}"})
         reply.raise_for_status()
-        run_id = reply.json()["run_id"]
-        self._run_id = run_id
-        pending, streamed = "", False
+        return reply.json()["run_id"]
+
+    async def _hermes(self, utt_id, text, sentences, marks):
+        """Run Hermes on the text and put each whole sentence of the reply in sentences."""
+        create = asyncio.ensure_future(self._create_run(utt_id, text))
+        self._create = create
+        # last: the final character of the reply so far; gap: a non-delta event came after it.
+        pending, last, gap = "", "", False
         try:
+            # The shield keeps the create request alive when the turn is cancelled, so cancel() can stop the run.
+            run_id = await asyncio.shield(create)
             async with http.stream("GET", f"{HERMES_URL}/v1/runs/{run_id}/events", headers=_hermes_auth()) as events:
                 events.raise_for_status()
                 async for line in events.aiter_lines():
@@ -353,22 +364,29 @@ class Voice:
                     name = event.get("event")
                     if name == "message.delta":
                         marks.setdefault("first_delta", time.monotonic())
-                        streamed = True
-                        *whole, pending = SENTENCE_END_RE.split(pending + (event.get("delta") or ""))
+                        delta = event.get("delta") or ""
+                        # Text before and after a tool call must not fuse into one word.
+                        if gap and last and delta and not last.isspace() and not delta[0].isspace():
+                            delta = " " + delta
+                        gap = False
+                        last = delta[-1:] or last
+                        *whole, pending = SENTENCE_END_RE.split(pending + delta)
                         for sentence in whole:
                             sentences.put_nowait(sentence)
                     elif name == "run.completed":
-                        if not streamed:
+                        if not last:
                             pending = event.get("output") or ""
                         break
                     elif name in RUN_FAILED_EVENTS:
                         log.warning("Hermes run %s ended: %s %s", run_id, name, event.get("error", ""))
                         break
+                    else:
+                        gap = True
             if pending.strip():
                 sentences.put_nowait(pending)
         finally:
-            if self._run_id == run_id:
-                self._run_id = None
+            if self._create is create:
+                self._create = None
 
     async def _speak(self, sentences, marks):
         """Speak each queued sentence on the dog in order, until None arrives or the TTS cap is reached."""

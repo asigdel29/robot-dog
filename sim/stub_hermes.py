@@ -6,7 +6,7 @@ endpoints that the hub uses (/v1/audio/transcriptions, /v1/audio/speech). When
 a run input contains "bark", the stream calls do_trick("bark") on the hub's
 /tools endpoint with a real Model Context Protocol client, in the middle of the
 stream, as Hermes does. Each request is recorded: GET /_stub/requests returns
-the list, and POST /_stub/config sets the transcript and the reply.
+the list, and POST /_stub/config sets the transcript, the reply and the delays.
 """
 
 import argparse
@@ -26,7 +26,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 #: Text that a test can change with POST /_stub/config.
 config = {"transcript": "hello dog", "reply": ["Sure,", " I can do that.", " Here I go!"], "delta_delay": 0.05,
-          "tools_url": "", "tools_token": ""}
+          "create_delay": 0, "tools_url": "", "tools_token": ""}
 requests = []
 runs = {}
 app = FastAPI()
@@ -44,7 +44,7 @@ def hermes_headers(request):
 
 @app.post("/_stub/config")
 async def set_config(request: Request):
-    """Change the transcript, the reply deltas or the delay between deltas."""
+    """Change the transcript, the reply deltas, the delay between deltas or the delay of the create reply."""
     config.update(await request.json())
     return config
 
@@ -57,11 +57,12 @@ async def get_requests():
 
 @app.post("/v1/runs", status_code=202)
 async def create_run(request: Request):
-    """Start a run, as Hermes does: 202 with a run id."""
+    """Start a run, as Hermes does: 202 with a run id, after create_delay seconds."""
     body = await request.json()
     run_id = f"run_{uuid.uuid4().hex}"
     runs[run_id] = {"input": body.get("input", ""), "stopped": asyncio.Event()}
     record("/v1/runs", headers=hermes_headers(request), body=body, run_id=run_id)
+    await asyncio.sleep(config["create_delay"])
     return {"run_id": run_id, "status": "started", "replayed": False}
 
 

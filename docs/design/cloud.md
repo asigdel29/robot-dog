@@ -196,6 +196,8 @@ The limits are nested: robotd 30 s, then the hub 35 s, then Hermes 60 s. When He
 6. Stop fast path: when the text matches `^\W*(stop|halt|freeze|no)\b` (any case), the hub sends `robot.stop` first.
 7. The hub starts a Hermes run with the text (section 6.2). The run also starts after a stop phrase, so Hermes can answer.
 8. The hub reads the event stream. It adds the text of each `message.delta` to a buffer.
+   When a different event, for example a tool call, comes between two deltas, the hub adds one space between them.
+   It does not add the space when one side already has whitespace.
 9. The hub cuts whole sentences from the buffer. A sentence ends at `.`, `!` or `?` before a space.
 10. The hub sends each sentence to OpenAI TTS with `response_format="pcm"` (24 kHz, 16-bit, mono).
 11. The hub sends the audio to the dog with `audio.play {pcm16_b64, rate: 24000}`. Each part is 10 s or less, so it fits in one frame.
@@ -203,6 +205,8 @@ The limits are nested: robotd 30 s, then the hub 35 s, then Hermes 60 s. When He
 
 - Only one turn runs at a time. A new utterance cancels the old turn.
 - `voice.cancel` (barge-in) cancels the turn. The hub sends a stop for its Hermes run and drops the sentences that it did not play.
+- When the create request of the run has no reply yet, the hub keeps that request open. It sends the stop when the run id arrives.
+- A cancelled turn never sends `audio.play`.
 - mediad clears its own play queue on a push-to-talk press, before `voice.cancel` arrives.
 
 ### 6.2 Hermes run API
@@ -219,12 +223,12 @@ These are the calls that the hub makes. Sources: the Hermes "API Server" page, s
 - `Idempotency-Key` makes a repeated utterance safe. The same key with the same body returns the first `run_id`. The same key with a different body gets HTTP 409.
 - Each event is an `id: <seq>` line, a `data: <json>` line and a blank line. The JSON has `event`, `run_id`, `timestamp` and `seq`, plus the event fields.
 - Lines that start with `:` are comments: `: open`, `: keepalive` and `: stream closed`. The hub reads only `data:` lines.
-- The hub uses these events: `message.delta` (`delta`), `run.completed` (`output`), `run.failed` (`error`), `run.cancelled` and `run.interrupted`. It ignores all other events, for example `tool.started` and `message.interim`.
+- The hub uses these events: `message.delta` (`delta`), `run.completed` (`output`), `run.failed` (`error`), `run.cancelled` and `run.interrupted`. It reads no fields from other events, for example `tool.started` and `message.interim`. They only mark a gap between two deltas.
 
 Not verified against a live Hermes server:
 
 - The frame shape. The docs do not show it, so it comes from the Hermes source (main branch, read on 2026-10-25). Phase 4 must check it against the live server.
-- The text between two model turns. Hermes can send text before a tool call and the answer after it. The hub joins the two texts with no space between them.
+- That Hermes sends another event, for example `tool.started`, between the text of two model turns. The hub adds a space only after such an event (step 8 in section 6.1).
 
 ### 6.3 Latency log
 
@@ -245,6 +249,6 @@ A stage that did not occur is not in the line. The budget is in the plan: p50 of
 - A run sends the configured reply as `message.delta` events, then `run.completed`.
 - When the run input contains "bark", the stub calls `do_trick("bark")` on `/tools` in the middle of the stream. It uses a real Model Context Protocol client, as Hermes does.
 - `POST /v1/runs/{run_id}/stop` ends the stream with `run.cancelled`.
-- `GET /_stub/requests` returns each recorded request. `POST /_stub/config` changes the transcript, the reply and the delay between deltas.
+- `GET /_stub/requests` returns each recorded request. `POST /_stub/config` changes the transcript, the reply, the delay between deltas and the delay of the create reply.
 
 `tests/test_link.py` also uses a stub mediad cloud socket and a fake hub. The fake hub sends linkd frames that the real hub never sends, for example an old `sent_at`.

@@ -352,7 +352,17 @@ class VoiceLoop(LinkTestCase):
         call = self.stack.stub_requests("tool:do_trick")[0]
         self.assertFalse(call["is_error"], call["text"])
         self.assertTrue(json.loads(call["text"])["transmitted"])
+        spoken = [r["body"]["input"] for r in self.stack.stub_requests("/v1/audio/speech")]
+        self.assertEqual(spoken, ["Sure, I can do that.", "Here I go!"], "no second space after the tool call")
         self.wait_latency_line()
+
+    def test_text_around_tool_call_is_not_fused(self):
+        self.arm()
+        self.stack.stub_config(transcript="please bark", reply=["Okay.", "Done!"])
+        self.stack.utter()
+        self.stack.wait_for(lambda: len(self.stack.mediad.plays) >= 2, "both sentences played")
+        spoken = [r["body"]["input"] for r in self.stack.stub_requests("/v1/audio/speech")]
+        self.assertEqual(spoken, ["Okay.", "Done!"])
 
     def test_bargein_stops_run(self):
         self.stack.stub_config(reply=[" One."] * 40, delta_delay=0.1)
@@ -368,6 +378,19 @@ class VoiceLoop(LinkTestCase):
         time.sleep(1.0)
         self.assertEqual(len(self.stack.mediad.plays), played, "audio.play after barge-in")
         self.assertLess(played, 10)
+
+    def test_bargein_while_run_is_created(self):
+        """A barge-in before Hermes answers the create request still stops that run, and nothing plays."""
+        self.stack.stub_config(create_delay=1.0)
+        self.stack.utter()
+        self.stack.wait_for(lambda: self.stack.stub_requests("/v1/runs"), "create request at Hermes")
+        self.stack.mediad.notify("media.bargein", {})
+        self.stack.wait_for(lambda: self.stack.stub_requests("/v1/runs/stop"), "run stop at Hermes", timeout=5)
+        stop = self.stack.stub_requests("/v1/runs/stop")[0]
+        self.assertEqual(stop["run_id"], self.stack.stub_requests("/v1/runs")[0]["run_id"])
+        time.sleep(0.5)
+        self.assertEqual(self.stack.stub_requests("/v1/runs/events"), [])
+        self.assertEqual(self.stack.mediad.plays, [])
 
     def test_stop_phrase_before_hermes(self):
         self.stack.stub_config(transcript="Stop! Stop right there.")
