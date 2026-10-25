@@ -6,6 +6,15 @@
 # Each step is idempotent. Secrets and config files are created only when they are absent.
 set -euo pipefail
 
+# Hermes Agent pin: the release tag, the sha256 of its scripts/install.sh, and the commit of that tag.
+# docs/runbook.md, "Update the Hermes pin", tells how to change these three values together.
+HERMES_TAG=v0.22.5
+HERMES_INSTALLER_SHA256=99cb3691d55019c6973a7acb775a915648666cc24e483ca827a1cdbb3531a674
+HERMES_COMMIT=bf0203a794a07aac3ff764972ab9087baa4e4f4e
+# The sha256 of /etc/caddy/Caddyfile as the Ubuntu 24.04 caddy package installs it.
+UBUNTU_CADDYFILE_SHA256=66177d46fa761acb07208065db9b0274cb1b12c02ac43b9bfc9857b698b1ccfe
+DOG_CADDYFILE_HEADER='# Caddyfile: the public TLS front of the hub'
+
 usage() {
 	echo "usage: $0 <ssh-target> <domain>   (example: $0 root@203.0.113.10 example.com)" >&2
 	exit 3
@@ -14,7 +23,8 @@ usage() {
 # remote runs on the droplet as root; $1 is the domain and $2 is the copied source directory.
 remote() {
 	local domain=$1 src=$2
-	local hh=/home/hermes/.hermes hubenv=/etc/doghub/hub.env uid codename
+	local hh=/home/hermes/.hermes hubenv=/etc/doghub/hub.env caddyfile=/etc/caddy/Caddyfile
+	local uid codename device tools apikey installer
 	[[ $EUID -eq 0 ]] || {
 		echo "deploy-hub.sh --remote: run it as root" >&2
 		exit 3
@@ -24,6 +34,12 @@ remote() {
 	echo "== packages"
 	apt-get update
 	apt-get install -y ca-certificates curl git openssl caddy ufw python3-venv uidmap dbus-user-session slirp4netns libatomic1
+	# Replace only the Ubuntu default Caddyfile or the dog Caddyfile; stop before any change to another one.
+	if ! grep -qF "$DOG_CADDYFILE_HEADER" "$caddyfile" &&
+		[[ $(sha256sum <"$caddyfile" | cut -d ' ' -f 1) != "$UBUNTU_CADDYFILE_SHA256" ]]; then
+		echo "deploy-hub.sh: $caddyfile is not the Ubuntu default and not the dog Caddyfile; merge it by hand" >&2
+		exit 1
+	fi
 	# Docker comes from the Docker apt repo: the Ubuntu docker.io package has no rootless setup tool.
 	if [[ ! -e /etc/apt/sources.list.d/docker.sources ]]; then
 		install -m 0755 -d /etc/apt/keyrings
@@ -54,9 +70,13 @@ EOF
 		exit 1
 	}
 
-	echo "== firewall: 22, 80 and 443 only"
-	ufw default deny incoming
-	ufw default allow outgoing
+	echo "== firewall: 22, 80 and 443"
+	if ufw status | grep -q '^Status: active'; then
+		echo "ufw is already active, so its default policies stay as they are"
+	else
+		ufw default deny incoming
+		ufw default allow outgoing
+	fi
 	ufw allow 22/tcp
 	ufw allow 80/tcp
 	ufw allow 443/tcp
@@ -76,32 +96,47 @@ EOF
 
 	echo "== hub secrets and Hermes files (only when absent)"
 	install -d -m 0755 /etc/doghub
+	# The secrets go to sed through a here-doc, so they never appear in a process argument list.
 	if [[ ! -e $hubenv ]]; then
+		device=$(token)
+		tools=$(token)
+		apikey=$(token)
+		need "$device" "$tools" "$apikey"
 		(
 			umask 077
-			sed -e "s|^DEVICE_TOKEN=.*|DEVICE_TOKEN=$(token)|" \
-				-e "s|^TOOLS_TOKEN=.*|TOOLS_TOKEN=$(token)|" \
-				-e "s|^HERMES_API_KEY=.*|HERMES_API_KEY=$(token)|" \
-				"$src/deploy/hub/hub.env.example" >"$hubenv"
+			sed -f /dev/stdin "$src/deploy/hub/hub.env.example" >"$hubenv" <<EOF
+s|^DEVICE_TOKEN=.*|DEVICE_TOKEN=$device|
+s|^TOOLS_TOKEN=.*|TOOLS_TOKEN=$tools|
+s|^HERMES_API_KEY=.*|HERMES_API_KEY=$apikey|
+EOF
 		)
 	fi
 	# Hermes seeds its own SOUL.md and config.yaml and never overwrites them, so the dog files go in first.
 	install -d -o hermes -g hermes -m 0700 "$hh"
 	if [[ ! -e $hh/.env ]]; then
+		tools=$(env_value TOOLS_TOKEN "$hubenv")
+		apikey=$(env_value HERMES_API_KEY "$hubenv")
+		need "$tools" "$apikey"
 		(
 			umask 077
-			sed -e "s|^API_SERVER_KEY=.*|API_SERVER_KEY=$(env_value HERMES_API_KEY "$hubenv")|" \
-				-e "s|^TOOLS_TOKEN=.*|TOOLS_TOKEN=$(env_value TOOLS_TOKEN "$hubenv")|" \
-				"$src/deploy/hub/hermes.env.example" >"$hh/.env"
+			sed -f /dev/stdin "$src/deploy/hub/hermes.env.example" >"$hh/.env" <<EOF
+s|^API_SERVER_KEY=.*|API_SERVER_KEY=$apikey|
+s|^TOOLS_TOKEN=.*|TOOLS_TOKEN=$tools|
+EOF
 		)
 		chown hermes:hermes "$hh/.env"
 	fi
 	seed "$src/deploy/hub/hermes-config.yaml" "$hh/config.yaml" 0600
 	seed "$src/deploy/hub/SOUL.md" "$hh/SOUL.md" 0644
 
-	echo "== Hermes Agent (official installer, as hermes)"
+	echo "== Hermes Agent $HERMES_TAG (the official installer of that tag, as hermes)"
 	if [[ ! -x /home/hermes/.local/bin/hermes ]]; then
-		as_hermes "$uid" bash -c 'set -euo pipefail; curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --non-interactive'
+		installer=/home/hermes/hermes-install-$HERMES_TAG.sh
+		as_hermes "$uid" curl -fsSL -o "$installer" \
+			"https://raw.githubusercontent.com/NousResearch/hermes-agent/$HERMES_TAG/scripts/install.sh"
+		echo "$HERMES_INSTALLER_SHA256  $installer" | sha256sum --check --quiet
+		as_hermes "$uid" bash "$installer" --non-interactive --commit "$HERMES_COMMIT"
+		rm -f "$installer"
 	fi
 	as_hermes "$uid" hermes gateway install --if-missing
 
@@ -117,7 +152,10 @@ EOF
 
 	echo "== services"
 	install -m 0644 "$src/deploy/hub/doghub.service" /etc/systemd/system/doghub.service
-	install -m 0644 "$src/deploy/hub/Caddyfile" /etc/caddy/Caddyfile
+	if ! grep -qF "$DOG_CADDYFILE_HEADER" "$caddyfile"; then
+		cp -p "$caddyfile" "$caddyfile.ubuntu-default" # the backup of the Ubuntu default
+	fi
+	install -m 0644 "$src/deploy/hub/Caddyfile" "$caddyfile"
 	install -d -m 0755 /etc/systemd/system/caddy.service.d
 	printf '[Service]\nEnvironment=DOG_DOMAIN=%s\n' "$domain" >/etc/systemd/system/caddy.service.d/dog.conf
 	systemctl daemon-reload
@@ -133,7 +171,7 @@ EOF
 	rm -rf "$src"
 	cat <<EOF
 
-Provisioning is complete. Do the manual steps in docs/runbook.md, section "Droplet bring-up":
+Provisioning is complete. Do the manual steps in docs/runbook.md, sections 1.4 to 1.6:
   1. Put OPENROUTER_API_KEY, VOICE_TOOLS_OPENAI_KEY and TELEGRAM_BOT_TOKEN (from BotFather) in $hh/.env.
   2. Put OPENAI_API_KEY in $hubenv, then run: sudo systemctl restart doghub
   3. Put the vision model id in $hh/config.yaml (model.default).
@@ -155,6 +193,17 @@ as_hermes() {
 # token prints a new random secret of 32 bytes in hex.
 token() {
 	openssl rand -hex 32
+}
+
+# need stops the script when one of its arguments is empty, so an empty secret is never written.
+need() {
+	local value
+	for value in "$@"; do
+		[[ -n $value ]] || {
+			echo "deploy-hub.sh: a token is empty; nothing was written" >&2
+			exit 1
+		}
+	done
 }
 
 # env_value prints the value of one KEY=value line of an env file.

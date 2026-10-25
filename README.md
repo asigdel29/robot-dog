@@ -33,6 +33,7 @@ The design documents in `docs/design/` own the mechanisms:
 | `scripts/deploy-pi.sh` | Laptop | Makes a release, copies it to `robot-pi` and applies it with the health gate. |
 | `robotctl update status`, `robotctl update rollback` | Pi | Shows the releases, or makes the previous release current again. |
 | `scripts/deploy-hub.sh <ssh-target> <domain>` | Laptop | Installs Caddy, ufw, the hub, rootless Docker and Hermes Agent on the droplet. |
+| `scripts/check-pi-install.sh <tarball>` | CI, Docker | Installs a real release in a Debian 13 container and measures a rollback. |
 
 The units and templates are in `deploy/pi/` and `deploy/hub/`. The release hooks are in `hooks/`.
 

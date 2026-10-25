@@ -23,9 +23,9 @@ jobs:
       - name: Unit, conformance and end-to-end tests
         run: python -m unittest discover -v -s tests
   deploy:
-    # Static checks of the deploy files: shell scripts, systemd units, tmpfiles and the Caddyfile.
+    # Checks of the deploy files: shell scripts, systemd units, tmpfiles, the Caddyfile and a real Pi install.
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Shellcheck the scripts, hooks and launcher
@@ -55,3 +55,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y caddy
           DOG_DOMAIN=example.com caddy validate --adapter caddyfile --config deploy/hub/Caddyfile
+      - name: Install the real release in Debian 13 and check the commit and the rollback
+        # Real hooks, robotctl and robotd; shims for systemctl and systemd-run (scripts/check-pi-install.sh).
+        run: |
+          tarball=$(scripts/package.sh)
+          docker run --rm -v "$PWD":/repo:ro -w /repo debian:trixie bash scripts/check-pi-install.sh "$tarball"

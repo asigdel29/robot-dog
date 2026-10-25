@@ -5,6 +5,7 @@
 set -euo pipefail
 
 ADMIN_USER=robot
+# scripts/install-pi.sh reads this line, so the list is in one place.
 APT_PACKAGES=(python3-venv python3-opencv python3-numpy python3-evdev alsa-utils)
 MIN_FREE_KB=$((200 * 1024))
 

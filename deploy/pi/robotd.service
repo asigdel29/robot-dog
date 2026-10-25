@@ -9,6 +9,8 @@ StartLimitIntervalSec=0
 [Service]
 Type=notify
 WatchdogSec=2
+TimeoutStartSec=10
+TimeoutStopSec=5
 User=dog
 Group=dog
 ExecStart=/opt/dog/current/.venv/bin/python /opt/dog/current/pi/robotd.py --config /etc/dog/dog.toml
@@ -31,3 +33,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX
+# The IR bridge is a USB serial device (ttyUSB for the CP2102N of the Feather V2, ttyACM for CDC boards).
+DevicePolicy=closed
+DeviceAllow=char-ttyUSB rw
+DeviceAllow=char-ttyACM rw

@@ -29,3 +29,9 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# The camera (video4linux) and the microphone and speaker (alsa) only.
+DevicePolicy=closed
+DeviceAllow=char-video4linux rw
+DeviceAllow=char-alsa rw
+# The filter also blocks ptrace, so mediad cannot reach into robotd, which runs as the same user.
+SystemCallFilter=@system-service

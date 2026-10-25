@@ -11,14 +11,17 @@ import argparse
 import asyncio
 import contextlib
 import datetime
+import fcntl
 import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
+import syslog
 import tarfile
 import tempfile
 import time
@@ -176,6 +179,16 @@ def map_drive(direction, name, registry_path):
 
 # ---------------------------------------------------------------- releases (docs/design/release.md)
 
+#: Longest time of the health gate, in seconds. DOG_HEALTH_WAIT_S changes it for tests.
+HEALTH_WAIT_S = 30
+#: robotd must stay healthy with one PID for this long before a commit. It is longer than WatchdogSec=2.
+SETTLE_S = 10
+HEALTH_POLL_S = 1.0
+HOOK_TIMEOUT_S = 300
+PIP_TIMEOUT_S = 900
+#: The only environment values that go into the dog-update unit. Tokens never do.
+FORWARD_ENV = ("DOG_ROOT", "DOG_RUN_DIR", "DOG_FAKE_VENV", "DOG_HEALTH_WAIT_S")
+
 
 class UpdateError(Exception):
     """An update or rollback that did not commit; the message says which release runs now."""
@@ -192,6 +205,14 @@ def say(text):
         print(text, file=sys.stderr, flush=True)
     except OSError:
         pass
+
+
+def report(text, code):
+    """Print the outcome of an update and record it in the journal, which keeps it after a lost SSH session."""
+    say(text)
+    syslog.openlog("robotctl")
+    syslog.syslog(syslog.LOG_NOTICE if code == EXIT_OK else syslog.LOG_ERR, text)
+    return code
 
 
 def link_version(name):
@@ -216,15 +237,19 @@ def point(name, version):
     os.replace(tmp, link)
 
 
-def quiet(cmd, **kwargs):
+def quiet(cmd, timeout=HOOK_TIMEOUT_S, **kwargs):
     """Run a command with captured output, so a lost terminal cannot break it; raise UpdateError on failure."""
+    name = os.path.basename(cmd[0])
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **kwargs)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout,
+                              **kwargs)
     except OSError as err:  # an absent or non-executable hook must also lead to a rollback
         raise UpdateError(f"cannot run {cmd[0]}: {err}") from None
+    except subprocess.TimeoutExpired:
+        raise UpdateError(f"{name} did not finish in {timeout} s") from None
     if proc.returncode != 0:
         say(proc.stdout[-2000:])
-        raise UpdateError(f"{os.path.basename(cmd[0])} failed with exit code {proc.returncode}")
+        raise UpdateError(f"{name} failed with exit code {proc.returncode}")
 
 
 def check_sha256(tarball):
@@ -281,7 +306,8 @@ def make_venv(release):
         return
     quiet(["python3", "-m", "venv", "--system-site-packages", venv])
     quiet([os.path.join(venv, "bin", "python"), "-m", "pip", "install", "--no-cache-dir",
-           "--disable-pip-version-check", "-r", os.path.join(release, "deploy", "pi", "requirements.txt")])
+           "--disable-pip-version-check", "-r", os.path.join(release, "deploy", "pi", "requirements.txt")],
+          timeout=PIP_TIMEOUT_S)
 
 
 def hook(version, name):
@@ -290,46 +316,79 @@ def hook(version, name):
     quiet([os.path.join(release, "hooks", name)], cwd=release)
 
 
+def robotd_identity():
+    """Return the MainPID and NRestarts of robotd.service; a change means that robotd started again."""
+    try:
+        text = subprocess.run(["systemctl", "show", "robotd", "-p", "MainPID", "-p", "NRestarts"],
+                              capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return sorted(line for line in text.splitlines() if "=" in line)
+
+
 def health_gate():
-    """Poll robot.state for DOG_HEALTH_WAIT_S (30 s); return ok, degraded, fault, or None for no answer."""
-    deadline = time.monotonic() + float(os.environ.get("DOG_HEALTH_WAIT_S", "30"))
+    """Return the health ("ok" or "degraded") of a robotd that stays healthy; raise UpdateError with the reason if not.
+
+    The gate polls robot.state for at most DOG_HEALTH_WAIT_S (30 s). It commits only after SETTLE_S
+    (10 s; a third of a shorter test gate) of ok or degraded answers with one robotd MainPID and
+    NRestarts. A fault, a lost answer after a good one, or a robotd restart fails at once.
+    """
+    wait = float(os.environ.get("DOG_HEALTH_WAIT_S", HEALTH_WAIT_S))
+    settle = min(SETTLE_S, wait / 3)
+    deadline = time.monotonic() + wait
+    since, identity = None, None
     while (remaining := deadline - time.monotonic()) > 0:
         try:
             health = rpc("robot.state", timeout=min(2.0, remaining)).get("health")
         except (dogproto.RpcError, OSError, TimeoutError):
             health = None
-        if health in ("ok", "degraded", "fault"):
-            return health
-        time.sleep(max(0.0, min(1.0, deadline - time.monotonic())))
-    return None
+        if health == "fault":
+            raise UpdateError("health fault")
+        if health in ("ok", "degraded"):
+            if since is None:
+                since, identity = time.monotonic(), robotd_identity()
+            elif robotd_identity() != identity:
+                raise UpdateError("robotd started again during the gate")
+            if time.monotonic() - since >= settle:
+                return health
+        elif since is not None:
+            raise UpdateError("robotd stopped answering")
+        time.sleep(max(0.0, min(HEALTH_POLL_S, deadline - time.monotonic())))
+    raise UpdateError("no stable health" if since is not None else "no answer")
 
 
-def activate(version):
-    """Make a release current, restart dog.target and apply the health gate; on failure restore the old release."""
-    old, old_previous = link_version("current"), link_version("previous")
-    point("current", version)
-    if old:
-        point("previous", old)
-    try:
-        hook(version, "postinstall")
-        quiet(["systemctl", "restart", "dog.target"])
-        health = health_gate()
-    except UpdateError as err:
-        say(str(err))
-        health = None
-    if health in ("ok", "degraded"):
-        say(f"{version} is current, health {health}")
-        return {"current": version, "previous": old, "health": health}
-    reason = f"{version}: health {health or 'no answer'}"
+def restore(old, old_previous):
+    """Undo a release change: make the old release current again, or leave none current after a first install."""
     if old is None:
-        raise UpdateError(f"{reason}; there is no earlier release, so {version} stays current")
+        point("current", None)
+        with contextlib.suppress(UpdateError):
+            quiet(["systemctl", "stop", "dog.target"])
+        return "no release is current and dog.target is stopped; correct the fault and apply again"
     point("current", old)
     point("previous", old_previous)
     with contextlib.suppress(UpdateError):
         hook(old, "postinstall")
     with contextlib.suppress(UpdateError):
         quiet(["systemctl", "restart", "dog.target"])
-    raise UpdateError(f"{reason}; rolled back to {old}")
+    return f"rolled back to {old}"
+
+
+def activate(version):
+    """Make a release current, restart dog.target and apply the health gate; on any failure undo the change."""
+    old, old_previous = link_version("current"), link_version("previous")
+    try:
+        point("current", version)
+        if old:
+            point("previous", old)
+        hook(version, "postinstall")
+        quiet(["systemctl", "restart", "dog.target"])
+        health = health_gate()
+    except UpdateError as err:
+        raise UpdateError(f"{version}: {err}; {restore(old, old_previous)}") from None
+    except BaseException:
+        restore(old, old_previous)
+        raise
+    return {"current": version, "previous": old, "health": health}
 
 
 def prune():
@@ -369,9 +428,27 @@ def update_status():
     return {"current": link_version("current"), "previous": link_version("previous"), "releases": names}
 
 
+@contextlib.contextmanager
+def update_lock():
+    """Hold an exclusive lock on /opt/dog/.lock, so that two updates never run at the same time."""
+    os.makedirs(dog_root(), exist_ok=True)
+    with open(os.path.join(dog_root(), ".lock"), "w") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise UpdateError("another update is active") from None
+        yield
+
+
+def on_sigterm(signum, frame):
+    """Turn the first SIGTERM into SystemExit, so that activate() undoes the release change; ignore later ones."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise SystemExit(128 + signum)
+
+
 def in_own_unit(argv):
     """Run this command again in the dog-update systemd unit, so a lost SSH session cannot stop it halfway."""
-    env = [f"--setenv={key}={value}" for key, value in os.environ.items() if key.startswith("DOG_")]
+    env = [f"--setenv={key}={os.environ[key]}" for key in FORWARD_ENV if key in os.environ]
     cmd = ["systemd-run", "--unit=dog-update", "--wait", "--collect", "--pipe", *env,
            "--", sys.executable, os.path.realpath(__file__), *argv]
     return subprocess.run(cmd).returncode
@@ -421,22 +498,25 @@ def build_parser():
 
 def run_update(args):
     """Run one update command and return its exit code; apply and rollback move into their own unit first."""
-    if args.update != "status" and not os.environ.get("INVOCATION_ID"):
+    if args.update == "status":
+        out(update_status())
+        return EXIT_OK
+    if not os.environ.get("INVOCATION_ID"):
         tail = [os.path.abspath(args.tarball)] if args.update == "apply" else []
         return in_own_unit(["--config", args.config, "update", args.update, *tail])
+    signal.signal(signal.SIGTERM, on_sigterm)
     try:
-        if args.update == "apply":
-            out(update_apply(args.tarball))
-        elif args.update == "rollback":
-            out(update_rollback())
-        else:
-            out(update_status())
+        with update_lock():
+            result = update_apply(args.tarball) if args.update == "apply" else update_rollback()
     except InputError as err:
-        say(str(err))
-        return EXIT_INPUT
+        return report(f"update refused: {err}", EXIT_INPUT)
     except (UpdateError, OSError) as err:
-        say(f"update did not commit: {err}")
-        return EXIT_REFUSED
+        return report(f"update did not commit: {err}", EXIT_REFUSED)
+    report(f"update committed: {result['current']} is current with health {result['health']}", EXIT_OK)
+    try:
+        out(result)
+    except BrokenPipeError:  # the SSH session is gone; the journal has the outcome
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
     return EXIT_OK
 
 

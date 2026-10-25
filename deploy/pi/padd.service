@@ -16,7 +16,6 @@ RestartSec=1
 Environment=PYTHONUNBUFFERED=1
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/run/dog
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes
@@ -28,3 +27,8 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX
+# The gamepad (input event devices), read only.
+DevicePolicy=closed
+DeviceAllow=char-input r
+# The filter also blocks ptrace, so padd cannot reach into robotd, which runs as the same user.
+SystemCallFilter=@system-service

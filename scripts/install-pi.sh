@@ -5,9 +5,6 @@
 # The release hooks do every other change to the board, so later releases need only deploy-pi.sh.
 set -euo pipefail
 
-# Keep this list in step with APT_PACKAGES in hooks/preinstall.
-APT_PACKAGES=(python3 python3-venv python3-opencv python3-numpy python3-evdev alsa-utils)
-
 if [[ $# -ne 1 ]]; then
 	echo "usage: sudo $0 dog-<version>.tar.gz" >&2
 	exit 3
@@ -18,12 +15,18 @@ if [[ $EUID -ne 0 ]]; then
 fi
 tarball=$(realpath "$1")
 (cd "$(dirname "$tarball")" && sha256sum --check --quiet "$(basename "$tarball").sha256")
-
-apt-get update
-apt-get install -y "${APT_PACKAGES[@]}"
-
-# No release is current yet, so run robotctl from the new tarball with the system python3 (it needs only the stdlib).
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-tar -xzf "$tarball" -C "$work" pi
+tar -xzf "$tarball" -C "$work" pi hooks
+
+# The apt list is the APT_PACKAGES line of hooks/preinstall, so the hook checks the same packages.
+read -ra packages <<<"$(sed -n 's/^APT_PACKAGES=(\(.*\))$/\1/p' "$work/hooks/preinstall")"
+if ((${#packages[@]} == 0)); then
+	echo "install-pi.sh: no APT_PACKAGES line in hooks/preinstall" >&2
+	exit 1
+fi
+apt-get update
+apt-get install -y python3 "${packages[@]}"
+
+# No release is current yet, so run robotctl from the new tarball with the system python3 (it needs only the stdlib).
 python3 "$work/pi/robotctl.py" update apply "$tarball"

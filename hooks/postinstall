@@ -12,11 +12,12 @@ for unit in dog.target robotd.service mediad.service padd.service linkd.service;
 	install -m 0644 "$units/$unit" "/etc/systemd/system/$unit"
 done
 install -m 0644 "$units/dog-tmpfiles.conf" /etc/tmpfiles.d/dog.conf
+install -m 0644 "$units/dog-modules.conf" /etc/modules-load.d/dog.conf
 install -m 0755 "$units/robotctl" /usr/local/bin/robotctl
 systemctl daemon-reload
 systemd-tmpfiles --create /etc/tmpfiles.d/dog.conf
 
-# /etc/dog is setgid group dog and group-writable, so robotctl (run by the admin user) can replace registry.json.
+# /etc/dog is setgid group dog and group-writable, so robotctl (run by a member of dog) can replace registry.json.
 install -d -o root -g dog -m 2775 /etc/dog
 
 # seed copies a template to /etc/dog only when the target is absent, with the given owner and mode.
@@ -27,7 +28,7 @@ seed() {
 	fi
 }
 seed "$release/config/dog.toml" /etc/dog/dog.toml root:dog 0644
-seed "$release/config/registry.json" /etc/dog/registry.json robot:dog 0664
+seed "$release/config/registry.json" /etc/dog/registry.json root:dog 0664
 seed "$units/link.env.example" /etc/dog/link.env doglink:doglink 0600
 seed "$units/console.env.example" /etc/dog/console.env root:dog 0640
 

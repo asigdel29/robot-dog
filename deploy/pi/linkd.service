@@ -12,7 +12,8 @@ StartLimitIntervalSec=0
 User=doglink
 Group=doglink
 EnvironmentFile=/etc/dog/link.env
-ExecStart=/opt/dog/current/.venv/bin/python /opt/dog/current/pi/linkd.py --config /etc/dog/dog.toml
+# linkd takes no arguments; it reads only /etc/dog/link.env.
+ExecStart=/opt/dog/current/.venv/bin/python /opt/dog/current/pi/linkd.py
 Restart=always
 RestartSec=1
 Environment=PYTHONUNBUFFERED=1
@@ -21,6 +22,7 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
+DevicePolicy=closed
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

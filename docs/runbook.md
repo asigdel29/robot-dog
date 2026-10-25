@@ -8,6 +8,8 @@ This runbook gives the procedures for phase 4 (the droplet) and phase 6 (the Pi)
 
 `docs/design/release.md` owns the release mechanism. This runbook only tells you how to use it.
 
+Merge order: merge the phase 4 branch after the phase 3 branches. The mediad, padd and linkd units start daemons that only the phase 3 branches contain. Before that merge, those three units restart in a loop on the Pi.
+
 ## 1. Phase 4: install the droplet
 
 ### 1.1 Accounts and the droplet (Owner)
@@ -39,15 +41,29 @@ The script does these steps on the droplet:
 - It installs `caddy`, `ufw`, `python3-venv`, `uidmap`, `dbus-user-session` and Docker from the Docker apt repository.
 - It stops the root Docker daemon. A member of the `docker` group has root access, and root Docker bypasses ufw.
 - It creates the users `doghub` (system user, no login) and `hermes` (normal user, no password).
-- It lets only ports 22, 80 and 443 through ufw.
+- It lets ports 22, 80 and 443 through ufw. When ufw is already active, the script adds these ports and keeps the default policies.
 - It runs `loginctl enable-linger hermes` and starts rootless Docker for `hermes`.
 - It creates `/etc/doghub/hub.env` and `~hermes/.hermes/.env` with new random values for `DEVICE_TOKEN`, `TOOLS_TOKEN` and the API server key.
 - It copies `hermes-config.yaml` and `SOUL.md` into `~hermes/.hermes/` before the Hermes installer runs. Hermes keeps a `SOUL.md` that is already there.
-- It runs the official Hermes installer as `hermes` with `--non-interactive`. Then it installs the gateway as a user service.
+- It downloads `scripts/install.sh` of the pinned Hermes release tag and checks its sha256. Then it runs that file as `hermes` with `--non-interactive` and the pinned commit, and installs the gateway as a user service.
 - It copies `hub/` to `/opt/doghub/hub/`, makes `/opt/doghub/.venv` and installs `hub/requirements.txt`.
-- It installs `doghub.service`, the Caddyfile and a Caddy drop-in that sets `DOG_DOMAIN`.
+- It installs `doghub.service`, the Caddyfile and a Caddy drop-in that sets `DOG_DOMAIN`. It replaces only the Ubuntu default Caddyfile (kept as `/etc/caddy/Caddyfile.ubuntu-default`) or an earlier dog Caddyfile. It stops before it changes another Caddyfile.
+- It writes each new secret through a here-doc, so a secret never appears in a process argument list. It stops when a new token is empty.
 
-### 1.3 Add the keys
+### 1.3 Update the Hermes pin
+
+`scripts/deploy-hub.sh` installs one pinned Hermes release. Three values at the top of the script give the pin. Change them together:
+
+1. Find the new release tag on the NousResearch/hermes-agent releases page, for example `v0.23.0`.
+2. Run `curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/<tag>/scripts/install.sh | sha256sum`.
+3. Read the downloaded `install.sh` before you trust it. Examine its new flags and its new downloads.
+4. Run `gh api repos/NousResearch/hermes-agent/commits/<tag> --jq .sha` to get the commit of the tag.
+5. Write the tag in `HERMES_TAG`, the hash in `HERMES_INSTALLER_SHA256` and the commit in `HERMES_COMMIT`.
+6. Make a commit of the change.
+
+The pin applies to a new install only. On a droplet that already has Hermes, run `sudo -iu hermes hermes update`. Then run the phase 4 checks again.
+
+### 1.4 Add the keys
 
 Do these steps on the droplet. `sudoedit` keeps the file owner and mode.
 
@@ -64,7 +80,7 @@ Do these steps on the droplet. `sudoedit` keeps the file owner and mode.
 
 The `look` tool returns a JPEG image. A model that accepts only text cannot see that image, so the model must accept images.
 
-### 1.4 Pair the owner in Telegram
+### 1.5 Pair the owner in Telegram
 
 1. **(Owner)** Send a direct message to the bot. The bot replies with a pair code.
 2. **(Owner)** Send the pair code to the implementer.
@@ -76,7 +92,7 @@ The `look` tool returns a JPEG image. A model that accepts only text cannot see 
 
 With `ignore`, Hermes gives no answer to a direct message from an account that is not on the allowlist.
 
-### 1.5 Phase 4 checks
+### 1.6 Phase 4 checks
 
 Do each check. Write each result in `docs/test-log.md`, with the date, the command and the measured value.
 
@@ -97,7 +113,7 @@ Do each check. Write each result in `docs/test-log.md`, with the date, the comma
 | Tools need the token | On the droplet, run `curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8000/tools/`. | `401`. |
 | Root Docker is off | `systemctl is-active docker.service` | `inactive`. |
 
-### 1.6 Privacy and cost after phase 4
+### 1.7 Privacy and cost after phase 4
 
 - Hermes keeps transcripts and tool images in `~hermes/.hermes/`. Delete old files on a schedule.
 - The hub keeps no audio and no images. It keeps only the daily totals in `/var/lib/doghub/usage.json`.
@@ -132,7 +148,9 @@ The Bookworm release of Raspberry Pi OS is not correct for this project. Its Ope
 5. Run `ssh -t robot-pi sudo bash install-pi.sh dog-<version>.tar.gz`.
 6. Make sure that the last output line shows `health` with the value `degraded` or `ok`.
 
-`install-pi.sh` installs the apt packages. Then it runs `robotctl update apply` from the new tarball. The hooks create the users, the directories, the units and the `/etc/dog` files.
+`install-pi.sh` installs the apt packages. Then it runs `robotctl update apply` from the new tarball. The hooks create the users, the directories, the units and the `/etc/dog` files. The health gate commits approximately 10 s after the restart.
+
+When the first install fails, no release is current and `dog.target` is stopped. Correct the fault and run step 5 again with the same tarball.
 
 ### 2.3 Configure the Pi
 
@@ -156,6 +174,7 @@ The LAN console of mediad is plain HTTP on `console_port` in the `[mediad]` sect
 | --- | --- | --- |
 | Units after a reboot | `sudo reboot`, then `systemctl is-active robotd mediad padd linkd` | Each line is `active`. |
 | Start never arms | `robotctl state` | `"armed": false`. |
+| Bridge access through the device policy | Connect the Feather, then run `robotctl state`. | `"esp"` shows a board state, not a link failure. |
 | Releases | `robotctl update status` | `current` is the new version. |
 | Rollback time | The procedure in section 2.5. | The old release is current again in 40 s or less. |
 
@@ -186,6 +205,7 @@ When the SSH connection stops during an update, the update continues on the Pi. 
 | --- | --- |
 | A daemon on the Pi | `journalctl -u robotd -b` (or `mediad`, `padd`, `linkd`) |
 | The hub | `journalctl -u doghub -b` |
+| The result of each update on the Pi | `journalctl -t robotctl` |
 | Caddy | `journalctl -u caddy -b` |
 | The Hermes gateway | `sudo -iu hermes journalctl --user -u hermes-gateway -b` |
 
@@ -195,8 +215,8 @@ The Hermes docs were read on 2026-10-25 (`https://hermes-agent.nousresearch.com/
 
 | Item | Where it is used | Status and check |
 | --- | --- | --- |
-| Rootless Docker as the terminal backend | `terminal.backend: docker` with the `rootless` CLI context of `hermes` | The docs do not describe rootless Docker. Check that `sudo -iu hermes docker info` shows `rootless`, and do the terminal checks in section 1.5. |
-| `curl ... \| bash -s -- --non-interactive` | `deploy-hub.sh` | `install.sh` accepts `--non-interactive`. The docs show the `bash -s --` form only with `--dir`. Check that `~hermes/.local/bin/hermes` exists after the script. |
+| Rootless Docker as the terminal backend | `terminal.backend: docker` with the `rootless` CLI context of `hermes` | The docs do not describe rootless Docker. Check that `sudo -iu hermes docker info` shows `rootless`, and do the terminal checks in section 1.6. |
+| `install.sh --non-interactive --commit <sha>` | `deploy-hub.sh` | The docs give `--non-interactive`. `--commit` is in the usage text of `install.sh`, not in the docs. Check that `~hermes/.local/bin/hermes` exists after the script. |
 | `hermes gateway install --if-missing` | `deploy-hub.sh` | The flag is in `install.sh`, not in the CLI reference. Check `sudo -iu hermes systemctl --user status hermes-gateway`. |
 | Default of `agent.max_turns` | `hermes-config.yaml` sets 40 | The docs give two defaults (unlimited and 500). The template sets an explicit value, so the default does not apply. |
 | Default of the tool server `timeout` | `hermes-config.yaml` sets 60 | The docs give 300 in a table and 120 in an example. The template sets an explicit value. |
