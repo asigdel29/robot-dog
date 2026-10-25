@@ -489,7 +489,6 @@ class Robotd:
             link.send({"op": "hello", "sid": self._sid})
             await asyncio.wait({self._hello}, timeout=0.5)
         hello = self._hello.result()
-        self.esp_state = hello.get("state", "?")
         loaded = 0
         if self.registry is not None:
             for name, cmd in self.registry["commands"].items():
@@ -498,6 +497,8 @@ class Robotd:
                     loaded += 1
         self._loaded = loaded
         self._esp_rx = time.monotonic()
+        # Report the bridge state only now: a client that sees DISARMED must be able to arm at once.
+        self.esp_state = hello.get("state", "?")
         self.link_up = True
         log.info("esp32 link up: fw=%s boot=%s loaded=%d", hello.get("fw"), hello.get("boot"), loaded)
 
