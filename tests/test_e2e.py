@@ -104,8 +104,9 @@ class RobotdStack(unittest.TestCase):
                     await asyncio.sleep(0.03)
                     before = time.monotonic_ns()
                     await local.call("robot.stop")
-                    with self.assertRaises(dogproto.RpcError):
+                    with self.assertRaises(dogproto.RpcError) as ctx:
                         await drive
+                    self.assertEqual(ctx.exception.code, dogproto.PREEMPTED)
                     stops = self.stack.wait_ops("stop", 1, since_ns=before)
                     samples.append((stops[0][0] - before) / 1e6)
             finally:
@@ -140,8 +141,28 @@ class RobotdStack(unittest.TestCase):
         last_tx = max(t for t, m in out if m.get("ev") == "tx" and m.get("id"))
         fault = min(t for t, m in out if m.get("ev") == "fault" and t > killed)
         print(f"\nafter kill: last repeat {(last_tx - killed) / 1e6:.0f} ms, fault {(fault - killed) / 1e6:.0f} ms")
+        self.assertGreater(last_tx, killed, "no repeat frame after the kill: the hold was not running")
         self.assertLessEqual((last_tx - killed) / 1e6, 400)
         self.assertLessEqual((fault - killed) / 1e6, 1100)
+
+    def test_owner_disconnect_stops_hold(self):
+        self.arm()
+
+        async def close_during_drive():
+            client = await dogproto.Client.connect(self.stack.sock("robotd", cloud=True))
+            drive = asyncio.ensure_future(client.call("robot.drive", {"dir": "forward", "ms": 1000, "id": aid()}))
+            await asyncio.sleep(0.2)
+            closed_ns = time.monotonic_ns()
+            await client.close()
+            with contextlib.suppress(Exception):
+                await drive
+            return closed_ns
+
+        closed = asyncio.run(close_during_drive())
+        stops = self.stack.wait_ops("stop", 1, since_ns=closed)
+        self.assertTrue(stops, "robotd kept the hold after its owner closed")
+        print(f"\nowner close to stop: {(stops[0][0] - closed) / 1e6:.1f} ms")
+        self.assertLess((stops[0][0] - closed) / 1e6, 100)
 
     def test_restart_starts_disarmed(self):
         self.arm()

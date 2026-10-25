@@ -1,9 +1,12 @@
-"""Unit tests for the pure parts of robotd, dogproto and robotctl: rules, mappings, geometry."""
+"""Unit tests for robotd, dogproto and robotctl: rules, mappings, geometry, and in-process ordering checks."""
 
+import asyncio
 import copy
+import json
 import math
 import os
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -52,7 +55,30 @@ class RegistryRules(unittest.TestCase):
         self.assertTrue(robotd.check_registry(demo(bark={"natural_ms": 20000})))
 
     def test_toggle_protocol_refused(self):
-        self.assertTrue(robotd.check_registry(demo(bark={"ir": {"proto": "RC5", "addr": 0, "cmd": 1}})))
+        errors = robotd.check_registry(demo(bark={"ir": {"proto": "RC5", "addr": 0, "cmd": 1}}))
+        self.assertTrue(any("protocol RC5 refused" in e for e in errors), errors)
+
+    def test_run_times_are_bounded(self):
+        self.assertTrue(robotd.check_registry(demo(dance={"max_run_ms": 3600000})))
+        self.assertTrue(robotd.check_registry(demo(dance={"max_run_ms": "3000"})))
+        doc = demo()
+        doc["goto"]["forward_ms"] = 30000
+        self.assertTrue(robotd.check_registry(doc))
+
+    def test_wrong_types_do_not_crash(self):
+        for doc in ({"schema": 1, "commands": {"x": 5}}, {"schema": 1, "drive": []}, {"schema": 1, "goto": None}):
+            self.assertTrue(robotd.check_registry(doc))
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump({"schema": 1, "commands": {"x": 5}}, handle)
+        registry, errors = robotd.load_registry(handle.name)
+        self.assertIsNone(registry)
+        self.assertTrue(errors)
+
+    def test_cloud_capabilities_need_cloud_flag(self):
+        doc = demo(forward={"cloud": False})
+        self.assertTrue(robotd.capabilities(doc)["drive"]["forward"])
+        self.assertFalse(robotd.capabilities(doc, cloud=True)["drive"]["forward"])
+        self.assertFalse(robotd.capabilities(doc, cloud=True)["goto"])
 
     def test_drive_must_be_hold(self):
         doc = demo()
@@ -163,6 +189,127 @@ class Capture(unittest.TestCase):
         self.assertEqual(entry["ir"]["proto"], "raw")
         with self.assertRaises(robotctl.InputError):
             robotctl.entry_from_captures([raw, {**raw, "raw": [2000, 500, 1000, 500]}, raw], [raw])
+
+
+class StubLink:
+    """A bridge link that answers ops at once, in the same loop turn as a real fast reply."""
+
+    def __init__(self, daemon, on_op=None):
+        self.daemon = daemon
+        self.ops = []
+        self.on_op = on_op
+
+    def send(self, obj):
+        self.ops.append(obj)
+        if self.on_op is not None and self.on_op(self, obj):
+            return
+        if "id" in obj:
+            loop = asyncio.get_running_loop()
+            loop.call_soon(self.daemon._on_esp, {"ev": "ack", "id": obj["id"]})
+            if obj["op"] == "send":
+                loop.call_soon(self.daemon._on_esp, {"ev": "tx", "id": obj["id"], "frames": 1})
+                loop.call_soon(self.daemon._on_esp, {"ev": "done", "id": obj["id"]})
+
+    def close(self):
+        pass
+
+    def names(self):
+        """Return ops as short strings such as 'send dance' or 'stop'."""
+        return [f"{o['op']} {o['name']}" if "name" in o else o["op"] for o in self.ops]
+
+
+class Conn:
+    """A stand-in for dogproto.Conn."""
+
+    def __init__(self, cloud):
+        self.cloud = cloud
+
+
+class InProcess(unittest.IsolatedAsyncioTestCase):
+    """robotd handlers with a stub link: ordering and race rules that need exact control."""
+
+    def make(self, registry=None, on_op=None):
+        path = os.path.join(tempfile.mkdtemp(), "registry.json")
+        with open(path, "w") as handle:
+            json.dump(DEMO_REGISTRY if registry is None else registry, handle)
+        daemon = robotd.Robotd("/nonexistent", path)
+        daemon.link = StubLink(daemon, on_op)
+        daemon.link_up = True
+        daemon.armed = True
+        return daemon
+
+    async def test_stop_in_same_turn_as_ack_is_not_lost(self):
+        """A stop that lands with the first hold ack must end the drive (Python 3.11 wait_for drops it)."""
+        def ack_then_stop(link, obj):
+            if obj["op"] == "hold" and link.names().count("hold forward") == 1:
+                def both():
+                    link.daemon._on_esp({"ev": "ack", "id": obj["id"]})
+                    link.daemon._esp_quiet("stop")
+                    link.daemon._cancel_action("stopped")
+                asyncio.get_running_loop().call_soon(both)
+                return True
+            return False
+
+        daemon = self.make(on_op=ack_then_stop)
+        with self.assertRaises(dogproto.RpcError) as ctx:
+            await daemon.h_drive({"dir": "forward", "ms": 600, "id": "a"}, Conn(True))
+        self.assertEqual(ctx.exception.code, dogproto.PREEMPTED)
+        names = daemon.link.names()
+        self.assertEqual(names[names.index("stop"):].count("hold forward"), 0, names)
+
+    async def test_disarm_during_perpetual_sends_stop_command_first(self):
+        daemon = self.make()
+        task = asyncio.ensure_future(daemon.h_do({"trick": "dance", "id": "d"}, Conn(True)))
+        await asyncio.sleep(0.05)
+        daemon._disarm("request")
+        with self.assertRaises(dogproto.RpcError):
+            await task
+        names = daemon.link.names()
+        self.assertEqual(names[names.index("send dance"):], ["send dance", "stop", "send stop", "disarm"])
+
+    async def test_stick_preempt_of_perpetual_sends_stop_command_before_hold(self):
+        daemon = self.make()
+        task = asyncio.ensure_future(daemon.h_do({"trick": "dance", "id": "d"}, Conn(True)))
+        await asyncio.sleep(0.05)
+        daemon._drive_stick("left")
+        with self.assertRaises(dogproto.RpcError):
+            await task
+        daemon._drive_stick("left")
+        names = daemon.link.names()
+        self.assertEqual(names[names.index("send dance"):], ["send dance", "send stop", "hold left"])
+
+    async def test_cloud_drive_needs_cloud_flag(self):
+        daemon = self.make(registry=demo(forward={"cloud": False}))
+        with self.assertRaises(dogproto.RpcError) as ctx:
+            await daemon.h_drive({"dir": "forward", "ms": 300, "id": "a"}, Conn(True))
+        self.assertEqual(ctx.exception.code, dogproto.UNAVAILABLE)
+        self.assertFalse(daemon.state(Conn(True))["caps"]["drive"]["forward"])
+        await daemon.h_drive({"dir": "forward", "ms": 100, "id": "b"}, Conn(False))
+
+    async def test_bad_marker_is_refused_and_does_not_wedge(self):
+        daemon = self.make()
+        with self.assertRaises(dogproto.RpcError):
+            await daemon.h_observe({"t_mono_ns": 1, "markers": {"1": 5}}, Conn(False))
+        result = await daemon.h_do({"trick": "bark", "id": "b"}, Conn(True))
+        self.assertTrue(result["transmitted"])
+
+    async def test_nan_never_reaches_the_stick(self):
+        with self.assertRaises(ValueError):
+            dogproto.decode('{"jsonrpc":"2.0","method":"robot.move","params":{"vx":NaN,"vyaw":0}}')
+        with self.assertRaises(dogproto.RpcError):
+            dogproto.validate("robot.move", {"vx": float("nan"), "vyaw": 0.0})
+        daemon = self.make()
+        with self.assertRaises(dogproto.RpcError):
+            await daemon.h_move({"vx": float("inf"), "vyaw": 0.0}, Conn(False))
+
+    async def test_failed_action_id_is_not_run_again(self):
+        daemon = self.make()
+        daemon._observed = lambda before: 1 / 0
+        for _ in range(2):
+            with self.assertRaises(dogproto.RpcError) as ctx:
+                await daemon.h_do({"trick": "bark", "id": "same"}, Conn(True))
+            self.assertEqual(ctx.exception.code, dogproto.INTERNAL_ERROR)
+        self.assertEqual(daemon.link.names().count("send bark"), 1)
 
 
 if __name__ == "__main__":
