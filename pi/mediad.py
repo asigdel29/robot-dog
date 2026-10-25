@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import tomllib
+import uuid
 
 import cv2
 import numpy as np
@@ -36,6 +37,9 @@ FAKE_MARKER_PX = 36  # 6 px for each cell of a 4x4 marker with its border
 FAKE_MARGIN_PX = 6  # white quiet zone around each fake marker
 FAKE_FLOOR_GRAY = 150
 JPEG_QUALITY = 80
+REC_RATE = 16000
+MIN_UTTERANCE_MS = 300
+MAX_UTTERANCE_S = 10
 MAX_PLAY_S = 30
 PLAY_RATES = (8000, 48000)
 PLAY_QUEUE_MAX = 16
@@ -202,13 +206,17 @@ class Mediad:
         self.mic = mic
         self.frame = None  # (t_mono_ns, BGR image)
         self.robotd = None
+        self._subscribers = set()
         self._queue = asyncio.Queue()
         self._playing = None
+        self._ptt_owner = None  # the connection that holds push-to-talk down
+        self._ptt_up = None
+        self._recording = None
 
     def handlers(self):
         """Return the method table for dogproto.serve."""
-        return {"media.snapshot": self.h_snapshot,
-                "audio.play": self.h_play, "audio.stop": self.h_stop}
+        return {"media.snapshot": self.h_snapshot, "media.subscribe": self.h_subscribe,
+                "audio.play": self.h_play, "audio.stop": self.h_stop, "audio.ptt": self.h_ptt}
 
     def on_frame(self, t_ns, frame, markers):
         """Keep the newest frame and send its marker poses to robotd; never waits on robotd."""
@@ -226,6 +234,11 @@ class Mediad:
             raise RpcError(dogproto.UNAVAILABLE, "no camera frame yet")
         age_ms = self.frame_age_ms()
         return await asyncio.to_thread(encode_jpeg, self.frame[1], max_px), age_ms
+
+    def _notify(self, method, params):
+        """Send one notification to each media.subscribe connection."""
+        for conn in list(self._subscribers):
+            conn.notify(method, params)
 
     async def player(self):
         """Play the queued items one at a time; cut() cancels the current one."""
@@ -269,6 +282,44 @@ class Mediad:
                 proc.kill()
                 await proc.wait()
 
+    async def _record(self, ptt_up):
+        """Record until ptt_up or the 10 s cap; send the utterance unless it is shorter than 300 ms."""
+        try:
+            pcm = await (self._fake_capture(ptt_up) if self.fake_audio else self._arecord(ptt_up))
+        except OSError as exc:
+            log.error("recording failed: %s", exc)
+            return
+        ms = len(pcm) * 1000 // (2 * REC_RATE)
+        if ms < MIN_UTTERANCE_MS:
+            log.info("utterance of %d ms dropped", ms)
+            return
+        self._notify("media.utterance", {"id": uuid.uuid4().hex, "rate": REC_RATE,
+                                         "pcm16_b64": base64.b64encode(pcm).decode()})
+
+    async def _fake_capture(self, ptt_up):
+        """Return silence as long as the press, capped at 10 s."""
+        start = time.monotonic()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(ptt_up.wait(), MAX_UTTERANCE_S)
+        return bytes(2 * int(min(time.monotonic() - start, MAX_UTTERANCE_S) * REC_RATE))
+
+    async def _arecord(self, ptt_up):
+        """Return the PCM that arecord gives until ptt_up or the 10 s cap."""
+        proc = await asyncio.create_subprocess_exec(
+            "arecord", "-q", "-D", self.mic, "-t", "raw", "-f", "S16_LE", "-c", "1", "-r", str(REC_RATE),
+            stdout=asyncio.subprocess.PIPE)
+        reader = asyncio.ensure_future(proc.stdout.readexactly(int(MAX_UTTERANCE_S * REC_RATE * 2)))
+        waiter = asyncio.ensure_future(ptt_up.wait())
+        await asyncio.wait({reader, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        waiter.cancel()
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+        try:
+            return await reader
+        except asyncio.IncompleteReadError as exc:
+            return exc.partial
+
     async def h_snapshot(self, params, conn):
         """media.snapshot: return the newest frame as a JPEG with its age."""
         max_px = params.get("max_px", FRAME_W)
@@ -276,6 +327,12 @@ class Mediad:
             raise RpcError(dogproto.INVALID_PARAMS, f"max_px must be {SNAPSHOT_PX[0]}..{SNAPSHOT_PX[1]}")
         jpeg, age_ms = await self.snapshot(max_px)
         return {"jpeg_b64": base64.b64encode(jpeg).decode(), "age_ms": age_ms}
+
+    async def h_subscribe(self, params, conn):
+        """media.subscribe: send media.utterance and media.bargein to this connection until it closes."""
+        self._subscribers.add(conn)
+        conn.on_close.append(lambda: self._subscribers.discard(conn))
+        return {}
 
     async def h_play(self, params, conn):
         """audio.play: queue one PCM16 mono item of 30 s or less; refused while push-to-talk is down."""
@@ -299,6 +356,26 @@ class Mediad:
         """audio.stop: stop the speaker and clear the queue."""
         self.cut()
         return {}
+
+    async def h_ptt(self, params, conn):
+        """audio.ptt: down cuts the speaker, sends media.bargein and records; the press ends on up or close of conn."""
+        if not params["down"]:
+            self._release_ptt()
+            return {}
+        self.cut()
+        self._notify("media.bargein", {})
+        if self._ptt_owner is None:
+            self._ptt_owner = conn
+            if self._recording is None or self._recording.done():
+                self._ptt_up = asyncio.Event()
+                self._recording = asyncio.ensure_future(self._record(self._ptt_up))
+        return {}
+
+    def _release_ptt(self):
+        """End the press; audio.play works again."""
+        self._ptt_owner = None
+        if self._ptt_up is not None:
+            self._ptt_up.set()
 
 
 # ---------------------------------------------------------------- start-up

@@ -6,9 +6,11 @@ scripts on PATH, so the real subprocess paths run too. The barge-in latency is
 printed so a run can go into docs/test-log.md.
 """
 
+import asyncio
 import base64
 import math
 import os
+import statistics
 import sys
 import time
 import types
@@ -100,6 +102,71 @@ class MediaStack(unittest.TestCase):
             self.media("media.snapshot", {"max_px": 0})
         self.assertEqual(ctx.exception.code, dogproto.INVALID_PARAMS)
 
+    def subscribe_and_press(self, hold_s, wait_s):
+        """Subscribe on the cloud socket like linkd, press ptt for hold_s, and return the notifications."""
+        got = []
+
+        async def scenario():
+            sub = await dogproto.Client.connect(self.stack.sock("mediad", cloud=True),
+                                                on_notify=lambda method, params: got.append((method, params)))
+            pad = await dogproto.Client.connect(self.stack.sock("mediad"))
+            try:
+                await sub.call("media.subscribe")
+                await pad.call("audio.ptt", {"down": True})
+                await asyncio.sleep(hold_s)
+                await pad.call("audio.ptt", {"down": False})
+                await asyncio.sleep(wait_s)
+            finally:
+                await sub.close()
+                await pad.close()
+
+        asyncio.run(scenario())
+        return got
+
+    def test_ptt_sends_bargein_then_utterance(self):
+        short = self.subscribe_and_press(0.1, 0.3)
+        self.assertEqual([method for method, _ in short], ["media.bargein"], "a short press is dropped")
+        got = self.subscribe_and_press(0.5, 0.3)
+        self.assertEqual([method for method, _ in got], ["media.bargein", "media.utterance"])
+        utterance = got[1][1]
+        self.assertEqual(utterance["rate"], 16000)
+        seconds = len(base64.b64decode(utterance["pcm16_b64"])) / 2 / 16000
+        self.assertAlmostEqual(seconds, 0.5, delta=0.15)
+        self.assertTrue(utterance["id"])
+
+    def test_ptt_cuts_playback_within_100ms(self):
+        """audio.play, then ptt down: the fake speaker logs the cut; 10 trials."""
+        two_s = base64.b64encode(bytes(2 * 24000 * 2)).decode()
+        samples = []
+
+        async def trials():
+            cloud = await dogproto.Client.connect(self.stack.sock("mediad", cloud=True))
+            pad = await dogproto.Client.connect(self.stack.sock("mediad"))
+            try:
+                for _ in range(10):
+                    plays = self.events().count("play")
+                    await cloud.call("audio.play", {"pcm16_b64": two_s})
+                    while self.events().count("play") == plays:
+                        await asyncio.sleep(0.005)
+                    before = time.monotonic_ns()
+                    await pad.call("audio.ptt", {"down": True})
+                    end = time.monotonic() + 1.0
+                    while time.monotonic() < end:
+                        cuts = [t for t, event in self.stack.audio_log() if event == "cut" and t >= before]
+                        if cuts:
+                            samples.append((cuts[0] - before) / 1e6)
+                            break
+                        await asyncio.sleep(0.005)
+                    await pad.call("audio.ptt", {"down": False})
+            finally:
+                await cloud.close()
+                await pad.close()
+
+        asyncio.run(trials())
+        print(f"\nptt cut latency ms: p50={statistics.median(samples):.2f} max={max(samples):.2f}")
+        self.assertEqual(len(samples), 10)
+        self.assertLessEqual(max(samples), 100.0)
+
     def test_play_rules(self):
         quarter_s = base64.b64encode(bytes(int(0.25 * 24000) * 2)).decode()
         one_s = base64.b64encode(bytes(24000 * 2)).decode()
@@ -117,6 +184,11 @@ class MediaStack(unittest.TestCase):
         self.stack.wait_for(lambda: self.events(since)[-1:] == ["play"], "second play", timeout=2)
         self.assertEqual(self.media("audio.stop", cloud=True), {})
         self.stack.wait_for(lambda: self.events()[-1:] == ["cut"], "cut after audio.stop", timeout=1)
+
+    def test_cloud_socket_refuses_ptt(self):
+        with self.assertRaises(dogproto.RpcError) as ctx:
+            self.media("audio.ptt", {"down": True}, cloud=True)
+        self.assertEqual(ctx.exception.code, dogproto.METHOD_NOT_FOUND)
 
 
 if __name__ == "__main__":
