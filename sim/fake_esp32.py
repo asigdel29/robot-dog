@@ -22,6 +22,9 @@ LINE_LIMIT = 1024
 HB_TIMEOUT_S = 1.0
 FRAME_S = 0.07
 MAX_LEASE_MS = 400
+MAX_ENTRIES = 24  # the firmware's RAM table
+MAX_RAW = 120
+NAME_LEN = 32  # firmware name buffer, with its terminating zero
 TICK_S = 0.01
 POSE_EVERY_S = 0.1
 FLOOR = (640.0, 480.0)
@@ -29,6 +32,20 @@ FLOOR = (640.0, 480.0)
 MOTION = {"forward": (120.0, 0.0), "back": (-80.0, 0.0),
           "left": (0.0, -math.radians(90)), "right": (0.0, math.radians(90))}
 NEC_FRAME_US = [9000, 4500] + [560, 560] * 16 + [560, 1690] * 16 + [560]
+
+
+def entry_ok(msg):
+    """Return True when the firmware can store and send this load entry; it refuses the rest as "bad entry"."""
+    name, raw = msg.get("name"), msg.get("raw", [])
+    if not (isinstance(name, str) and 0 < len(name) < NAME_LEN and isinstance(raw, list) and len(raw) <= MAX_RAW):
+        return False
+    if not (20 <= msg.get("khz", 38) <= 60 and 10 <= msg.get("period_ms", 108) <= 1000):
+        return False
+    if msg.get("repeat") not in ("nec", "resend", "none") or not all(isinstance(v, int) and 0 < v <= 0xFFFF for v in raw):
+        return False
+    if msg.get("proto") == "NEC":
+        return 0 <= msg.get("addr", 0) <= 0xFFFF and 0 <= msg.get("cmd", 0) <= 0xFF
+    return msg.get("proto") == "raw" and len(raw) > 0
 
 
 class FakeBridge:
@@ -40,6 +57,7 @@ class FakeBridge:
         self.boot = 0
         self.log = open(os.path.join(run_dir, "fake_esp32.log"), "a", buffering=1)
         self.pose = list(start_pose)
+        self.capture = None  # timer handles of the open capture window
         self.reset()
         self._buf = b""
         self._next_pose_write = 0.0
@@ -47,6 +65,7 @@ class FakeBridge:
     def reset(self):
         """Return to the power-on state; the board forgets its session and registry."""
         self.boot += 1
+        self._cancel_capture()
         self.state = "DISARMED"
         self.sid = None
         self.last_id = 0
@@ -98,6 +117,7 @@ class FakeBridge:
             self.last_id = 0
             self.entries = {}
             self.hold = None
+            self._cancel_capture()
             self.emit(ev="hello", sid=self.sid, boot=self.boot, fw=FW, state=self.state)
             return
         if op == "hb":
@@ -120,13 +140,20 @@ class FakeBridge:
     def op_load(self, msg, now):
         if self.state != "DISARMED":
             return "not disarmed"
+        if not entry_ok(msg):
+            return "bad entry"
+        if msg["name"] not in self.entries and len(self.entries) >= MAX_ENTRIES:
+            return "table full"
         self.entries[msg["name"]] = msg
         self.emit(ev="ack", id=msg["id"])
 
     def op_arm(self, msg, now):
         if msg.get("n") != len(self.entries):
             return "entry count"
-        self.state = "READY"
+        if self.capture:
+            return "capturing"
+        if self.state in ("DISARMED", "FAULT"):
+            self.state = "READY"
         self.last_hb = now
         self.emit(ev="ack", id=msg["id"])
 
@@ -173,16 +200,29 @@ class FakeBridge:
     def op_capture(self, msg, now):
         if self.state != "DISARMED":
             return "capture needs DISARMED"
+        if self.capture:
+            return "capturing"
         ms = msg.get("ms", 0)
         self.emit(ev="ack", id=msg["id"])
         loop = asyncio.get_running_loop()
-        frame = {"proto": "NEC", "addr": 0, "cmd": 0x18, "bits": 32, "raw": NEC_FRAME_US, "gap_us": 0}
-        loop.call_later(min(0.2, ms / 2000), lambda: self.emit(ev="cap", **frame))
+        first = min(0.2, ms / 2000)
+        frames = [(first, {"proto": "NEC", "addr": 0, "cmd": 0x18, "bits": 32, "raw": NEC_FRAME_US, "gap_us": 0,
+                           "repeat": False})]
         if ms >= 4000:  # a long capture window stands for a held button: NEC repeat frames
-            for i in range(1, 6):
-                loop.call_later(min(0.2, ms / 2000) + i * 0.108, lambda: self.emit(
-                    ev="cap", proto="NEC", addr=0, cmd=0x18, bits=0, raw=[9000, 2250, 560], gap_us=108000, repeat=True))
-        loop.call_later(ms / 1000, lambda: self.emit(ev="done", id=msg["id"]))
+            frames += [(first + i * 0.108, {"proto": "NEC", "addr": 0, "cmd": 0x18, "bits": 0, "raw": [9000, 2250, 560],
+                                            "gap_us": 108000, "repeat": True}) for i in range(1, 6)]
+        self.capture = [loop.call_later(t, lambda f=f: self.emit(ev="cap", **f)) for t, f in frames]
+        self.capture.append(loop.call_later(ms / 1000, self._capture_done, msg["id"]))
+
+    def _capture_done(self, op_id):
+        self.capture = None
+        self.emit(ev="done", id=op_id)
+
+    def _cancel_capture(self):
+        """Forget the capture window without a done; a hello or a reset ends it."""
+        for handle in self.capture or ():
+            handle.cancel()
+        self.capture = None
 
     def _end_hold(self):
         if self.hold is not None:
@@ -208,7 +248,9 @@ class FakeBridge:
                 self._end_hold()
             elif now >= self.hold["next_frame"]:
                 self.emit(ev="tx", id=self.hold["id"], frames=1)
-                period = self.entries[self.hold["name"]].get("period_ms", 108) / 1000
+                entry = self.entries[self.hold["name"]]
+                # A remote that repeats nothing for a held button gets one frame only.
+                period = math.inf if entry["repeat"] == "none" else entry.get("period_ms", 108) / 1000
                 self.hold["next_frame"] = now + period
         moving = self.hold["name"] if self.hold else (self.timed[0] if self.timed and now < self.timed[1] else None)
         speed, turn = MOTION.get(moving, (0.0, 0.0))

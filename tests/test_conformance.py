@@ -185,6 +185,47 @@ class Conformance(unittest.TestCase):
         self.port.hello()
         self.assertLess(self.port.state()["max_loop_us"], 100_000)
 
+    def test_load_limits(self):
+        self.port.hello()
+        for bad in ({"proto": "RC5"}, {"repeat": "toggle"}, {"proto": "raw", "raw": []}, {"raw": [560] * 121}):
+            self.assertEqual(self.port.expect("nack", op_id=self.port.op("load", **{**ENTRY, **bad}))["why"], "bad entry")
+        for i in range(24):
+            self.port.expect("ack", op_id=self.port.op("load", **{**ENTRY, "name": f"e{i}"}))
+        self.assertEqual(self.port.expect("nack", op_id=self.port.op("load", **ENTRY))["why"], "table full")
+
+    def test_hold_without_repeat_sends_one_frame(self):
+        self.port.hello()
+        self.port.expect("ack", op_id=self.port.op("load", **{**ENTRY, "repeat": "none"}))
+        self.port.expect("ack", op_id=self.port.op("arm", n=1))
+        op_id = self.port.op("hold", name="t", lease_ms=300)
+        frames = 0
+        end = time.monotonic() + 1.0
+        while time.monotonic() < end:
+            msg = self.port.read(end - time.monotonic()) or {}
+            frames += msg.get("ev") == "tx"
+            if msg.get("ev") == "done" and msg.get("id") == op_id:
+                break
+        else:
+            self.fail("no done for the hold")
+        self.assertEqual(frames, 1)
+
+    def test_arm_refused_while_capturing(self):
+        self.port.hello()
+        self.port.expect("ack", op_id=self.port.op("load", **ENTRY))
+        cap_id = self.port.op("capture", ms=300)
+        self.port.expect("ack", op_id=cap_id)
+        self.assertEqual(self.port.expect("nack", op_id=self.port.op("arm", n=1))["why"], "capturing")
+        self.port.expect("done", op_id=cap_id)
+        self.port.expect("ack", op_id=self.port.op("arm", n=1))
+
+    def test_send_after_stop(self):
+        self.port.ready()
+        self.port.expect("ack", op_id=self.port.op("hold", name="t", lease_ms=300))
+        self.port.expect("ack", op_id=self.port.op("stop"))
+        op_id = self.port.op("send", name="t")
+        self.port.expect("ack", op_id=op_id)
+        self.port.expect("done", op_id=op_id)
+
     def _next_tx(self, timeout):
         end = time.monotonic() + timeout
         while time.monotonic() < end:
