@@ -39,7 +39,6 @@ sys.path.insert(0, os.path.join(ROOT, "tests"))
 import dogproto  # noqa: E402
 import linkd  # noqa: E402
 from devstack import Stack, free_port  # noqa: E402
-from test_e2e import PoseFeeder  # noqa: E402
 
 DEVICE_TOKEN = "device-secret"
 TOOLS_TOKEN = "tools-secret"
@@ -66,6 +65,16 @@ def answers(url):
         return http_json(url)[0] == 200
     except OSError:
         return False
+
+
+async def feed_pose(stack, halt):
+    """Send robot.observe each 100 ms until halt, as mediad does: the toy at the center, goal marker 2 in a corner."""
+    client = await dogproto.Client.connect(stack.sock("robotd"))
+    while not halt.is_set():
+        client.notify("robot.observe", {"t_mono_ns": time.monotonic_ns(),
+                                        "markers": {"1": [320, 240, 0.0], "2": [600, 440, 0.0]}})
+        await asyncio.sleep(0.1)
+    await client.close()
 
 
 class StubMediad(threading.Thread):
@@ -303,10 +312,11 @@ class Tools(LinkTestCase):
     def test_hub_loss_disarms_and_cancels_goto(self):
         """Hub killed during a goto: linkd disarms robotd and the goto ends; no hold follows."""
         self.arm()
-        feeder = PoseFeeder(self.stack, (600, 440))
+        halt = threading.Event()
+        feeder = threading.Thread(target=asyncio.run, args=(feed_pose(self.stack, halt),), daemon=True)
         feeder.start()
         self.addCleanup(feeder.join)
-        self.addCleanup(feeder.halt.set)
+        self.addCleanup(halt.set)
         time.sleep(0.3)
         goto = threading.Thread(target=self._quiet_tool, args=("go_to_marker", {"marker_id": 2}), daemon=True)
         goto.start()
