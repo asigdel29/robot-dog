@@ -7,6 +7,7 @@ import math
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -260,6 +261,7 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
         daemon.link = StubLink(daemon, on_op)
         daemon.link_up = True
         daemon.armed = True
+        daemon._esp_rx = time.monotonic() + 3600  # keep the silence watchdog quiet for direct tick() calls
         return daemon
 
     async def test_stop_in_same_turn_as_ack_is_not_lost(self):
@@ -301,6 +303,35 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
         daemon._drive_stick("left")
         names = daemon.link.names()
         self.assertEqual(names[names.index("send dance"):], ["send dance", "send stop", "hold left"])
+
+    async def test_stop_latches_a_held_stick(self):
+        """A stop must hold while the stick stays pushed; padd re-sends the stick at 20 Hz."""
+        daemon = self.make()
+        local = Conn(False)
+        await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
+        daemon.tick(1)
+        self.assertIn("hold forward", daemon.link.names())
+        await daemon.h_stop({}, local)
+        stopped_at = len(daemon.link.ops)
+        for tick in range(2, 10):
+            await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
+            daemon.tick(tick)
+        self.assertNotIn("hold forward", daemon.link.names()[stopped_at:])
+        await daemon.h_move({"vx": 0.0, "vyaw": 0.0}, local)  # stick back at center
+        await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
+        daemon.tick(11)
+        self.assertIn("hold forward", daemon.link.names()[stopped_at:])
+
+    async def test_disarm_latches_a_held_stick(self):
+        daemon = self.make()
+        local = Conn(False)
+        await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
+        daemon._disarm("request")
+        daemon.armed = True  # Start pressed again with the stick still pushed
+        disarmed_at = len(daemon.link.ops)
+        await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
+        daemon.tick(1)
+        self.assertNotIn("hold forward", daemon.link.names()[disarmed_at:])
 
     async def test_cloud_drive_needs_cloud_flag(self):
         daemon = self.make(registry=demo(forward={"cloud": False}))

@@ -419,6 +419,7 @@ class Robotd:
         self._loaded = 0
         self._move = (0.0, 0.0, 0.0)
         self._stick = None
+        self._stick_latched = False  # set by a stop or disarm; cleared when the stick is back at center
         self._pose = (0.0, {})
         self._results = collections.OrderedDict()
         self._last_activity = time.monotonic()
@@ -618,11 +619,21 @@ class Robotd:
         if self.armed:
             log.info("disarm: %s", reason)
         self.armed = False
-        self._stick = None
+        self._latch_stick()
         if self._cancel_action(reason):
             self._esp_quiet("stop")
         else:
             self._esp_quiet("disarm")
+
+    def _latch_stick(self):
+        """Drop the stick intent and ignore stick input until the stick is back at center.
+
+        padd sends the last stick value again at 20 Hz, so without the latch a stop
+        or disarm would be undone by the next tick while the stick stays pushed.
+        """
+        self._move = (0.0, 0.0, 0.0)
+        self._stick = None
+        self._stick_latched = True
 
     def _require_ready(self):
         if self.fault:
@@ -846,6 +857,11 @@ class Robotd:
             raise RpcError(dogproto.INVALID_PARAMS, "vx and vyaw must be finite")
         vx = max(-1.0, min(1.0, float(params["vx"])))
         vyaw = max(-1.0, min(1.0, float(params["vyaw"])))
+        if self._stick_latched:
+            # After a stop or disarm, a stick that stays pushed must not move the dog again.
+            if stick_dir(vx, vyaw) is not None:
+                return
+            self._stick_latched = False
         self._move = (vx, vyaw, time.monotonic())
 
     async def h_observe(self, params, conn):
@@ -876,6 +892,7 @@ class Robotd:
 
     async def h_stop(self, params, conn):
         """robot.stop: stop IR output now and cancel the action; stay armed."""
+        self._latch_stick()
         self._esp_quiet("stop")
         self._cancel_action("stopped")
         return {"stop_transmitted": self.link_up}  # read after the send: a failed write drops the link
