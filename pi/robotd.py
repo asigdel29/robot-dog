@@ -428,8 +428,11 @@ class Robotd:
         self._esp_rx = time.monotonic()
         ev = msg.get("ev")
         if ev == "hello":
-            if self._hello is not None and not self._hello.done() and msg.get("sid") == self._sid:
-                self._hello.set_result(msg)
+            if msg.get("sid") == self._sid:
+                # The handshake repeats hello until a reply comes, so a slow or booting
+                # bridge can answer twice; a reply with our own sid is never a reset.
+                if self._hello is not None and not self._hello.done():
+                    self._hello.set_result(msg)
             elif self.link_up:
                 self._link_lost("esp32 reset")
         elif ev in ("ack", "nack"):
