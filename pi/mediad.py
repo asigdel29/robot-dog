@@ -608,7 +608,7 @@ class Console:
             return json_response(*await self._robot("robot.stop"))
         if path == "/do":
             try:
-                trick = json.loads(body or b"{}").get("trick")
+                trick = dogproto.decode(body or b"{}").get("trick")
             except (ValueError, AttributeError):
                 trick = None
             if not isinstance(trick, str) or not trick:
