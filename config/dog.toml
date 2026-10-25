@@ -12,3 +12,6 @@ camera = "/dev/v4l/by-id/REPLACE_WITH_C270-video-index0"
 # ALSA devices from `aplay -L` and `arecord -L`, for example "plughw:CARD=Device,DEV=0".
 speaker = "default"
 mic = "default"
+# LAN console. The token comes from DOG_CONSOLE_TOKEN in /etc/dog/console.env.
+console_bind = "0.0.0.0"
+console_port = 8080
