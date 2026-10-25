@@ -1,8 +1,9 @@
 """End-to-end tests of the dog stack on one machine, against the fake ESP32.
 
 Each check maps to a row of the verification table in the plan: stop latency,
-watchdog after a robotd crash, cloud refusals, arm rules, duplicates and the
-simulated goto. Latency numbers are printed so a run can go into docs/test-log.md.
+watchdog after a robotd crash, cloud refusals, arm rules, duplicates, the
+simulated goto (with a pose feeder and with mediad's fake camera) and the pose
+rate and age. Numbers are printed so a run can go into docs/test-log.md.
 """
 
 import asyncio
@@ -246,6 +247,14 @@ class PoseFeeder(threading.Thread):
             await client.close()
 
 
+def random_goal(rng, pose, margin=40):
+    """Return a goal 100 to 220 px from the toy pose and at least margin px inside the 640 x 480 floor."""
+    angle = rng.uniform(-math.pi, math.pi)
+    dist = rng.uniform(100, 220)
+    return (min(640 - margin, max(margin, pose["x"] + dist * math.cos(angle))),
+            min(480 - margin, max(margin, pose["y"] + dist * math.sin(angle))))
+
+
 class SimGoto(unittest.TestCase):
     """Simulated goto: 9 of 10 random goals reached."""
 
@@ -255,11 +264,7 @@ class SimGoto(unittest.TestCase):
         with Stack() as stack:
             stack.call("robot.enable")
             for seed in range(10):
-                pose = stack.sim_pose()
-                angle = rng.uniform(-math.pi, math.pi)
-                dist = rng.uniform(100, 220)
-                goal = (min(600, max(40, pose["x"] + dist * math.cos(angle))),
-                        min(440, max(40, pose["y"] + dist * math.sin(angle))))
+                goal = random_goal(rng, stack.sim_pose())
                 feeder = PoseFeeder(stack, goal)
                 feeder.start()
                 time.sleep(0.3)
@@ -271,6 +276,61 @@ class SimGoto(unittest.TestCase):
                 reached += result["reached"]
                 print(f"\ngoto {seed}: {result['reason']} in {result['steps']} steps")
         self.assertGreaterEqual(reached, 9)
+
+
+class CameraPose(unittest.TestCase):
+    """mediad's fake camera draws the markers and the real ArUco detection finds them."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stack = Stack(media=True)
+        cls.stack.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.stack.stop()
+
+    def test_goto_random_goals_camera(self):
+        """9 of 10 random goals reached with poses from the camera path.
+
+        The goals stay 80 px inside the image: the detector drops a marker whose
+        white margin touches the image edge, on a real camera too.
+        """
+        rng = random.Random(7)
+        reached = 0
+        self.stack.call("robot.enable")
+        for seed in range(10):
+            goal = random_goal(rng, self.stack.sim_pose(), margin=80)
+            self.stack.set_goal_markers({"2": list(goal)})
+            time.sleep(0.3)
+            result = self.stack.call("robot.goto", {"marker": 2, "id": aid()}, cloud=True, timeout=40)
+            reached += result["reached"]
+            print(f"\ncamera goto {seed}: {result['reason']} in {result['steps']} steps")
+        self.assertGreaterEqual(reached, 9)
+
+    def test_pose_rate_and_age(self):
+        """Pose rate 10 Hz or more and vision age p95 under 200 ms, from robot.state samples."""
+
+        async def sample(seconds):
+            client = await dogproto.Client.connect(self.stack.sock("robotd"))
+            ages = []
+            try:
+                end = time.monotonic() + seconds
+                while time.monotonic() < end:
+                    ages.append((await client.call("robot.state"))["vision_age_ms"])
+                    await asyncio.sleep(0.005)
+            finally:
+                await client.close()
+            return ages
+
+        seconds = 3.0
+        ages = asyncio.run(sample(seconds))
+        rate = sum(1 for before, after in zip(ages, ages[1:]) if after < before) / seconds
+        p95 = statistics.quantiles(ages, n=20)[18]
+        print(f"\npose rate {rate:.1f} Hz, vision age p50={statistics.median(ages):.0f} ms p95={p95:.0f} ms "
+              f"max={max(ages)} ms ({len(ages)} samples)")
+        self.assertGreaterEqual(rate, 10)
+        self.assertLess(p95, 200)
 
 
 if __name__ == "__main__":

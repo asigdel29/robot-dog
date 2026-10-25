@@ -1,14 +1,17 @@
 """Run the dog stack on one machine against the fake ESP32, for tests and local work.
 
-``python sim/devstack.py`` starts fake_esp32 and robotd with DEMO_REGISTRY in a
-temporary run directory and prints how to reach them. Tests import Stack. Each
+``python sim/devstack.py`` starts fake_esp32, robotd with DEMO_REGISTRY, and
+mediad with its fake camera, fake audio and the LAN console on 127.0.0.1, in a
+temporary run directory, and prints how to reach them. Tests import Stack. Each
 process gets DOG_RUN_DIR, so nothing touches /run/dog or /etc/dog.
 """
 
 import asyncio
 import json
 import os
+import secrets
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -46,16 +49,31 @@ DEMO_REGISTRY = {
 }
 
 
-class Stack:
-    """Processes of one dev stack and helpers to call them and read the fake log."""
+def free_port():
+    """Return a TCP port on 127.0.0.1 that is free now, for the console of one stack."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
-    def __init__(self, registry=None, pose="320,240,0"):
+
+class Stack:
+    """Processes of one dev stack and helpers to call them and read the fake logs.
+
+    media=True also starts mediad. The robotd tests leave it out, so the camera
+    work does not share the CPU with their latency checks.
+    """
+
+    def __init__(self, registry=None, pose="320,240,0", media=False):
         self.run_dir = tempfile.mkdtemp(prefix="dog-")
         self.registry_path = os.path.join(self.run_dir, "registry.json")
         with open(self.registry_path, "w") as handle:
             json.dump(DEMO_REGISTRY if registry is None else registry, handle)
         self.pose = pose
-        self.env = {**os.environ, "DOG_RUN_DIR": self.run_dir, "PYTHONUNBUFFERED": "1"}
+        self.media = media
+        self.console_port = free_port()
+        self.console_token = secrets.token_hex(16)
+        self.env = {**os.environ, "DOG_RUN_DIR": self.run_dir, "PYTHONUNBUFFERED": "1",
+                    "DOG_CONSOLE_TOKEN": self.console_token}
         self.procs = {}
         self._logs = []
         self._log_pos = 0
@@ -76,21 +94,31 @@ class Stack:
         return self.procs[name]
 
     def start(self):
-        """Start fake_esp32 and robotd and wait until the bridge link is up."""
+        """Start fake_esp32, robotd and (with media=True) mediad, and wait until each is ready."""
         self.spawn("fake_esp32", os.path.join(ROOT, "sim", "fake_esp32.py"), "--run-dir", self.run_dir,
                    "--pose", self.pose)
         self.wait_for(lambda: os.path.exists(os.path.join(self.run_dir, "esp32")), "fake esp32 pty")
         self.start_robotd()
+        if self.media:
+            self.start_mediad()
 
     def start_robotd(self):
         """Start (or start again) robotd and wait for its link to the fake bridge."""
         self.spawn("robotd", os.path.join(ROOT, "pi", "robotd.py"), "--serial", os.path.join(self.run_dir, "esp32"),
                    "--registry", self.registry_path, "--config", os.path.join(self.run_dir, "absent.toml"))
-        self.wait_for(lambda: self._state_esp() == "DISARMED", "robotd esp32 link")
+        self.wait_for(lambda: self._state("esp") == "DISARMED", "robotd esp32 link")
 
-    def _state_esp(self):
+    def start_mediad(self):
+        """Start mediad with the fake camera and fake audio; wait until robotd sees its camera poses."""
+        self.spawn("mediad", os.path.join(ROOT, "pi", "mediad.py"), "--fake-camera", "--fake-audio",
+                   "--config", os.path.join(self.run_dir, "absent.toml"),
+                   "--console-bind", "127.0.0.1", "--console-port", str(self.console_port))
+        self.wait_for(lambda: self._state("vision_age_ms") is not None, "camera poses at robotd")
+
+    def _state(self, field):
+        """Return one field of robot.state, or None while robotd does not answer."""
         try:
-            return self.call("robot.state")["esp"]
+            return self.call("robot.state")[field]
         except (OSError, dogproto.RpcError, TimeoutError):
             return None
 
@@ -115,6 +143,30 @@ class Stack:
         """Return the simulated toy pose written by the fake bridge."""
         with open(os.path.join(self.run_dir, "sim_pose.json")) as handle:
             return json.load(handle)
+
+    def set_goal_markers(self, markers):
+        """Put goal markers on the fake camera floor, for example {"2": [x, y]}; mediad reads them each frame."""
+        path = os.path.join(self.run_dir, "fake_markers.json")
+        with open(path + ".tmp", "w") as handle:
+            json.dump(markers, handle)
+        os.replace(path + ".tmp", path)
+
+    def console_url(self, path="/"):
+        """Return the URL of a LAN console path of this stack."""
+        return f"http://127.0.0.1:{self.console_port}{path}"
+
+    def audio_log(self):
+        """Return the fake speaker log as (t_mono_ns, "play"|"end"|"cut", fields) tuples."""
+        try:
+            with open(os.path.join(self.run_dir, "audio_out.log")) as handle:
+                lines = handle.read().splitlines()
+        except FileNotFoundError:
+            return []
+        rows = []
+        for line in lines:
+            t_ns, event, fields = line.split(" ", 2)
+            rows.append((int(t_ns), event, json.loads(fields)))
+        return rows
 
     def log(self):
         """Return the fake bridge log as (t_mono_ns, "in"|"out", message) tuples.
@@ -173,9 +225,10 @@ class Stack:
 
 def main():
     """Start a dev stack and keep it alive until Ctrl-C."""
-    with Stack() as stack:
+    with Stack(media=True) as stack:
         print(f"run dir: {stack.run_dir}")
         print(f"robotctl: DOG_RUN_DIR={stack.run_dir} python pi/robotctl.py --config /dev/null state")
+        print(f"console: {stack.console_url('/?token=' + stack.console_token)}")
         try:
             while all(p.poll() is None for p in stack.procs.values()):
                 time.sleep(0.5)

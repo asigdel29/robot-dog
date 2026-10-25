@@ -927,20 +927,21 @@ class Robotd:
         return await self._run_action("goto", params["id"], conn, lambda a: self._goto(str(params["marker"]), caps))
 
     async def _goto(self, goal_id, caps):
+        """Drive toward the goal marker; the goal is where the camera last saw it in this goto."""
         cfg = self.registry["goto"]
         drive = self.registry["drive"]
         cmds = self.registry["commands"]
-        best, since_best, steps, move = math.inf, 0, 0, None
+        best, since_best, steps, move, goal = math.inf, 0, 0, None, None
         try:
             async with asyncio.timeout(GOTO_LIMIT_S):
                 for steps in range(1, GOTO_MAX_STEPS + 1):
                     _, markers = self._markers()
                     robot = self._robot_pose()
-                    if robot is None or goal_id not in markers:
+                    goal = markers.get(goal_id, goal)  # the dog covers a floor marker as it arrives
+                    if robot is None or goal is None:
                         return {"reached": False, "reason": "vision stale or marker not seen", "steps": steps}
                     if not inside(robot[:2], cfg["area_px"]):
                         return {"reached": False, "reason": "robot left the area", "steps": steps}
-                    goal = markers[goal_id]
                     dist = math.hypot(goal[0] - robot[0], goal[1] - robot[1])
                     if dist < best - 2:
                         best, since_best = dist, 0

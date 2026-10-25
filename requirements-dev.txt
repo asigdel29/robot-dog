@@ -1,3 +1,5 @@
 # Python packages for tests and the dev stack. The Pi uses apt packages where they exist (see scripts/install-pi.sh).
 # The hub pins; linkd on the Pi needs only websockets from this list.
 -r hub/requirements.txt
+numpy==2.4.6
+opencv-python-headless==4.14.0.94

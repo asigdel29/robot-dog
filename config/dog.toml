@@ -5,3 +5,20 @@
 serial = "/dev/serial/by-id/REPLACE_WITH_FEATHER"
 registry = "/etc/dog/registry.json"
 captures = "/var/lib/dog/captures"
+
+[mediad]
+# Persistent path of the camera, from `ls /dev/v4l/by-id/` (use the -video-index0 entry).
+camera = "/dev/v4l/by-id/REPLACE_WITH_C270-video-index0"
+# ArUco dictionary of the printed markers. robot_marker is the id on the dog and must equal
+# goto.robot_marker in the registry. The fake camera draws this id on the simulated dog.
+aruco_dict = "DICT_4X4_50"
+robot_marker = 1
+# ALSA devices from `aplay -L` and `arecord -L`, for example "plughw:CARD=Device,DEV=0".
+speaker = "default"
+mic = "default"
+# LAN console. The token comes from DOG_CONSOLE_TOKEN in /etc/dog/console.env.
+console_bind = "0.0.0.0"
+console_port = 8080
+
+[padd.bindings]
+# Verified trick names for the X, Y, LB and RB buttons, for example X = "bark". Empty by default.
