@@ -19,6 +19,7 @@ import threading
 import time
 import unittest
 import uuid
+from unittest import mock
 
 import websockets.sync.server
 
@@ -28,6 +29,7 @@ sys.path.insert(0, os.path.join(ROOT, "sim"))
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
 import dogproto  # noqa: E402
+import linkd  # noqa: E402
 from devstack import Stack  # noqa: E402
 
 DEVICE_TOKEN = "device-secret"
@@ -181,6 +183,23 @@ class LinkdRules(unittest.TestCase):
         self.assertEqual(self.hello["method"], "link.hello")
         self.assertEqual({k: self.hello["params"][k] for k in ("api", "device")}, {"api": 1, "device": "dog-01"})
 
+    def test_stale_rule(self):
+        """An old, future, infinite or absent sent_at gets STALE; stop, disarm and audio.stop always pass."""
+        self.assertTrue(self.stack.call("robot.enable")["armed"])
+        for age_ms in (5000, -5000):
+            self.request("robot.do", {"trick": "bark", "id": uuid.uuid4().hex}, age_ms=age_ms)
+            self.assertEqual(self.reply()["error"]["code"], dogproto.STALE, age_ms)
+        self.conn.send('{"jsonrpc": "2.0", "id": 98, "method": "robot.state", "params": {}, "sent_at": 1e999}')
+        self.assertEqual(self.reply()["error"]["code"], dogproto.STALE, "an infinite sent_at")
+        self.conn.send(json.dumps({"jsonrpc": "2.0", "id": 99, "method": "robot.state", "params": {}}))
+        self.assertEqual(self.reply()["error"]["code"], dogproto.STALE, "no sent_at")
+        self.assertEqual(self.stack.wait_ops("send", 1, timeout=0.5), [])
+        for method in ("robot.stop", "robot.disarm", "audio.stop"):
+            self.request(method, age_ms=60000)
+            self.assertIn("result", self.reply(), method)
+        self.conn.send(json.dumps({"jsonrpc": "2.0", "id": 600, "method": "robot.stop", "params": {}}))
+        self.assertIn("result", self.reply(), "a stop with no sent_at")
+
     def test_only_cloud_methods(self):
         """Arming, stick motion, a second subscription and link methods get METHOD_NOT_FOUND."""
         for method in ("robot.enable", "robot.move", "media.subscribe", "link.hello"):
@@ -238,6 +257,35 @@ class LinkdRules(unittest.TestCase):
         attempts = self.hub.conns.qsize()
         print(f"\nreconnects in 6 s against a hub that closes at once: {attempts}")
         self.assertLessEqual(attempts, 3)
+
+
+class ClockWatch(unittest.TestCase):
+    """linkd's NTP flag: refreshed off the event loop; an unknown state keeps the last value."""
+
+    def test_unknown_state_keeps_last_value(self):
+        """The flag follows True, keeps True on an unknown state, then goes False; False makes a request STALE."""
+        link = linkd.Link("ws://127.0.0.1:1/device", "token", "dog-01", clock_synced=False)
+        answers, seen = [True, None, False], []
+
+        def fake_check():
+            """Record the flag before each check and return the next answer."""
+            seen.append(link.clock_synced)
+            return answers.pop(0) if answers else None
+
+        async def scenario():
+            """Run the watcher until it made four checks."""
+            task = asyncio.ensure_future(link._watch_clock())
+            while len(seen) < 4:
+                await asyncio.sleep(0.01)
+            task.cancel()
+
+        with mock.patch.object(linkd, "ntp_synced", fake_check), mock.patch.object(linkd, "CLOCK_CHECK_S", 0):
+            asyncio.run(scenario())
+        self.assertEqual(seen[:4], [False, True, True, False])
+        now = time.time() * 1000
+        with self.assertRaises(dogproto.RpcError) as ctx:
+            link._check_fresh(now, now)
+        self.assertEqual(ctx.exception.code, dogproto.STALE)
 
 
 if __name__ == "__main__":
