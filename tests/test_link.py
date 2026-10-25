@@ -244,6 +244,12 @@ class Tools(LinkTestCase):
         for headers in ({}, {"Authorization": "Bearer wrong"}):
             with self.assertRaises(websockets.exceptions.InvalidStatus):
                 websockets.sync.client.connect(device_url, additional_headers=headers, open_timeout=5)
+        with websockets.sync.client.connect(device_url, additional_headers={"Authorization": f"Bearer {DEVICE_TOKEN}"},
+                                            open_timeout=5) as conn:
+            conn.send(b"\x00 binary hello")
+            with self.assertRaises(websockets.exceptions.ConnectionClosed) as closed:
+                conn.recv(timeout=5)
+        self.assertEqual(closed.exception.rcvd.code, 1008, "a binary hello is refused, not an internal error")
 
     def test_do_trick_reaches_bridge(self):
         self.arm()
@@ -380,7 +386,7 @@ class VoiceLoop(LinkTestCase):
 
     def test_text_around_tool_call_is_not_fused(self):
         self.arm()
-        self.stack.stub_config(transcript="please bark", reply=["Okay.", "Done!"])
+        self.stack.stub_config(transcript="please bark", reply=["Okay.", "", "Done!"])
         self.stack.utter()
         self.stack.wait_for(lambda: len(self.stack.mediad.plays) >= 2, "both sentences played")
         spoken = [r["body"]["input"] for r in self.stack.stub_requests("/v1/audio/speech")]

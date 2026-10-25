@@ -430,12 +430,13 @@ class Voice:
                     if name == "message.delta":
                         marks.setdefault("first_delta", time.monotonic())
                         delta = event.get("delta")
-                        delta = delta if isinstance(delta, str) else ""
+                        if not isinstance(delta, str) or not delta:
+                            continue  # an empty delta must not end the gap of a tool call
                         # Text before and after a tool call must not fuse into one word.
-                        if gap and last and delta and not last.isspace() and not delta[0].isspace():
+                        if gap and last and not last.isspace() and not delta[0].isspace():
                             delta = " " + delta
                         gap = False
-                        last = delta[-1:] or last
+                        last = delta[-1]
                         *whole, pending = SENTENCE_END_RE.split(pending + delta)
                         for sentence in whole:
                             sentences.put_nowait(sentence)
@@ -639,7 +640,7 @@ async def device_link(ws: WebSocket):
     await ws.accept()
     try:
         hello = _hello_params(await asyncio.wait_for(ws.receive_text(), HELLO_WAIT_S))
-    except (TimeoutError, WebSocketDisconnect):
+    except (TimeoutError, WebSocketDisconnect, KeyError):  # KeyError: a binary frame has no text
         hello = None
     if hello is None:
         with contextlib.suppress(RuntimeError):
