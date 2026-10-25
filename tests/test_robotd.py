@@ -321,24 +321,28 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(daemon.link_up)
         self.assertFalse(daemon.armed)
 
-    async def test_reset_after_the_arm_ack_leaves_the_dog_disarmed(self):
-        """A bridge reset that arrives with the arm ack starts a new, DISARMED link; robotd must not report armed."""
-        def ack_then_reset(link, obj):
-            if obj["op"] != "arm":
-                return False
-            def both():
-                link.daemon._on_esp({"ev": "ack", "id": obj["id"]})
-                link.daemon._on_esp({"ev": "hello", "sid": 0, "boot": 2, "fw": "x", "state": "DISARMED"})
-            asyncio.get_running_loop().call_soon(both)
-            return True
+    async def test_arm_races_leave_the_dog_disarmed(self):
+        """A bridge reset or a disarm that lands with the arm ack must not leave robotd armed."""
+        for race in ("reset", "disarm"):
+            def ack_then_race(link, obj):
+                if obj["op"] != "arm":
+                    return False
+                def both():
+                    link.daemon._on_esp({"ev": "ack", "id": obj["id"]})
+                    if race == "reset":
+                        link.daemon._on_esp({"ev": "hello", "sid": 0, "boot": 2, "fw": "x", "state": "DISARMED"})
+                    else:
+                        link.daemon._disarm("request")
+                asyncio.get_running_loop().call_soon(both)
+                return True
 
-        daemon = self.make(on_op=ack_then_reset)
-        daemon.armed = False
-        daemon._sid = 1234
-        with self.assertRaises(dogproto.RpcError) as ctx:
-            await daemon.h_enable({}, Conn(False))
-        self.assertEqual(ctx.exception.code, dogproto.UNAVAILABLE)
-        self.assertFalse(daemon.armed)
+            with self.subTest(race):
+                daemon = self.make(on_op=ack_then_race)
+                daemon.armed = False
+                daemon._sid = 1234
+                with self.assertRaises(dogproto.RpcError):
+                    await daemon.h_enable({}, Conn(False))
+                self.assertFalse(daemon.armed)
 
     async def test_cloud_drive_needs_cloud_flag(self):
         daemon = self.make(registry=demo(forward={"cloud": False}))

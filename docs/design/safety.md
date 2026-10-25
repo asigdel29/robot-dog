@@ -20,6 +20,7 @@ This document owns the rules that keep the dog from unwanted motion. When this d
 - robotd disarms the dog when it stops.
 - `linkd` disarms the dog when the WSS link to the hub fails.
 - A reconnect never arms the dog again.
+- A disarm or a bridge reset that arrives during `robot.enable` wins. The dog stays DISARMED.
 
 ## 3. Motion limits
 

@@ -346,6 +346,7 @@ class Robotd:
         self.esp_state = "down"
         self.esp_max_loop_us = None
         self.armed = False
+        self._disarms = 0  # counts each disarm, so robot.enable can see one that lands during its arm op
         self.fault = None
         self.action = None
         self.loop_hz = 0.0
@@ -542,6 +543,7 @@ class Robotd:
         if self.armed:
             log.info("disarm: %s", reason)
         self.armed = False
+        self._disarms += 1
         self._latch_stick()
         if self._cancel_action(reason):
             self._esp_quiet("stop")  # the bridge refuses stop_via once DISARMED
@@ -773,7 +775,10 @@ class Robotd:
         if self.reg_errors:
             raise RpcError(dogproto.UNAVAILABLE, "registry not ready", self.reg_errors[:5])
         self._require_link()
+        disarms = self._disarms
         await self._esp_call("arm", n=self._loaded)
+        if self._disarms != disarms:  # a disarm reached the bridge after the arm
+            raise RpcError(dogproto.PREEMPTED, "disarmed while the dog was arming")
         self._require_link()  # a bridge reset right after its ack starts a new, DISARMED link
         self.fault = None
         self.armed = True

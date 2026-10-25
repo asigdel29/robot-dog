@@ -47,7 +47,7 @@ The `PARAMS` table in `dogproto.py` is the reference for each method and its fie
 | -32004 | UNAVAILABLE | The registry is not ready, the command is not verified or not enabled for remote use, or the bridge link is down. |
 | -32005 | STALE | The request is too old (linkd only). |
 | -32006 | TIMEOUT | The bridge did not answer. |
-| -32007 | PREEMPTED | A stop, a disarm or the local stick ended the action. |
+| -32007 | PREEMPTED | A stop, a disarm or the local stick ended the action, or a disarm overtook `robot.enable`. |
 
 ### 1.5 robotd methods
 
