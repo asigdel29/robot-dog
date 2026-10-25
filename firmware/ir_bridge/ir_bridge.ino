@@ -9,12 +9,9 @@
 // dog moving. robotd sends the IR registry to RAM at each handshake, so a new
 // capture never needs a new flash. The firmware never starts WiFi or Bluetooth.
 
-// IRremote reads these before its include. Frames with more durations than the
-// registry can store (MAX_RAW) must still be seen as too long, so the buffer has spare room.
+// IRremote reads this before its include. The spare room past MAX_RAW lets a longer frame
+// show as too long. The receiver calibration knobs also go here (firmware/README.md).
 #define RAW_BUFFER_LENGTH 124
-// Calibration knobs for the receiver module, kept at the library defaults until a
-// capture on the real remote says otherwise: MARK_EXCESS_MICROS (20) corrects the
-// receiver's mark stretch; RECORD_GAP_MICROS (8000) is the space that ends a frame.
 
 #include <IRremote.hpp>
 #include <ArduinoJson.h>
