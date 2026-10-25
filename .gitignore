@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+dist/
+*.env
+!deploy/**/*.env.example
