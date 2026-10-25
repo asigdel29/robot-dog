@@ -18,29 +18,29 @@ Both processes are local clients of `robotd`. They move the dog only through `ro
 - The capture buffer holds one frame. Thus mediad always has the newest frame.
 - A thread reads the frames. Thus a slow camera cannot stop the bus or the console.
 - mediad keeps the newest frame and its monotonic time. `media.snapshot` and the console use this frame.
-- When the camera fails or is disconnected, mediad opens it again each 1 s.
+- When the camera fails or a person disconnects it, mediad opens the camera again each 1 s.
 - mediad needs OpenCV 4.7 or later (`cv2.aruco.ArucoDetector`). With an older OpenCV, mediad stops at start-up and gives the version that it found.
 
 ## 3. Markers
 
 | Item | Value | Configuration |
 | --- | --- | --- |
-| Dictionary | `DICT_4X4_50` | `[mediad] aruco_dict` |
-| Marker on the dog | id 1 | `[mediad] robot_marker` and `goto.robot_marker` in the registry. The two values must be equal. |
+| Dictionary | `DICT_4X4_50` | A constant in `pi/mediad.py` |
+| Marker on the dog | id 1 | `goto.robot_marker` in the registry |
 | Goal markers | Each other id of the dictionary | None |
 
 The pose of one marker is `[cx, cy, heading_rad]` in image pixels:
 
 - `cx, cy` is the center of the marker: the mean of its four corners.
 - `heading_rad` is the angle from the center to the midpoint of the top edge. The top edge goes from corner 0 to corner 1.
-- Image y points down. Thus a positive angle is clockwise on the screen.
+- The image y axis is downward. Thus a positive angle is clockwise on the screen.
 - No camera calibration is necessary.
 
 ### 3.1 Attach the marker to the dog
 
 1. Print the markers upright, with a white margin of one cell or more on each side.
 2. Mark the top edge of the marker with a pen.
-3. Cut the marker from the sheet. Keep the white margin.
+3. Cut the marker from the sheet with its white margin.
 4. Put the marker flat on the back of the dog, with its top edge toward the nose.
 5. Attach the marker with tape.
 
@@ -55,7 +55,7 @@ The pose of one marker is `[cx, cy, heading_rad]` in image pixels:
 - For each frame, mediad sends `robot.observe {t_mono_ns, markers}` to `robotd.sock`. `t_mono_ns` is the monotonic time of the frame.
 - The rate is the camera rate: 15 Hz.
 - mediad also sends a frame with no markers. Then robotd knows that the camera works but does not see the dog.
-- mediad never waits for robotd. When robotd starts again, mediad connects again in 0.5 s or less.
+- mediad never waits for robotd. When the connection closes, mediad tries to connect again each 0.5 s.
 - `robot.state` gives the age of the last pose as `vision_age_ms`. robotd stops a goto when the pose is older than 2 s.
 
 Targets: a pose rate of 10 Hz or more, and a `vision_age_ms` p95 of less than 200 ms.
@@ -65,11 +65,12 @@ Targets: a pose rate of 10 Hz or more, and a `vision_age_ms` p95 of less than 20
 `mediad --fake-camera` replaces the camera in the dev stack and in the tests.
 
 - Each frame is a gray floor of 640 x 480 px.
-- The fake draws the robot marker at the toy pose in `sim_pose.json`. The top edge of the marker points along the toy heading.
-- The fake draws each goal marker of `fake_markers.json` upright. The file format is `{"2": [x, y]}`.
+- The fake camera draws marker 1 at the toy pose in `sim_pose.json`. The top edge of the marker points along the toy heading.
+- Marker 1 is the `goto.robot_marker` of the dev stack registry.
+- The fake camera draws each goal marker of `fake_markers.json` upright. The file format is `{"2": [x, y]}`.
 - mediad reads the two files in `DOG_RUN_DIR` for each frame. `Stack.set_goal_markers` in `sim/devstack.py` writes `fake_markers.json`.
 - Each fake marker is 36 px, with a white margin of 6 px.
-- Then the real detection runs on the drawn frame. Thus the tests use the same detection path as the real camera.
+- The real detector then examines the drawn frame. Thus the tests use the same detection path as the real camera.
 
 ## 6. Audio
 
@@ -84,29 +85,29 @@ mediad uses `arecord` and `aplay` subprocesses. Set the ALSA devices in `[mediad
 | Longest play item | 30 s |
 | Play queue | 16 items or less. mediad plays the items in sequence. |
 
-When gamepad A goes down, padd sends `audio.ptt {down: true}`. Then mediad does these steps:
+A push-to-talk press starts when the person pushes gamepad A. padd then sends `audio.ptt {down: true}`, and mediad does these steps:
 
 1. It stops `aplay` and clears the play queue.
 2. It sends `media.bargein {}` to each subscriber.
 3. It starts `arecord`.
 
-When A goes up, padd sends `audio.ptt {down: false}`. mediad stops `arecord` and sends `media.utterance {id, rate, pcm16_b64}` to each subscriber. Each utterance has a new `id`.
+When the person releases A, padd sends `audio.ptt {down: false}`. mediad stops `arecord` and sends `media.utterance {id, rate, pcm16_b64}` to each subscriber. Each utterance has a new `id`.
 
 The press follows the button:
 
-- The press ends when A goes up, or when the connection that pressed closes.
+- The press ends when the person releases A, or when the connection that started the press closes.
 - When padd loses the pad or stops, it sends `audio.ptt {down: false}`. When padd stops suddenly, for example after `kill -9`, the closed connection ends the press.
-- At the 10 s limit, mediad stops `arecord` and sends the utterance. The press continues until A goes up.
+- At the 10 s limit, mediad stops `arecord` and sends the utterance. The press continues until the person releases A.
 - While the press continues, mediad refuses `audio.play` with BUSY. Thus the speaker cannot play into the microphone.
 - `audio.stop` stops `aplay` and clears the play queue.
 - mediad records audio only while a person holds A.
+- When mediad stops, systemd also stops `aplay` and `arecord`. The unit stops its full control group.
 
 `mediad --fake-audio` uses no subprocesses:
 
-- An utterance is a quiet 440 Hz tone. Its length is the time that the person held A.
-- mediad adds each play item to `audio_out.pcm` in `DOG_RUN_DIR`.
-- mediad writes one line to `audio_out.log` for each event: `play`, `end` or `cut`. Each line starts with the monotonic time in ns.
-- The fake takes the real play time of each item. Thus the tests can measure the barge-in time.
+- An utterance is silence. Its length is the time that the person held A.
+- For each speaker event, mediad writes one line to `audio_out.log` in `DOG_RUN_DIR`. The line is the monotonic time in ns and the event: `play`, `end` or `cut`.
+- The fake speaker takes the real play time of each item. Thus the tests can measure the barge-in time.
 
 ### 6.1 mediad methods
 
@@ -127,7 +128,7 @@ The LAN console is the local interface of the owner. It is a small HTTP server i
 | Item | Value |
 | --- | --- |
 | Address | `[mediad] console_bind` and `console_port`. `config/dog.toml` has 0.0.0.0 and 8080. Without these keys, mediad uses 127.0.0.1 and 8080. |
-| Token | `DOG_CONSOLE_TOKEN` from `/etc/dog/console.env`. Without a token, the console is off. |
+| Token | `DOG_CONSOLE_TOKEN` from `/etc/dog/console.env`. |
 
 | Endpoint | Job |
 | --- | --- |
@@ -138,11 +139,13 @@ The LAN console is the local interface of the owner. It is a small HTTP server i
 | `POST /arm` | `robot.enable`. This is a local arm path, like gamepad Start. |
 | `POST /disarm` | `robot.disarm` |
 | `POST /stop` | `robot.stop` |
-| `POST /do` | Body `{"trick": "<name>"}`. Sends `robot.do` with a new action id. |
+| `POST /do` | Body `{"trick": "<name>"}`. Sends `robot.do` with a new action id. A different body gets 400. |
+
+A robotd error gets 409 with its `error` and `code`. When robotd does not reply, the console gives 503.
 
 Access rules:
 
-1. The token must have 32 characters or more. With a shorter token, mediad logs an error and the console is off.
+1. The token must have 32 characters or more. With a shorter or absent token, mediad logs an error and does not start the console.
 2. Each endpoint needs the token in an `Authorization: Bearer <token>` header, or the cookie.
 3. `GET /?token=<token>` sets the cookie `dog_console` with `HttpOnly` and `SameSite=Strict`. The cookie value is an HMAC-SHA256 of the token, not the token.
 4. The browser does not send this cookie when a link in a different app opens `/`. For such a link, use the URL with the token.
@@ -174,20 +177,20 @@ padd uses the first input device with two stick axes and the A, B and Start butt
 
 | Control | Action | Message |
 | --- | --- | --- |
-| Left stick | Drive | `robot.move {vx, vyaw}` to robotd, 20 times each second while the stick is out of the dead band. One zero message when the stick goes back to the center. |
+| Left stick | Drive | `robot.move {vx, vyaw}` to robotd, 20 times each second while the stick is out of the dead band. One zero message when the stick returns to the center. |
 | Start | Arm | `robot.enable` |
 | B | Stop | `robot.stop` |
 | Select, held for 1 s | Disarm | `robot.disarm` |
-| A, held | Push-to-talk | `audio.ptt {down: true}` to mediad, then `audio.ptt {down: false}` when A goes up. |
-| X, Y, LB, RB | Trick | `robot.do {trick, id}` with the trick from `[padd.bindings]`. Each press has a new id. |
+| A, held | Push-to-talk | `audio.ptt {down: true}` to mediad, then `audio.ptt {down: false}` when the person releases A. |
+| X, Y, LB, RB | Trick | `robot.do {trick, id}` with the trick from `[padd.bindings]`. Each push has a new id. |
 
 Stick rules:
 
-- `vx` is forward motion. The stick fully up gives 1.
-- `vyaw` is a left turn. The stick fully left gives 1.
+- `vx` is forward motion. The stick at its top position gives 1.
+- `vyaw` is a left turn. The stick at its left position gives 1.
 - padd scales each axis to -1 to 1 with the minimum and the maximum that the device gives.
 - The dead band of padd is 0.15. robotd uses its own dead band of 0.5 to select one drive direction.
-- After a stop or a disarm, robotd ignores the stick until it is back at the center. padd sends the last stick value again 20 times each second, so this latch keeps the stop.
+- After a stop or a disarm, robotd ignores the stick until it is at the center again. padd sends the last stick value again 20 times each second, so this latch keeps the stop.
 
 Bindings are empty by default. Example:
 
@@ -196,7 +199,7 @@ Bindings are empty by default. Example:
 X = "bark"
 ~~~
 
-padd does not start when a key is not X, Y, LB or RB.
+padd does not start when a key is not X, Y, LB or RB, or when a value is not a trick name.
 
 Safety rules:
 
