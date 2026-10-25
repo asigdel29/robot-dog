@@ -310,6 +310,23 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
         daemon.tick(1)
         self.assertNotIn("hold forward", daemon.link.names()[disarmed_at:])
 
+    async def test_goto_keeps_the_last_seen_goal(self):
+        """The dog covers a goal marker on the floor as it arrives; goto must still end there."""
+        registry = demo()
+        registry["goto"].update(forward_ms=50, turn_ms=50, settle_ms=10)
+        daemon = self.make(registry=registry)
+        local = Conn(False)
+        await daemon.h_observe({"t_mono_ns": time.monotonic_ns(),
+                                "markers": {"1": [100.0, 100.0, 0.0], "2": [160.0, 100.0, 0.0]}}, local)
+
+        async def arrive_on_goal(name, ms):  # stands in for the bridge hold: only the dog is seen now
+            await daemon.h_observe({"t_mono_ns": time.monotonic_ns(), "markers": {"1": [150.0, 100.0, 0.0]}}, local)
+
+        daemon._hold = arrive_on_goal
+        result = await daemon.h_goto({"marker": 2, "id": "g"}, Conn(True))
+        self.assertTrue(result["reached"], result)
+        self.assertEqual(result["steps"], 2)
+
     async def test_cloud_drive_needs_cloud_flag(self):
         daemon = self.make(registry=demo(forward={"cloud": False}))
         with self.assertRaises(dogproto.RpcError) as ctx:

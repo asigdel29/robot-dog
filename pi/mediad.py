@@ -14,6 +14,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import hashlib
 import hmac
 import http.cookies
 import json
@@ -53,13 +54,23 @@ PLAY_RATES = (8000, 48000)
 PLAY_QUEUE_MAX = 16
 SNAPSHOT_PX = (16, 4096)
 CONSOLE_COOKIE = "dog_console"
+CONSOLE_MIN_TOKEN_CHARS = 32
+CONSOLE_MAX_CONNECTIONS = 16
+#: Console buttons that map to one robotd request without parameters.
+CONSOLE_BUTTONS = {"/arm": "robot.enable", "/disarm": "robot.disarm", "/stop": "robot.stop"}
 HTTP_HEAD_LIMIT = 8192
 HTTP_BODY_LIMIT = 1024
-HTTP_READ_S = 10.0
+HTTP_READ_S = 3.0
 TRICK_WAIT_S = 35.0
 
 
 # ---------------------------------------------------------------- vision
+
+
+def require_aruco_detector():
+    """Exit with a clear message on OpenCV older than 4.7, which has no cv2.aruco.ArucoDetector."""
+    if not hasattr(getattr(cv2, "aruco", None), "ArucoDetector"):
+        sys.exit(f"mediad needs OpenCV 4.7 or later (cv2.aruco.ArucoDetector); this is OpenCV {cv2.__version__}")
 
 
 def aruco_dictionary(name):
@@ -236,6 +247,8 @@ class Mediad:
         self._subscribers = set()
         self._queue = asyncio.Queue()
         self._playing = None
+        self._ptt_owner = None  # the connection that holds push-to-talk down; None when it is up
+        self._ptt_watched = set()
         self._ptt_up = None
         self._recording = None
 
@@ -254,22 +267,19 @@ class Mediad:
 
     async def robotd_link(self):
         """Keep one connection to robotd open, and open it again after a robotd restart."""
-        while True:
-            if self.robotd is None or self.robotd.closed.is_set():
-                try:
-                    self.robotd = await dogproto.Client.connect(dogproto.sock_path("robotd"))
-                    log.info("connected to robotd")
-                except OSError:
-                    self.robotd = None
-            await asyncio.sleep(ROBOTD_RETRY_S)
+        await dogproto.keep_connected(dogproto.sock_path("robotd"), self._set_robotd, ROBOTD_RETRY_S)
+
+    def _set_robotd(self, client):
+        """Use a new robotd connection for the poses."""
+        self.robotd = client
 
     async def snapshot(self, max_px):
         """Return (JPEG bytes, age_ms) of the newest frame."""
         if self.frame is None:
             raise RpcError(dogproto.UNAVAILABLE, "no camera frame yet")
-        t_ns, frame = self.frame
-        jpeg = await asyncio.to_thread(encode_jpeg, frame, max_px)
-        return jpeg, (time.monotonic_ns() - t_ns) // 1_000_000
+        age_ms = self.frame_age_ms()
+        jpeg = await asyncio.to_thread(encode_jpeg, self.frame[1], max_px)
+        return jpeg, age_ms
 
     def frame_age_ms(self):
         """Return the age of the newest frame in ms, or None before the first frame."""
@@ -318,6 +328,7 @@ class Mediad:
         finally:
             if proc.returncode is None:
                 proc.kill()
+                await proc.wait()
 
     async def _fake_play(self, pcm, rate):
         """Write the PCM and log lines to DOG_RUN_DIR, and take the real play time."""
@@ -364,7 +375,7 @@ class Mediad:
         proc = await asyncio.create_subprocess_exec(
             "arecord", "-q", "-D", self.mic, "-t", "raw", "-f", "S16_LE", "-c", "1", "-r", str(REC_RATE),
             stdout=asyncio.subprocess.PIPE)
-        reader = asyncio.ensure_future(proc.stdout.readexactly(MAX_UTTERANCE_S * REC_RATE * 2))
+        reader = asyncio.ensure_future(proc.stdout.readexactly(int(MAX_UTTERANCE_S * REC_RATE * 2)))
         waiter = asyncio.ensure_future(ptt_up.wait())
         await asyncio.wait({reader, waiter}, return_when=asyncio.FIRST_COMPLETED)
         waiter.cancel()
@@ -407,8 +418,8 @@ class Mediad:
             raise RpcError(dogproto.INVALID_PARAMS, f"an item must be {MAX_PLAY_S} s or less")
         if self._queue.qsize() >= PLAY_QUEUE_MAX:
             raise RpcError(dogproto.BUSY, "play queue full")
-        if self._recording is not None and not self._recording.done():
-            raise RpcError(dogproto.BUSY, "push-to-talk in progress")  # never play into the microphone
+        if self._ptt_owner is not None:
+            raise RpcError(dogproto.BUSY, "push-to-talk is down")  # never play into the microphone
         self._queue.put_nowait((pcm, rate))
         return {"queued": self._queue.qsize()}
 
@@ -418,16 +429,42 @@ class Mediad:
         return {}
 
     async def h_ptt(self, params, conn):
-        """audio.ptt: down silences the speaker, sends media.bargein and starts to record; up ends the recording."""
-        if params["down"]:
-            self.cut()
-            self._notify("media.bargein", {})
+        """audio.ptt: down silences the speaker, sends media.bargein and starts to record; up ends the press.
+
+        The press lasts until up or until the connection that pressed closes, also
+        after the recording stopped at its 10 s cap; audio.play is refused until then.
+        """
+        if not params["down"]:
+            self._release_ptt()
+            return {}
+        self.cut()
+        self._notify("media.bargein", {})
+        if self._ptt_owner is None:
+            self._ptt_owner = conn
+            self._watch_ptt_owner(conn)
             if self._recording is None or self._recording.done():
                 self._ptt_up = asyncio.Event()
                 self._recording = asyncio.ensure_future(self._record(self._ptt_up))
-        elif self._ptt_up is not None:
-            self._ptt_up.set()
         return {}
+
+    def _release_ptt(self):
+        """End the press: ptt up, or the close of the connection that pressed."""
+        self._ptt_owner = None
+        if self._ptt_up is not None:
+            self._ptt_up.set()
+
+    def _watch_ptt_owner(self, conn):
+        """Release push-to-talk when conn closes, so a stopped padd cannot leave the microphone open."""
+        if conn in self._ptt_watched:
+            return
+        self._ptt_watched.add(conn)
+
+        def closed():
+            self._ptt_watched.discard(conn)
+            if self._ptt_owner is conn:
+                self._release_ptt()
+
+        conn.on_close.append(closed)
 
 
 # ---------------------------------------------------------------- LAN console
@@ -534,20 +571,24 @@ class Console:
     """The LAN console: one page, the snapshot, the state, and arm, disarm, stop and trick buttons.
 
     Every endpoint needs the console token: a Bearer header, or the HttpOnly
-    SameSite=Strict cookie that GET /?token=... sets with the page. A POST with an Origin header
+    SameSite=Strict cookie that GET /?token=... sets with the page. The cookie
+    holds an HMAC of the token, not the token. A POST with an Origin header
     from another site is refused. The console calls robotd like any local client.
     """
 
     def __init__(self, media, token):
         self.media = media
         self._token = token.encode()
+        # The cookie holds a value derived from the token, so a browser never stores the token itself.
+        self._cookie = hmac.new(self._token, b"cookie", hashlib.sha256).hexdigest().encode()
+        self._open = 0
 
     def _token_ok(self, candidate):
         """Return True when candidate is the console token; constant time."""
         return hmac.compare_digest(candidate.encode(), self._token)
 
     def _authorized(self, headers):
-        """Return True when the request has the token in a Bearer header or the cookie."""
+        """Return True when the request has the token in a Bearer header or the cookie value in the cookie."""
         auth = headers.get("authorization", "")
         if auth.startswith("Bearer ") and self._token_ok(auth[len("Bearer "):]):
             return True
@@ -557,22 +598,31 @@ class Console:
         except http.cookies.CookieError:
             return False
         morsel = cookie.get(CONSOLE_COOKIE)
-        return morsel is not None and self._token_ok(morsel.value)
+        return morsel is not None and hmac.compare_digest(morsel.value.encode(), self._cookie)
 
     async def handle(self, reader, writer):
-        """Serve one HTTP request on one connection, then close it."""
+        """Serve one HTTP request on one connection, then close it; refuse more than 16 open connections."""
+        if self._open >= CONSOLE_MAX_CONNECTIONS:
+            writer.close()
+            return
+        self._open += 1
         try:
             try:
                 request = await asyncio.wait_for(read_request(reader), HTTP_READ_S)
             except (ValueError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError):
                 response = http_response(400, "text/plain", b"bad request\n")
             else:
-                response = await self.route(*request)
+                try:
+                    response = await self.route(*request)
+                except Exception:
+                    log.exception("console request failed")
+                    response = http_response(500, "text/plain", b"internal error\n")
             writer.write(response)
             await writer.drain()
         except ConnectionError:
             pass
         finally:
+            self._open -= 1
             writer.close()
 
     async def route(self, method, path, query, headers, body):
@@ -582,7 +632,7 @@ class Console:
                 return http_response(401, "text/plain", b"wrong console token\n")
             # The page itself, not a redirect: a browser does not send a Strict cookie on a
             # redirect that another app started. The page removes the token from the address bar.
-            cookie = f"Set-Cookie: {CONSOLE_COOKIE}={self._token.decode()}; HttpOnly; SameSite=Strict; Path=/"
+            cookie = f"Set-Cookie: {CONSOLE_COOKIE}={self._cookie.decode()}; HttpOnly; SameSite=Strict; Path=/"
             return http_response(200, "text/html; charset=utf-8", CONSOLE_PAGE, (cookie,))
         if not self._authorized(headers):
             return http_response(401, "text/plain", b"open /?token=<console token> first\n")
@@ -610,12 +660,8 @@ class Console:
 
     async def _post(self, path, body):
         """Run one console button through robotd."""
-        if path == "/arm":
-            return json_response(*await self._robot("robot.enable"))
-        if path == "/disarm":
-            return json_response(*await self._robot("robot.disarm"))
-        if path == "/stop":
-            return json_response(*await self._robot("robot.stop"))
+        if path in CONSOLE_BUTTONS:
+            return json_response(*await self._robot(CONSOLE_BUTTONS[path]))
         if path == "/do":
             try:
                 trick = dogproto.decode(body or b"{}").get("trick")
@@ -658,6 +704,7 @@ async def main(argv=None):
     parser.add_argument("--console-bind")
     parser.add_argument("--console-port", type=int)
     args = parser.parse_args(argv)
+    require_aruco_detector()
     cfg = load_config(args.config)
     dictionary = aruco_dictionary(cfg.get("aruco_dict", "DICT_4X4_50"))
     media = Mediad(args.fake_audio, cfg.get("speaker", "default"), cfg.get("mic", "default"))
@@ -668,13 +715,14 @@ async def main(argv=None):
                              limit=dogproto.MEDIA_LIMIT, group="doglink"),
     ]
     token = os.environ.get("DOG_CONSOLE_TOKEN", "")
-    if token:
+    if len(token) >= CONSOLE_MIN_TOKEN_CHARS:
         bind = args.console_bind or cfg.get("console_bind", "127.0.0.1")
         port = args.console_port or cfg.get("console_port", 8080)
         servers.append(await asyncio.start_server(Console(media, token).handle, bind, port, limit=HTTP_HEAD_LIMIT))
         log.info("console on http://%s:%d", bind, port)
     else:
-        log.warning("DOG_CONSOLE_TOKEN is not set; the LAN console is off")
+        log.error("DOG_CONSOLE_TOKEN must have %d characters or more; the LAN console is off",
+                  CONSOLE_MIN_TOKEN_CHARS)
     loop = asyncio.get_running_loop()
     if args.fake_camera:
         robot_marker = cfg.get("robot_marker", 1)

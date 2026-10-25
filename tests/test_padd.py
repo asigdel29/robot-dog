@@ -1,12 +1,21 @@
-"""Tests of the padd mapping from gamepad events to bus actions; they need no gamepad and no evdev."""
+"""Tests of padd: the mapping from gamepad events to bus actions, and the release of held controls.
 
+They need no gamepad and no evdev: a fake device stands in for the pad.
+"""
+
+import asyncio
 import os
 import sys
+import tempfile
+import time
+import types
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "pi"))
 
+import dogproto  # noqa: E402
 import padd  # noqa: E402
 from padd import ABS_X, ABS_Y, EV_ABS, EV_KEY  # noqa: E402
 
@@ -95,11 +104,94 @@ class Buttons(unittest.TestCase):
         self.assertEqual(press(pad, padd.BTN_Y), [], "unbound")
         self.assertEqual(press(mapper(), padd.BTN_LB), [], "empty bindings by default")
 
+    def test_release_ends_held_controls(self):
+        pad = mapper()
+        self.assertEqual(pad.release(), [])
+        press(pad, padd.BTN_A)
+        pad.on_event(EV_ABS, ABS_Y, -32768, 0.0)
+        pad.on_tick(0.0)
+        self.assertEqual(pad.release(), [("mediad", "audio.ptt", {"down": False}),
+                                         ("robotd", "robot.move", {"vx": 0.0, "vyaw": 0.0})])
+        self.assertEqual(pad.release(), [])
+        self.assertEqual(pad.on_tick(0.05), [])
+
     def test_bad_bindings_refused(self):
         with self.assertRaises(ValueError):
             mapper({"Z": "bark"})
         with self.assertRaises(ValueError):
             mapper({"X": 3})
+
+
+class FakeDevice:
+    """Stands in for an evdev InputDevice: yields events, then fails like an unplugged pad or waits."""
+
+    name = "fake pad"
+    path = "/dev/input/fake"
+
+    def __init__(self, events, unplug):
+        self.events = events
+        self.unplug = unplug
+
+    async def async_read_loop(self):
+        """Yield the events after padd had time to connect, then unplug or wait."""
+        await asyncio.sleep(0.3)
+        for etype, code, value in self.events:
+            yield types.SimpleNamespace(type=etype, code=code, value=value)
+        await asyncio.sleep(0.1)
+        if self.unplug:
+            raise OSError(19, "No such device")
+        await asyncio.Event().wait()
+
+    def close(self):
+        """Do nothing; there is no file."""
+
+
+class PadIO(unittest.IsolatedAsyncioTestCase):
+    """padd.run with a fake pad and a fake mediad: push-to-talk follows the button."""
+
+    async def asyncSetUp(self):
+        env = mock.patch.dict(os.environ, {"DOG_RUN_DIR": tempfile.mkdtemp()})
+        env.start()
+        self.addCleanup(env.stop)
+        self.ptt = []
+
+        async def ptt(params, conn):
+            self.ptt.append(params["down"])
+            return {}
+
+        self.server = await dogproto.serve(dogproto.sock_path("mediad"), {"audio.ptt": ptt})
+        self.addCleanup(self.server.close)
+
+    def start(self, device):
+        """Run padd with device as the only pad it finds."""
+        found = iter([(device, XINPUT)])
+        patcher = mock.patch.object(padd, "find_pad", lambda: next(found, None))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return asyncio.ensure_future(padd.run({}))
+
+    async def wait_ptt(self, expected):
+        """Wait until mediad got exactly these ptt values."""
+        end = time.monotonic() + 3
+        while self.ptt != expected and time.monotonic() < end:
+            await asyncio.sleep(0.02)
+        self.assertEqual(self.ptt, expected)
+
+    async def test_unplug_while_a_down_releases_ptt(self):
+        with self.assertLogs("padd", "WARNING"):
+            task = self.start(FakeDevice([(EV_KEY, padd.BTN_A, 1)], unplug=True))
+            await self.wait_ptt([True, False])
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    async def test_stop_while_a_down_releases_ptt(self):
+        task = self.start(FakeDevice([(EV_KEY, padd.BTN_A, 1)], unplug=False))
+        await self.wait_ptt([True])
+        task.cancel()  # what SIGTERM does
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(self.ptt, [True, False])
 
 
 if __name__ == "__main__":

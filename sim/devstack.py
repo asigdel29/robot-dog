@@ -106,7 +106,7 @@ class Stack:
         """Start (or start again) robotd and wait for its link to the fake bridge."""
         self.spawn("robotd", os.path.join(ROOT, "pi", "robotd.py"), "--serial", os.path.join(self.run_dir, "esp32"),
                    "--registry", self.registry_path, "--config", os.path.join(self.run_dir, "absent.toml"))
-        self.wait_for(lambda: self._state_esp() == "DISARMED", "robotd esp32 link")
+        self.wait_for(lambda: self._state("esp") == "DISARMED", "robotd esp32 link")
 
     def start_mediad(self):
         """Start mediad with the fake camera and fake audio; wait until robotd sees its camera poses."""
@@ -121,10 +121,6 @@ class Stack:
             return self.call("robot.state")[field]
         except (OSError, dogproto.RpcError, TimeoutError):
             return None
-
-    def _state_esp(self):
-        """Return the bridge state that robotd reports, or None."""
-        return self._state("esp")
 
     def wait_for(self, predicate, what, timeout=10.0):
         """Poll predicate until it is true; raise TimeoutError with what."""

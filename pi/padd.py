@@ -4,16 +4,21 @@ It reads a Logitech F310 class pad (XInput mode) with python-evdev and turns
 its events into local bus calls: robot.move notifications to robotd at 20 Hz
 from the left stick, Start to arm, B to stop, Select held for 1 s to disarm, A
 held for push-to-talk on mediad, and X, Y, LB and RB for the tricks in
-[padd.bindings] of dog.toml. When padd stops, the robotd deadman (500 ms)
-stops the motion. A request is sent once and never sent again. evdev is
+[padd.bindings] of dog.toml. When the pad is lost or padd stops, padd
+releases push-to-talk and the stick; if padd dies, the robotd deadman
+(500 ms) stops the motion and mediad releases push-to-talk when the
+connection closes. A request is sent once and never sent again. evdev is
 imported only on the Pi, so the mapping tests run anywhere.
 docs/design/media.md owns the mapping.
 """
 
 import argparse
 import asyncio
+import contextlib
+import functools
 import logging
 import os
+import signal
 import sys
 import time
 import tomllib
@@ -28,6 +33,7 @@ DEADBAND = 0.15
 SELECT_HOLD_S = 1.0
 RETRY_S = 1.0
 REPLY_WAIT_S = 60.0
+RELEASE_WAIT_S = 1.0
 EV_KEY, EV_ABS = 1, 3
 ABS_X, ABS_Y = 0, 1
 #: Linux codes that the xpad driver reports for an XInput pad.
@@ -55,6 +61,7 @@ class PadMapper:
         self._tricks = {TRICK_BUTTONS[name]: trick for name, trick in bindings.items()}
         self._axes = {ABS_X: 0.0, ABS_Y: 0.0}
         self._moving = False
+        self._ptt_down = False
         self._select_since = None
 
     def on_event(self, etype, code, value, now):
@@ -68,6 +75,7 @@ class PadMapper:
             return []
         down = value == 1
         if code == BTN_A:
+            self._ptt_down = down
             return [("mediad", "audio.ptt", {"down": down})]
         if code == BTN_SELECT:
             self._select_since = now if down else None
@@ -98,6 +106,18 @@ class PadMapper:
             self._select_since = None  # once for each hold
         return actions
 
+    def release(self):
+        """Return the actions that end held controls, for a lost pad or a stop of padd."""
+        actions = []
+        if self._ptt_down:
+            actions.append(("mediad", "audio.ptt", {"down": False}))
+        if self._moving:
+            actions.append(("robotd", "robot.move", {"vx": 0.0, "vyaw": 0.0}))
+        self._axes = {ABS_X: 0.0, ABS_Y: 0.0}
+        self._moving = self._ptt_down = False
+        self._select_since = None
+        return actions
+
 
 def find_pad():
     """Return (device, absinfo) of the first device with two stick axes and gamepad buttons, or None."""
@@ -113,18 +133,6 @@ def find_pad():
     return None
 
 
-async def keep_connected(clients, service):
-    """Keep clients[service] open; a closed connection is opened again each 1 s."""
-    while True:
-        client = clients.get(service)
-        if client is None or client.closed.is_set():
-            try:
-                clients[service] = await dogproto.Client.connect(dogproto.sock_path(service))
-            except OSError:
-                clients.pop(service, None)
-        await asyncio.sleep(RETRY_S)
-
-
 async def report(method, call):
     """Wait for one reply and log it; a failed request is not sent again."""
     try:
@@ -134,7 +142,8 @@ async def report(method, call):
 
 
 def dispatch(clients, actions):
-    """Send actions without waiting: robot.move as a notification, the rest as requests."""
+    """Send actions without waiting: robot.move as a notification, the rest as requests; return the request tasks."""
+    tasks = []
     for service, method, params in actions:
         client = clients.get(service)
         if client is None or client.closed.is_set():
@@ -143,7 +152,8 @@ def dispatch(clients, actions):
         if method == "robot.move":
             client.notify(method, params)
         else:
-            asyncio.ensure_future(report(method, client.call(method, params, REPLY_WAIT_S)))
+            tasks.append(asyncio.ensure_future(report(method, client.call(method, params, REPLY_WAIT_S))))
+    return tasks
 
 
 async def tick_loop(mapper, clients):
@@ -155,8 +165,11 @@ async def tick_loop(mapper, clients):
 
 async def run(bindings):
     """Find the pad, map its events, and look for it again each 1 s after an unplug."""
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
     clients = {}
-    keepers = [asyncio.ensure_future(keep_connected(clients, service)) for service in ("robotd", "mediad")]
+    keepers = [asyncio.ensure_future(dogproto.keep_connected(
+        dogproto.sock_path(service), functools.partial(clients.__setitem__, service), RETRY_S))
+        for service in ("robotd", "mediad")]
     try:
         while True:
             found = find_pad()
@@ -175,6 +188,9 @@ async def run(bindings):
             finally:
                 ticker.cancel()
                 device.close()
+                pending = dispatch(clients, mapper.release())
+                if pending:
+                    await asyncio.wait(pending, timeout=RELEASE_WAIT_S)
             await asyncio.sleep(RETRY_S)
     finally:
         for keeper in keepers:
@@ -197,7 +213,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     bindings = load_bindings(args.config)
     PadMapper({ABS_X: (-1, 1), ABS_Y: (-1, 1)}, bindings)
-    asyncio.run(run(bindings))
+    with contextlib.suppress(asyncio.CancelledError, KeyboardInterrupt):
+        asyncio.run(run(bindings))
 
 
 if __name__ == "__main__":

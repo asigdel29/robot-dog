@@ -19,6 +19,7 @@ Both processes are local clients of `robotd`. They move the dog only through `ro
 - A thread reads the frames. Thus a slow camera cannot stop the bus or the console.
 - mediad keeps the newest frame and its monotonic time. `media.snapshot` and the console use this frame.
 - When the camera fails or is disconnected, mediad opens it again each 1 s.
+- mediad needs OpenCV 4.7 or later (`cv2.aruco.ArucoDetector`). With an older OpenCV, mediad stops at start-up and gives the version that it found.
 
 ## 3. Markers
 
@@ -91,8 +92,13 @@ When gamepad A goes down, padd sends `audio.ptt {down: true}`. Then mediad does 
 
 When A goes up, padd sends `audio.ptt {down: false}`. mediad stops `arecord` and sends `media.utterance {id, rate, pcm16_b64}` to each subscriber. Each utterance has a new `id`.
 
+The press follows the button:
+
+- The press ends when A goes up, or when the connection that pressed closes.
+- When padd loses the pad or stops, it sends `audio.ptt {down: false}`. When padd stops suddenly, for example after `kill -9`, the closed connection ends the press.
+- At the 10 s limit, mediad stops `arecord` and sends the utterance. The press continues until A goes up.
+- While the press continues, mediad refuses `audio.play` with BUSY. Thus the speaker cannot play into the microphone.
 - `audio.stop` stops `aplay` and clears the play queue.
-- While A is down, mediad refuses `audio.play` with BUSY. Thus the speaker cannot play into the microphone.
 - mediad records audio only while a person holds A.
 
 `mediad --fake-audio` uses no subprocesses:
@@ -136,12 +142,19 @@ The LAN console is the local interface of the owner. It is a small HTTP server i
 
 Access rules:
 
-1. Each endpoint needs the token, in an `Authorization: Bearer <token>` header or in the cookie.
-2. `GET /?token=<token>` sets the cookie `dog_console` with `HttpOnly` and `SameSite=Strict`.
-3. The browser does not send this cookie when a link in a different app opens `/`. For such a link, use the URL with the token.
-4. A wrong or absent token gets 401.
-5. A POST with an `Origin` header from a different origin gets 403.
-6. mediad compares tokens in constant time.
+1. The token must have 32 characters or more. With a shorter token, mediad logs an error and the console is off.
+2. Each endpoint needs the token in an `Authorization: Bearer <token>` header, or the cookie.
+3. `GET /?token=<token>` sets the cookie `dog_console` with `HttpOnly` and `SameSite=Strict`. The cookie value is an HMAC-SHA256 of the token, not the token.
+4. The browser does not send this cookie when a link in a different app opens `/`. For such a link, use the URL with the token.
+5. A wrong or absent token or cookie gets 401.
+6. A POST with an `Origin` header from a different origin gets 403.
+7. mediad compares tokens and cookies in constant time.
+
+Limits:
+
+- The console accepts 16 open connections. It closes each new connection above this limit at once.
+- A client must send its full request in 3 s. Then the console sends 400 and closes the connection.
+- A request that fails inside the console gets 500.
 
 The console uses HTTP, not HTTPS. The token goes across the LAN as clear text. Use the console only on a trusted LAN.
 
@@ -151,6 +164,9 @@ The console uses HTTP, not HTTPS. The token goes across the LAN as clear text. U
 2. Connect the phone to the LAN of the Pi.
 3. Open `http://robot-pi.local:8080/?token=<token>` on the phone.
 4. Make sure that the page shows the camera image.
+5. Bookmark the page. The address bar now shows `http://robot-pi.local:8080/`, without the token.
+
+Do not bookmark or share the URL with the token.
 
 ## 8. Gamepad
 
@@ -171,6 +187,7 @@ Stick rules:
 - `vyaw` is a left turn. The stick fully left gives 1.
 - padd scales each axis to -1 to 1 with the minimum and the maximum that the device gives.
 - The dead band of padd is 0.15. robotd uses its own dead band of 0.5 to select one drive direction.
+- After a stop or a disarm, robotd ignores the stick until it is back at the center. padd sends the last stick value again 20 times each second, so this latch keeps the stop.
 
 Bindings are empty by default. Example:
 
@@ -184,7 +201,8 @@ padd does not start when a key is not X, Y, LB or RB.
 Safety rules:
 
 - padd sends each request one time. It never sends a `robot.do` again after an error.
-- When padd stops, the robotd deadman stops the stick motion after 500 ms.
+- When padd loses the pad or stops, it sends a zero stick message and releases push-to-talk.
+- When padd stops suddenly, the robotd deadman stops the stick motion after 500 ms.
 - Stick input has priority over a cloud action. robotd cancels the cloud action.
 - B is the local stop. It does not need speech, the cloud or the hub.
 
@@ -196,7 +214,7 @@ The xpad driver gives these Linux codes: A 304, B 305, X 307, Y 308, LB 310, RB 
 | --- | --- | --- |
 | Pose rate | 10 Hz or more | 15.0 Hz |
 | `vision_age_ms` p95 | Less than 200 ms | 65 ms |
-| Push-to-talk cut of the fake speaker | 100 ms or less | p50 0.13 ms, maximum 0.17 ms, 10 trials |
+| Push-to-talk cut of the fake speaker | 100 ms or less | p50 0.3 ms or less, maximum 0.51 ms, 10 trials in each run |
 | goto with the fake camera | 9 of 10 goals | 10 of 10 goals |
 | Heading error of a drawn marker | Less than 5° | 0.7° or less |
 

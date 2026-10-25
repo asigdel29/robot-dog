@@ -1,19 +1,27 @@
 """Tests of mediad: marker math on drawn frames, snapshot, push-to-talk, barge-in, cloud rules and console auth.
 
 The stack tests run mediad with --fake-camera and --fake-audio, so they need no
-camera, microphone or speaker. The barge-in latency is printed so a run can go
-into docs/test-log.md.
+camera, microphone or speaker. The in-process tests put stub aplay and arecord
+scripts on PATH, so the real subprocess paths run too. The barge-in latency is
+printed so a run can go into docs/test-log.md.
 """
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import http.client
 import math
 import os
+import socket
 import statistics
+import subprocess
 import sys
+import tempfile
 import time
+import types
 import unittest
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -24,7 +32,24 @@ sys.path.insert(0, os.path.join(ROOT, "sim"))
 
 import dogproto  # noqa: E402
 import mediad  # noqa: E402
-from devstack import Stack  # noqa: E402
+from devstack import Stack, free_port  # noqa: E402
+
+#: Stub aplay: records its pid and never reads stdin, like a long playback.
+STUB_APLAY = """#!/bin/sh
+echo $$ > "$STUB_DIR/aplay.pid"
+exec sleep 30
+"""
+
+#: Stub arecord: records its pid and writes 16 kHz PCM16 at the real rate.
+STUB_ARECORD = f"""#!{sys.executable}
+import os, sys, time
+with open(os.path.join(os.environ["STUB_DIR"], "arecord.pid"), "w") as handle:
+    handle.write(str(os.getpid()))
+while True:
+    sys.stdout.buffer.write(b"\\x01\\x00" * 800)
+    sys.stdout.buffer.flush()
+    time.sleep(0.05)
+"""
 
 
 def floor():
@@ -69,6 +94,168 @@ class MarkerMath(unittest.TestCase):
     def test_bad_dictionary_refused(self):
         with self.assertRaises(ValueError):
             mediad.aruco_dictionary("os")
+
+    def test_old_opencv_refused(self):
+        old = types.SimpleNamespace(__version__="4.6.0", aruco=types.SimpleNamespace())
+        with mock.patch.object(mediad, "cv2", old), self.assertRaises(SystemExit) as ctx:
+            mediad.require_aruco_detector()
+        self.assertIn("4.7", str(ctx.exception.code))
+        mediad.require_aruco_detector()
+
+
+class FakeConn:
+    """Stands in for a dogproto connection: keeps notifications and runs on_close callbacks on close()."""
+
+    def __init__(self):
+        self.cloud = False
+        self.on_close = []
+        self.notes = []
+
+    def notify(self, method, params=None):
+        """Keep one notification."""
+        self.notes.append((method, params))
+
+    def close(self):
+        """Run the on_close callbacks, as dogproto does when a client goes away."""
+        for callback in self.on_close:
+            callback()
+
+
+async def until(predicate, what, timeout=3.0):
+    """Wait until predicate() is true; fail with what after timeout."""
+    end = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > end:
+            raise AssertionError(f"timed out waiting for {what}")
+        await asyncio.sleep(0.01)
+
+
+def gone(pid):
+    """Return True when no process (not even a zombie) has this pid."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def read_pid(path):
+    """Return the pid that a stub wrote, or None before it wrote it."""
+    try:
+        with open(path) as handle:
+            return int(handle.read())
+    except (OSError, ValueError):
+        return None
+
+
+class InProcess(unittest.IsolatedAsyncioTestCase):
+    """Mediad handlers in this process: push-to-talk ownership, the cap and the real audio subprocess paths."""
+
+    async def asyncSetUp(self):
+        self.stub_dir = tempfile.mkdtemp()
+        for name, body in (("aplay", STUB_APLAY), ("arecord", STUB_ARECORD)):
+            path = os.path.join(self.stub_dir, name)
+            with open(path, "w") as handle:
+                handle.write(body)
+            os.chmod(path, 0o755)
+        env = {"PATH": self.stub_dir + os.pathsep + os.environ["PATH"], "STUB_DIR": self.stub_dir,
+               "DOG_RUN_DIR": self.stub_dir}
+        self.env = mock.patch.dict(os.environ, env)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def media(self, fake_audio):
+        """Return a mediad state object with one subscriber and the player running."""
+        media = mediad.Mediad(fake_audio, "default", "default")
+        self.sub = FakeConn()
+        media._subscribers.add(self.sub)
+        player = asyncio.ensure_future(media.player())
+        self.addCleanup(player.cancel)
+        return media
+
+    async def play_refused(self, media):
+        """Return True when audio.play gives BUSY."""
+        pcm = base64.b64encode(bytes(4800)).decode()
+        try:
+            await media.h_play({"pcm16_b64": pcm}, FakeConn())
+        except dogproto.RpcError as err:
+            return err.code == dogproto.BUSY
+        media.cut()
+        return False
+
+    def utterances(self):
+        """Return the PCM byte counts of the utterances that the subscriber got."""
+        return [len(base64.b64decode(p["pcm16_b64"])) for m, p in self.sub.notes if m == "media.utterance"]
+
+    async def test_close_of_pressing_connection_releases_ptt(self):
+        media = self.media(fake_audio=True)
+        pad = FakeConn()
+        await media.h_ptt({"down": True}, pad)
+        self.assertTrue(await self.play_refused(media))
+        await asyncio.sleep(0.4)
+        pad.close()  # padd died or the pad was lost while A was down
+        await until(lambda: self.utterances(), "utterance after the close")
+        self.assertFalse(await self.play_refused(media))
+
+    async def test_held_past_cap_sends_at_cap_and_stays_down(self):
+        media = self.media(fake_audio=True)
+        pad = FakeConn()
+        with mock.patch.object(mediad, "MAX_UTTERANCE_S", 0.4):
+            await media.h_ptt({"down": True}, pad)
+            await until(lambda: self.utterances(), "utterance at the cap")
+            self.assertAlmostEqual(self.utterances()[0] / 32000, 0.4, delta=0.05)
+            self.assertTrue(await self.play_refused(media), "still down after the cap")
+            await media.h_ptt({"down": False}, pad)
+            self.assertFalse(await self.play_refused(media))
+            self.assertEqual(len(self.utterances()), 1)
+
+    async def test_cut_kills_aplay(self):
+        media = self.media(fake_audio=False)
+        await media.h_play({"pcm16_b64": base64.b64encode(bytes(48000)).decode()}, FakeConn())
+        pid_path = os.path.join(self.stub_dir, "aplay.pid")
+        await until(lambda: read_pid(pid_path), "aplay start")
+        media.cut()
+        await until(lambda: gone(read_pid(pid_path)), "aplay exit", timeout=2)
+        await until(lambda: media._playing is None, "player idle")
+
+    async def test_arecord_partial_read_and_kill(self):
+        media = self.media(fake_audio=False)
+        pad = FakeConn()
+        await media.h_ptt({"down": True}, pad)
+        pid_path = os.path.join(self.stub_dir, "arecord.pid")
+        await until(lambda: read_pid(pid_path), "arecord start")
+        await asyncio.sleep(0.5)
+        await media.h_ptt({"down": False}, pad)
+        await until(lambda: self.utterances(), "utterance after up")
+        self.assertAlmostEqual(self.utterances()[0] / 32000, 0.5, delta=0.15)
+        self.assertTrue(gone(read_pid(pid_path)))
+
+    async def test_arecord_stops_at_cap(self):
+        media = self.media(fake_audio=False)
+        pad = FakeConn()
+        with mock.patch.object(mediad, "MAX_UTTERANCE_S", 0.4):
+            await media.h_ptt({"down": True}, pad)
+            pid_path = os.path.join(self.stub_dir, "arecord.pid")
+            await until(lambda: self.utterances(), "utterance at the cap")
+            self.assertEqual(self.utterances(), [int(0.4 * 32000)])
+            self.assertTrue(gone(read_pid(pid_path)), "arecord ends at the cap while A is down")
+            self.assertTrue(await self.play_refused(media))
+            await media.h_ptt({"down": False}, pad)
+
+    async def test_console_error_gets_500(self):
+        class BrokenMedia:
+            async def snapshot(self, max_px):
+                raise RuntimeError("broken camera path")
+
+        token = "t" * 32
+        server = await asyncio.start_server(mediad.Console(BrokenMedia(), token).handle, "127.0.0.1", 0)
+        self.addCleanup(server.close)
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.sockets[0].getsockname()[1])
+        with self.assertLogs("mediad", "ERROR"):
+            writer.write(f"GET /snapshot.jpg HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n".encode())
+            status = await reader.readline()
+        writer.close()
+        self.assertIn(b" 500 ", status)
 
 
 class MediaStack(unittest.TestCase):
@@ -249,6 +436,11 @@ class MediaStack(unittest.TestCase):
         set_cookie = headers["Set-Cookie"]
         self.assertIn("HttpOnly", set_cookie)
         self.assertIn("SameSite=Strict", set_cookie)
+        token = self.stack.console_token
+        derived = hmac.new(token.encode(), b"cookie", hashlib.sha256).hexdigest()
+        self.assertEqual(set_cookie.split(";")[0], "dog_console=" + derived)
+        self.assertNotIn(token, set_cookie)
+        self.assertEqual(self.request("GET", "/state", {"Cookie": "dog_console=" + token})[0], 401)
         cookie = {"Cookie": set_cookie.split(";")[0]}
         status, headers, body = self.request("GET", "/", cookie)
         self.assertEqual(status, 200)
@@ -276,6 +468,47 @@ class MediaStack(unittest.TestCase):
         bearer = {"Authorization": "Bearer " + self.stack.console_token}
         self.assertEqual(self.request("POST", "/disarm", bearer)[0], 200)
         self.assertFalse(self.stack.call("robot.state")["armed"])
+
+    def test_console_answers_a_deeply_nested_body(self):
+        status = self.request("POST", "/do", {"Cookie": self.cookie()}, b"[" * 1000)[0]
+        self.assertIn(status, (400, 500))
+
+    def test_console_connection_limit(self):
+        port = self.stack.console_port
+        idle = [socket.create_connection(("127.0.0.1", port)) for _ in range(mediad.CONSOLE_MAX_CONNECTIONS)]
+        try:
+            time.sleep(0.3)
+            with socket.create_connection(("127.0.0.1", port)) as extra:
+                extra.settimeout(2)
+                self.assertEqual(extra.recv(64), b"", "connection over the limit is closed at once")
+            idle[0].settimeout(mediad.HTTP_READ_S + 2)
+            start = time.monotonic()
+            self.assertTrue(idle[0].recv(64).startswith(b"HTTP/1.1 400"))
+            self.assertLess(time.monotonic() - start, mediad.HTTP_READ_S + 1)
+        finally:
+            for conn in idle:
+                conn.close()
+        bearer = {"Authorization": "Bearer " + self.stack.console_token}
+        self.stack.wait_for(lambda: self.request("GET", "/state", bearer)[0] == 200, "console after the limit")
+
+    def test_short_token_turns_the_console_off(self):
+        port = free_port()
+        run_dir = tempfile.mkdtemp()
+        proc = subprocess.Popen(
+            [sys.executable, os.path.join(ROOT, "pi", "mediad.py"), "--fake-camera", "--fake-audio",
+             "--config", os.path.join(run_dir, "absent.toml"), "--console-bind", "127.0.0.1",
+             "--console-port", str(port)],
+            env={**os.environ, "DOG_RUN_DIR": run_dir, "DOG_CONSOLE_TOKEN": "x" * 31},
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            self.stack.wait_for(lambda: os.path.exists(os.path.join(run_dir, "mediad-cloud.sock")), "mediad start")
+            time.sleep(0.2)
+            with self.assertRaises(ConnectionRefusedError):
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        finally:
+            proc.terminate()
+            _, err = proc.communicate(timeout=5)
+        self.assertIn("must have 32 characters or more", err)
 
     def test_console_refuses_cross_origin_post(self):
         self.stack.call("robot.disarm")
