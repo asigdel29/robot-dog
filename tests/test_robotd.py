@@ -1,8 +1,12 @@
 """Unit tests for robotd, dogproto and robotctl: registry rules, geometry, the validator and in-process ordering."""
 
+import asyncio
 import copy
+import json
 import os
 import sys
+import tempfile
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -100,6 +104,66 @@ class Params(unittest.TestCase):
     def test_cloud_methods_exclude_arming_and_stick(self):
         for method in ("robot.enable", "robot.move", "robot.capture", "robot.test", "robot.reload", "audio.ptt"):
             self.assertNotIn(method, dogproto.CLOUD_METHODS)
+
+
+class StubLink:
+    """A bridge link that answers ops at once, in the same loop turn as a real fast reply."""
+
+    def __init__(self, daemon, on_op=None):
+        self.daemon = daemon
+        self.ops = []
+        self.on_op = on_op
+
+    def send(self, obj):
+        self.ops.append(obj)
+        if self.on_op is not None and self.on_op(self, obj):
+            return
+        if "id" in obj:
+            loop = asyncio.get_running_loop()
+            loop.call_soon(self.daemon._on_esp, {"ev": "ack", "id": obj["id"]})
+            if obj["op"] == "send":
+                loop.call_soon(self.daemon._on_esp, {"ev": "tx", "id": obj["id"], "frames": 1})
+                loop.call_soon(self.daemon._on_esp, {"ev": "done", "id": obj["id"]})
+
+    def close(self):
+        pass
+
+    def names(self):
+        """Return ops as short strings such as 'send dance' or 'stop'."""
+        return [f"{o['op']} {o['name']}" if "name" in o else o["op"] for o in self.ops]
+
+
+class Conn:
+    """A stand-in for dogproto.Conn."""
+
+    def __init__(self, cloud):
+        self.cloud = cloud
+
+
+class InProcess(unittest.IsolatedAsyncioTestCase):
+    """robotd handlers with a stub link: ordering and race rules that need exact control."""
+
+    def make(self, registry=None, on_op=None):
+        path = os.path.join(tempfile.mkdtemp(), "registry.json")
+        with open(path, "w") as handle:
+            json.dump(DEMO_REGISTRY if registry is None else registry, handle)
+        daemon = robotd.Robotd("/nonexistent", path)
+        daemon.link = StubLink(daemon, on_op)
+        daemon.link_up = True
+        daemon.armed = True
+        daemon._esp_rx = time.monotonic() + 3600  # keep the silence watchdog quiet for direct tick() calls
+        return daemon
+
+    async def test_duplicate_hello_reply_keeps_the_link(self):
+        """A repeated hello can get two replies with our sid; only another sid means a board reset."""
+        daemon = self.make()
+        daemon._sid = 1234
+        daemon._on_esp({"ev": "hello", "sid": 1234, "boot": 1, "fw": "x", "state": "DISARMED"})
+        self.assertTrue(daemon.link_up)
+        self.assertTrue(daemon.armed)
+        daemon._on_esp({"ev": "hello", "sid": 0, "boot": 2, "fw": "x", "state": "DISARMED"})
+        self.assertFalse(daemon.link_up)
+        self.assertFalse(daemon.armed)
 
 
 if __name__ == "__main__":
