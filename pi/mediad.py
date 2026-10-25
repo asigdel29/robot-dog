@@ -12,7 +12,6 @@ subprocesses with a log. docs/design/media.md owns the rules.
 import argparse
 import asyncio
 import base64
-import binascii
 import contextlib
 import hashlib
 import hmac
@@ -410,7 +409,7 @@ class Mediad:
             raise RpcError(dogproto.INVALID_PARAMS, f"rate must be {PLAY_RATES[0]}..{PLAY_RATES[1]}")
         try:
             pcm = base64.b64decode(params["pcm16_b64"], validate=True)
-        except binascii.Error as exc:
+        except ValueError as exc:  # binascii.Error, or a character outside ASCII
             raise RpcError(dogproto.INVALID_PARAMS, "pcm16_b64 is not base64") from exc
         if not pcm or len(pcm) % 2:
             raise RpcError(dogproto.INVALID_PARAMS, "pcm16_b64 must hold whole 16-bit samples")

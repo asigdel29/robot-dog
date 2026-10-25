@@ -360,7 +360,7 @@ class MediaStack(unittest.TestCase):
     def test_play_rules(self):
         quarter_s = base64.b64encode(bytes(int(0.25 * 24000) * 2)).decode()
         one_s = base64.b64encode(bytes(24000 * 2)).decode()
-        bad = ({"pcm16_b64": "***"}, {"pcm16_b64": base64.b64encode(b"abc").decode()},
+        bad = ({"pcm16_b64": "***"}, {"pcm16_b64": "é"}, {"pcm16_b64": base64.b64encode(b"abc").decode()},
                {"pcm16_b64": quarter_s, "rate": 1000},
                {"pcm16_b64": base64.b64encode(bytes(31 * 8000 * 2)).decode(), "rate": 8000})
         for params in bad:
