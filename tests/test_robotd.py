@@ -1,4 +1,4 @@
-"""Unit tests for robotd, dogproto and robotctl: rules, mappings, geometry, and in-process ordering checks."""
+"""Unit tests for robotd, dogproto and robotctl: registry rules, geometry, the validator and in-process ordering."""
 
 import asyncio
 import copy
@@ -34,64 +34,33 @@ class RegistryRules(unittest.TestCase):
     def test_demo_is_valid(self):
         self.assertEqual(robotd.check_registry(DEMO_REGISTRY), [])
 
-    def test_unknown_field_refused(self):
-        self.assertTrue(robotd.check_registry(demo(bark={"colour": "red"})))
-        doc = demo()
-        doc["extra"] = 1
-        self.assertTrue(robotd.check_registry(doc))
-
-    def test_verified_needs_payload(self):
-        self.assertTrue(robotd.check_registry(demo(bark={"ir": None})))
-
-    def test_hold_cap(self):
-        self.assertTrue(robotd.check_registry(demo(forward={"max_run_ms": 1500})))
-
-    def test_perpetual_needs_verified_stop(self):
-        self.assertTrue(robotd.check_registry(demo(stop={"verified": False})))
-
-    def test_cloud_rules(self):
-        self.assertTrue(robotd.check_registry(demo(bark={"verified": False})))
-        self.assertTrue(robotd.check_registry(demo(program={"cloud": True})))
-        self.assertTrue(robotd.check_registry(demo(bark={"natural_ms": None})))
-        self.assertTrue(robotd.check_registry(demo(bark={"natural_ms": 20000})))
-
-    def test_toggle_protocol_refused(self):
-        errors = robotd.check_registry(demo(bark={"ir": {"proto": "RC5", "addr": 0, "cmd": 1}}))
-        self.assertTrue(any("protocol RC5 refused" in e for e in errors), errors)
-
-    def test_run_times_are_bounded(self):
-        self.assertTrue(robotd.check_registry(demo(dance={"max_run_ms": 3600000})))
-        self.assertTrue(robotd.check_registry(demo(dance={"max_run_ms": "3000"})))
-        doc = demo()
-        doc["goto"]["forward_ms"] = 30000
-        self.assertTrue(robotd.check_registry(doc))
-
-    def test_wrong_types_do_not_crash(self):
-        for doc in ({"schema": 1, "commands": {"x": 5}}, {"schema": 1, "drive": []}, {"schema": 1, "goto": None}):
-            self.assertTrue(robotd.check_registry(doc))
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
-            json.dump({"schema": 1, "commands": {"x": 5}}, handle)
-        registry, errors = robotd.load_registry(handle.name)
-        self.assertIsNone(registry)
-        self.assertTrue(errors)
-
-    def test_cloud_capabilities_need_cloud_flag(self):
-        doc = demo(forward={"cloud": False})
-        self.assertTrue(robotd.capabilities(doc)["drive"]["forward"])
-        self.assertFalse(robotd.capabilities(doc, cloud=True)["drive"]["forward"])
-        self.assertFalse(robotd.capabilities(doc, cloud=True)["goto"])
-
-    def test_drive_must_be_hold(self):
-        doc = demo()
-        doc["drive"]["forward"] = "bark"
-        self.assertTrue(robotd.check_registry(doc))
-
-    def test_unverified_drive_is_not_an_error(self):
-        doc = demo(left={"verified": False, "cloud": False}, right={"verified": False, "cloud": False})
-        self.assertEqual(robotd.check_registry(doc), [])
-        caps = robotd.capabilities(doc)
-        self.assertFalse(caps["drive"]["left"])
-        self.assertFalse(caps["goto"])
+    def test_each_rule_refuses_its_violation(self):
+        """One registry for each rule of registry.md section 3; each gives an error and none raises."""
+        extra, bark_drive, list_drive, long_pulse = demo(), demo(), demo(), demo()
+        extra["extra"] = 1
+        bark_drive["drive"]["forward"] = "bark"
+        list_drive["drive"]["forward"] = ["forward"]
+        long_pulse["goto"]["forward_ms"] = 30000
+        cases = {
+            "unknown field": demo(bark={"colour": "red"}), "unknown top field": extra,
+            "verified without payload": demo(bark={"ir": None}),
+            "perpetual stop_via not verified": demo(stop={"verified": False}),
+            "stop_via not a name": demo(dance={"stop_via": ["stop"]}),
+            "hold over 1000 ms": demo(forward={"max_run_ms": 1500}),
+            "cloud not verified": demo(bark={"verified": False}),
+            "cloud episodic without natural_ms": demo(bark={"natural_ms": None}),
+            "cloud episodic over 10 s": demo(bark={"natural_ms": 20000}),
+            "mode command cloud": demo(program={"cloud": True}),
+            "toggle protocol": demo(bark={"ir": {"proto": "RC5", "addr": 0, "cmd": 1}}),
+            "unbounded run time": demo(dance={"max_run_ms": 3600000}),
+            "run time not an int": demo(dance={"max_run_ms": "3000"}),
+            "goto pulse over 1 s": long_pulse, "drive not a hold": bark_drive, "drive not a name": list_drive,
+            "not an object": [], "command not an object": {"schema": 1, "commands": {"x": 5}},
+            "drive not an object": {"schema": 1, "drive": []}, "goto not an object": {"schema": 1, "goto": None},
+        }
+        for rule, doc in cases.items():
+            with self.subTest(rule):
+                self.assertTrue(robotd.check_registry(doc))
 
     def test_bridge_limits(self):
         """A registry with a payload that the bridge refuses at load is never ready (protocol.md 2.4)."""
@@ -99,7 +68,7 @@ class RegistryRules(unittest.TestCase):
         for ir in ({**nec, "cmd": 0x100}, {**nec, "addr": 0x10000}, {**nec, "carrier_khz": 70},
                    {**nec, "carrier_khz": 38.0}, {**nec, "data": -1}, {**nec, "data": "x"}, {**nec, "raw_us": [0]},
                    {"proto": "raw", "raw_us": [60000, 60000, 30001]}, {"proto": "raw", "raw_us": [70000]},
-                   {"proto": "raw", "raw_us": []}, {"proto": "raw", "raw_us": [500] * 121}):
+                   {"proto": "raw", "raw_us": []}, {"proto": "raw", "raw_us": [500] * 121}, 5):
             self.assertTrue(robotd.check_registry(demo(bark={"ir": ir})), ir)
         self.assertEqual(robotd.check_registry(demo(bark={"ir": {**nec, "data": 0xE718FF00}})), [])
         self.assertEqual(robotd.check_registry(demo(bark={"ir": {"proto": "raw", "raw_us": [60000, 60000, 30000]}})), [])
@@ -108,67 +77,66 @@ class RegistryRules(unittest.TestCase):
         many = demo(**{f"c{i}": {"ir": nec} for i in range(24)})
         self.assertTrue(any("more than 24" in e for e in robotd.check_registry(many)))
 
-    def test_goto_needs_forward_and_a_turn(self):
-        self.assertTrue(robotd.capabilities(DEMO_REGISTRY)["goto"])
-        self.assertTrue(robotd.capabilities(demo(left={"verified": False, "cloud": False}))["goto"])
+    def test_unverified_drive_is_only_unavailable(self):
+        """An unverified drive command is not an error; goto needs forward and one turn."""
+        no_left = demo(left={"verified": False, "cloud": False})
+        self.assertEqual(robotd.check_registry(no_left), [])
+        self.assertFalse(robotd.capabilities(no_left)["drive"]["left"])
+        self.assertTrue(robotd.capabilities(no_left)["goto"])
+        no_turn = demo(left={"verified": False, "cloud": False}, right={"verified": False, "cloud": False})
+        self.assertFalse(robotd.capabilities(no_turn)["goto"])
         self.assertFalse(robotd.capabilities(demo(forward={"verified": False, "cloud": False}))["goto"])
 
 
 class Geometry(unittest.TestCase):
     """Stick mapping and the goto step."""
 
-    def test_stick_dead_band(self):
+    def test_stick(self):
+        """Inside the dead band there is no direction; outside it the larger axis wins."""
         self.assertIsNone(robotd.stick_dir(0.3, -0.4))
+        for axes, direction in (((0.9, 0.6), "forward"), ((-0.9, 0.6), "back"), ((0.2, 0.8), "left"),
+                                ((0.2, -0.8), "right")):
+            self.assertEqual(robotd.stick_dir(*axes), direction)
 
-    def test_stick_larger_axis_wins(self):
-        self.assertEqual(robotd.stick_dir(0.9, 0.6), "forward")
-        self.assertEqual(robotd.stick_dir(-0.9, 0.6), "back")
-        self.assertEqual(robotd.stick_dir(0.2, 0.8), "left")
-        self.assertEqual(robotd.stick_dir(0.2, -0.8), "right")
-
-    def test_nav_done_inside_radius(self):
+    def test_nav_step(self):
         self.assertEqual(robotd.nav_step((100, 100, 0), (120, 100), 40), "done")
-
-    def test_nav_forward_when_aligned(self):
         self.assertEqual(robotd.nav_step((100, 100, 0), (300, 110), 40), "forward")
-
-    def test_nav_turns_toward_goal(self):
         # Goal straight below on screen (y down): clockwise, so right.
         self.assertEqual(robotd.nav_step((100, 100, 0), (100, 300), 40), "right")
         self.assertEqual(robotd.nav_step((100, 100, 0), (100, -100), 40), "left")
         self.assertEqual(robotd.nav_step((100, 100, 0), (100, 300), 40, turn_sign=-1), "left")
+        self.assertAlmostEqual(robotd.wrap(3 * math.pi), math.pi)
 
     def test_inside_polygon(self):
         square = [[0, 0], [10, 0], [10, 10], [0, 10]]
         self.assertTrue(robotd.inside((5, 5), square))
         self.assertFalse(robotd.inside((15, 5), square))
 
-    def test_wrap(self):
-        self.assertAlmostEqual(robotd.wrap(3 * math.pi), math.pi)
-
 
 class Params(unittest.TestCase):
     """The dogproto PARAMS validator."""
 
-    def test_unknown_and_missing_fields(self):
-        with self.assertRaises(dogproto.RpcError) as ctx:
-            dogproto.validate("robot.do", {"trick": "bark", "id": "1", "x": 1})
-        self.assertEqual(ctx.exception.code, dogproto.INVALID_PARAMS)
-        with self.assertRaises(dogproto.RpcError):
-            dogproto.validate("robot.do", {"trick": "bark"})
-
-    def test_bool_is_not_int(self):
-        with self.assertRaises(dogproto.RpcError):
-            dogproto.validate("robot.drive", {"dir": "forward", "ms": True, "id": "1"})
-
-    def test_optional_field(self):
+    def test_validate(self):
+        """Unknown, absent and mistyped fields and unknown methods are refused; a final "?" marks an optional field."""
+        for method, params, code in (
+                ("robot.do", {"trick": "bark", "id": "1", "x": 1}, dogproto.INVALID_PARAMS),
+                ("robot.do", {"trick": "bark"}, dogproto.INVALID_PARAMS),
+                ("robot.drive", {"dir": "forward", "ms": True, "id": "1"}, dogproto.INVALID_PARAMS),
+                ("robot.fly", {}, dogproto.METHOD_NOT_FOUND)):
+            with self.subTest(method=method, params=params):
+                with self.assertRaises(dogproto.RpcError) as ctx:
+                    dogproto.validate(method, params)
+                self.assertEqual(ctx.exception.code, code)
         self.assertEqual(dogproto.validate("media.snapshot", {}), {})
         self.assertEqual(dogproto.validate("media.snapshot", {"max_px": 320}), {"max_px": 320})
 
-    def test_unknown_method(self):
-        with self.assertRaises(dogproto.RpcError) as ctx:
-            dogproto.validate("robot.fly", {})
-        self.assertEqual(ctx.exception.code, dogproto.METHOD_NOT_FOUND)
+    def test_nan_never_reaches_the_stick(self):
+        """A clamp turns NaN into full motion, so the bus refuses NaN and Infinity."""
+        with self.assertRaises(ValueError):
+            dogproto.decode('{"vx":NaN,"vyaw":0}')
+        for params in (dogproto.decode('{"vx":1e999,"vyaw":0}'), {"vx": float("nan"), "vyaw": 0.0}):
+            with self.assertRaises(dogproto.RpcError):
+                dogproto.validate("robot.move", params)
 
     def test_cloud_methods_exclude_arming_and_stick(self):
         for method in ("robot.enable", "robot.move", "robot.capture", "robot.test", "robot.reload", "audio.ptt"):
@@ -304,34 +272,26 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
         names = daemon.link.names()
         self.assertEqual(names[names.index("send dance"):], ["send dance", "send stop", "hold left"])
 
-    async def test_stop_latches_a_held_stick(self):
-        """A stop must hold while the stick stays pushed; padd re-sends the stick at 20 Hz."""
-        daemon = self.make()
-        local = Conn(False)
-        await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
-        daemon.tick(1)
-        self.assertIn("hold forward", daemon.link.names())
-        await daemon.h_stop({}, local)
-        stopped_at = len(daemon.link.ops)
-        for tick in range(2, 10):
-            await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
-            daemon.tick(tick)
-        self.assertNotIn("hold forward", daemon.link.names()[stopped_at:])
-        await daemon.h_move({"vx": 0.0, "vyaw": 0.0}, local)  # stick back at center
-        await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
-        daemon.tick(11)
-        self.assertIn("hold forward", daemon.link.names()[stopped_at:])
-
-    async def test_disarm_latches_a_held_stick(self):
-        daemon = self.make()
-        local = Conn(False)
-        await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
-        daemon._disarm("request")
-        daemon.armed = True  # Start pressed again with the stick still pushed
-        disarmed_at = len(daemon.link.ops)
-        await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
-        daemon.tick(1)
-        self.assertNotIn("hold forward", daemon.link.names()[disarmed_at:])
+    async def test_stop_and_disarm_latch_a_held_stick(self):
+        """A stop or a disarm must hold while the stick stays pushed; padd repeats the stick at 20 Hz."""
+        for stop in ("h_stop", "h_disarm"):
+            with self.subTest(stop):
+                daemon = self.make()
+                local = Conn(False)
+                await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
+                daemon.tick(1)
+                self.assertIn("hold forward", daemon.link.names())
+                await getattr(daemon, stop)({}, local)
+                daemon.armed = True  # Start pressed again with the stick still pushed
+                stopped_at = len(daemon.link.ops)
+                for tick in range(2, 10):
+                    await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
+                    daemon.tick(tick)
+                self.assertNotIn("hold forward", daemon.link.names()[stopped_at:])
+                await daemon.h_move({"vx": 0.0, "vyaw": 0.0}, local)  # stick back at center
+                await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
+                daemon.tick(11)
+                self.assertIn("hold forward", daemon.link.names()[stopped_at:])
 
     async def test_goto_keeps_the_last_seen_goal(self):
         """The dog covers a goal marker on the floor as it arrives; goto must still end there."""
@@ -361,12 +321,32 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(daemon.link_up)
         self.assertFalse(daemon.armed)
 
+    async def test_reset_after_the_arm_ack_leaves_the_dog_disarmed(self):
+        """A bridge reset that arrives with the arm ack starts a new, DISARMED link; robotd must not report armed."""
+        def ack_then_reset(link, obj):
+            if obj["op"] != "arm":
+                return False
+            def both():
+                link.daemon._on_esp({"ev": "ack", "id": obj["id"]})
+                link.daemon._on_esp({"ev": "hello", "sid": 0, "boot": 2, "fw": "x", "state": "DISARMED"})
+            asyncio.get_running_loop().call_soon(both)
+            return True
+
+        daemon = self.make(on_op=ack_then_reset)
+        daemon.armed = False
+        daemon._sid = 1234
+        with self.assertRaises(dogproto.RpcError) as ctx:
+            await daemon.h_enable({}, Conn(False))
+        self.assertEqual(ctx.exception.code, dogproto.UNAVAILABLE)
+        self.assertFalse(daemon.armed)
+
     async def test_cloud_drive_needs_cloud_flag(self):
         daemon = self.make(registry=demo(forward={"cloud": False}))
         with self.assertRaises(dogproto.RpcError) as ctx:
             await daemon.h_drive({"dir": "forward", "ms": 300, "id": "a"}, Conn(True))
         self.assertEqual(ctx.exception.code, dogproto.UNAVAILABLE)
-        self.assertFalse(daemon.state(Conn(True))["caps"]["drive"]["forward"])
+        caps = daemon.state(Conn(True))["caps"]
+        self.assertFalse(caps["drive"]["forward"] or caps["goto"])
         await daemon.h_drive({"dir": "forward", "ms": 100, "id": "b"}, Conn(False))
 
     async def test_bad_marker_is_refused_and_does_not_wedge(self):
@@ -376,15 +356,6 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
         result = await daemon.h_do({"trick": "bark", "id": "b"}, Conn(True))
         self.assertTrue(result["transmitted"])
 
-    async def test_nan_never_reaches_the_stick(self):
-        with self.assertRaises(ValueError):
-            dogproto.decode('{"jsonrpc":"2.0","method":"robot.move","params":{"vx":NaN,"vyaw":0}}')
-        with self.assertRaises(dogproto.RpcError):
-            dogproto.validate("robot.move", {"vx": float("nan"), "vyaw": 0.0})
-        daemon = self.make()
-        with self.assertRaises(dogproto.RpcError):
-            await daemon.h_move({"vx": float("inf"), "vyaw": 0.0}, Conn(False))
-
     async def test_failed_action_id_is_not_run_again(self):
         daemon = self.make()
         daemon._observed = lambda before: 1 / 0
@@ -393,6 +364,19 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
                 await daemon.h_do({"trick": "bark", "id": "same"}, Conn(True))
             self.assertEqual(ctx.exception.code, dogproto.INTERNAL_ERROR)
         self.assertEqual(daemon.link.names().count("send bark"), 1)
+
+    async def test_one_capture_at_a_time(self):
+        """A second capture must not take the frames of the first one."""
+        daemon = self.make()
+        daemon.armed = False
+        first = asyncio.ensure_future(daemon.h_capture({"ms": 500}, Conn(False)))
+        await asyncio.sleep(0.01)
+        with self.assertRaises(dogproto.RpcError) as ctx:
+            await daemon.h_capture({"ms": 500}, Conn(False))
+        self.assertEqual(ctx.exception.code, dogproto.BUSY)
+        daemon._on_esp({"ev": "cap", "proto": "NEC"})
+        daemon._on_esp({"ev": "done", "id": daemon.link.ops[-1]["id"]})
+        self.assertEqual((await first)["frames"], [{"proto": "NEC"}])
 
 
 if __name__ == "__main__":

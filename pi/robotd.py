@@ -10,6 +10,7 @@ docs/design/safety.md and docs/design/registry.md own the rules.
 import argparse
 import asyncio
 import collections
+import contextlib
 import itertools
 import json
 import logging
@@ -70,12 +71,22 @@ CMD_DEFAULTS = {"ir": None, "kind": "episodic", "repeat": "none", "period_ms": 1
 # ---------------------------------------------------------------- registry
 
 
+def _int_in(value, low, high):
+    """Return True for an int (not a bool) in low..high."""
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def _num(value):
+    """Return True for a finite int or float (not a bool)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def ir_errors(ir):
-    """Return why the bridge would refuse to load this IR payload (protocol.md 2.4); [] when it can send it."""
+    """Return why an IR payload is refused: an unknown field, or outside the bridge limits (protocol.md 2.4)."""
     if not isinstance(ir, dict):
-        return ["no IR payload"]
+        return ["ir must be an object"]
     proto, raw = ir.get("proto"), ir.get("raw_us", [])
-    errors = []
+    errors = [f"unknown ir field {k}" for k in ir if k not in IR_FIELDS]
     if proto not in PROTOS:
         errors.append(f"protocol {proto} refused; only NEC and raw (no toggle bit)")
     if proto == "NEC" and not (_int_in(ir.get("addr"), 0, 0xFFFF) and _int_in(ir.get("cmd"), 0, 0xFF)):
@@ -95,11 +106,6 @@ def ir_errors(ir):
     return errors
 
 
-def has_payload(ir):
-    """Return True when the bridge can load and send this IR payload."""
-    return not ir_errors(ir)
-
-
 def normalize(doc):
     """Return a copy of a registry with defaults filled in for absent fields."""
     out = dict(doc)
@@ -109,52 +115,23 @@ def normalize(doc):
     return out
 
 
-def _shape_errors(doc):
-    """Return errors for a registry whose containers have the wrong JSON types; normalize needs none."""
-    if not isinstance(doc, dict):
-        return ["registry is not an object"]
-    errors = [f"{key} must be an object" for key in ("commands", "drive", "goto")
-              if not isinstance(doc.get(key, {}), dict)]
-    if errors:
-        return errors
-    for name, cmd in doc.get("commands", {}).items():
-        if not isinstance(cmd, dict):
-            errors.append(f"{name}: must be an object")
-        elif cmd.get("ir") is not None and not isinstance(cmd["ir"], dict):
-            errors.append(f"{name}: ir must be an object or null")
-    return errors
-
-
-def _int_in(value, low, high):
-    """Return True for an int (not a bool) in low..high."""
-    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
-
-
-def _num(value):
-    """Return True for a finite int or float (not a bool)."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
-
-
 def check_registry(doc):
-    """Return a list of rule violations; an empty list means robotd may arm."""
-    errors = _shape_errors(doc)
-    if errors:
-        return errors
-    errors += [f"unknown field {k}" for k in doc if k not in TOP_FIELDS]
+    """Return the rule violations of a registry (registry.md section 3); an empty list means robotd may arm."""
+    if not isinstance(doc, dict) or not all(isinstance(doc.get(k, {}), dict) for k in ("commands", "drive", "goto")):
+        return ["the registry, commands, drive and goto must be objects"]
+    if not all(isinstance(cmd, dict) for cmd in doc.get("commands", {}).values()):
+        return ["each command must be an object"]
+    errors = [f"unknown field {k}" for k in doc if k not in TOP_FIELDS]
     if doc.get("schema") != 1:
         errors.append("schema must be 1")
-    for name, cmd in doc.get("commands", {}).items():
-        errors += [f"{name}: unknown field {k}" for k in cmd if k not in CMD_DEFAULTS]
-        if isinstance(cmd.get("ir"), dict):
-            errors += [f"{name}: unknown ir field {k}" for k in cmd["ir"] if k not in IR_FIELDS]
     errors += [f"drive: unknown field {k}" for k in doc.get("drive", {}) if k not in DIRS]
     errors += [f"goto: unknown field {k}" for k in doc.get("goto", {}) if k not in GOTO_DEFAULTS]
     norm = normalize(doc)
     cmds = norm["commands"]
     for name, cmd in cmds.items():
-        ir = cmd["ir"]
-        if ir is not None:
-            errors += [f"{name}: {e}" for e in ir_errors(ir)]
+        errors += [f"{name}: unknown field {k}" for k in cmd if k not in CMD_DEFAULTS]
+        if cmd["ir"] is not None:
+            errors += [f"{name}: {e}" for e in ir_errors(cmd["ir"])]
         if not 0 < len(name.encode()) <= MAX_NAME_BYTES:
             errors.append(f"{name}: a command name must be 1 to {MAX_NAME_BYTES} bytes in UTF-8")
         if cmd["kind"] not in KINDS:
@@ -163,20 +140,21 @@ def check_registry(doc):
             errors.append(f"{name}: repeat must be one of {REPEATS}")
         if not all(isinstance(cmd[flag], bool) for flag in ("verified", "cloud")):
             errors.append(f"{name}: verified and cloud must be true or false")
+        if not isinstance(cmd["stop_via"], str):
+            errors.append(f"{name}: stop_via must be a string")
         if not _int_in(cmd["period_ms"], 20, 1000):
             errors.append(f"{name}: period_ms must be an int in 20..1000")
         if not _int_in(cmd["max_run_ms"], 1, 10000):
             errors.append(f"{name}: max_run_ms must be an int in 1..10000")
         if cmd["natural_ms"] is not None and not _int_in(cmd["natural_ms"], 0, 60000):
             errors.append(f"{name}: natural_ms must be null or an int in 0..60000")
-        if cmd["verified"] and ir is None:
+        if cmd["verified"] and cmd["ir"] is None:
             errors.append(f"{name}: verified without an IR payload")
         if cmd["kind"] == "hold" and not _int_in(cmd["max_run_ms"], 1, 1000):
             errors.append(f"{name}: hold needs max_run_ms in 1..1000")
-        if cmd["kind"] == "perpetual" and cmd["verified"]:
-            via = cmd["stop_via"]
-            if via not in cmds or not cmds[via]["verified"]:
-                errors.append(f"{name}: perpetual needs stop_via naming a verified command")
+        via = cmds.get(cmd["stop_via"]) if isinstance(cmd["stop_via"], str) else None
+        if cmd["kind"] == "perpetual" and cmd["verified"] and not (via and via["verified"]):
+            errors.append(f"{name}: perpetual needs stop_via naming a verified command")
         if cmd["cloud"]:
             if not cmd["verified"]:
                 errors.append(f"{name}: cloud needs verified")
@@ -184,14 +162,10 @@ def check_registry(doc):
                 errors.append(f"{name}: a mode command can never be cloud")
             if cmd["kind"] == "episodic" and not _int_in(cmd["natural_ms"], 0, 10000):
                 errors.append(f"{name}: episodic cloud needs natural_ms <= 10000")
-    if sum(has_payload(cmd["ir"]) for cmd in cmds.values()) > MAX_ENTRIES:
+    if sum(cmd["ir"] is not None for cmd in cmds.values()) > MAX_ENTRIES:
         errors.append(f"more than {MAX_ENTRIES} commands with an IR payload; the bridge keeps {MAX_ENTRIES}")
     for direction, target in norm["drive"].items():
-        if target is None:
-            continue
-        if target not in cmds:
-            errors.append(f"drive.{direction}: no command {target}")
-        elif cmds[target]["kind"] != "hold":
+        if target is not None and not (isinstance(target, str) and cmds.get(target, {}).get("kind") == "hold"):
             errors.append(f"drive.{direction}: {target} is not a hold command")
     goto = norm["goto"]
     if not _int_in(goto["robot_marker"], 0, 999):
@@ -211,35 +185,19 @@ def check_registry(doc):
 
 
 def capabilities(doc, cloud=False):
-    """Return which drive directions and whether goto are usable; cloud=True also needs each cloud flag."""
-    cmds = normalize(doc)["commands"]
-
-    def usable(target):
-        cmd = cmds.get(target) if target else None
-        return bool(cmd and cmd["verified"] is True and (cmd["cloud"] is True or not cloud))
-
-    drive = {d: usable(t) for d, t in normalize(doc)["drive"].items()}
+    """Return the usable drive directions and goto of a valid registry; cloud=True also needs each cloud flag."""
+    norm = normalize(doc)
+    cmds = norm["commands"]
+    drive = {d: bool(t in cmds and cmds[t]["verified"] and (cmds[t]["cloud"] or not cloud))
+             for d, t in norm["drive"].items()}
     return {"drive": drive, "goto": drive["forward"] and (drive["left"] or drive["right"])}
 
 
-def load_registry(path):
-    """Return (normalized registry or None, errors); never raises for a bad file."""
-    try:
-        with open(path) as handle:
-            doc = json.load(handle)
-    except (OSError, ValueError) as exc:
-        return None, [f"cannot read registry: {exc}"]
-    errors = check_registry(doc)
-    if _shape_errors(doc):
-        return None, errors
-    return normalize(doc), errors
-
-
 def ir_wire(name, cmd):
-    """Return the load message for one command."""
+    """Return the load op fields for one command."""
     ir = cmd["ir"]
     wire = {"name": name, "proto": ir["proto"], "addr": ir.get("addr", 0), "cmd": ir.get("cmd", 0),
-            "bits": ir.get("bits", 32), "raw": ir.get("raw_us", []), "khz": ir.get("carrier_khz", 38),
+            "raw": ir.get("raw_us", []), "khz": ir.get("carrier_khz", 38),
             "repeat": cmd["repeat"], "period_ms": cmd["period_ms"]}
     if "data" in ir:
         wire["data"] = ir["data"]  # the captured NEC frame, sent byte for byte
@@ -264,11 +222,10 @@ def wrap(angle):
 
 
 def nav_step(robot, goal, radius, turn_sign=1):
-    """Return "done", "left", "right" or "forward" for one goto step in image space.
+    """Return "done", "left", "right" or "forward" for one goto step from robot (cx, cy, heading) to goal (cx, cy).
 
-    robot is (cx, cy, heading_rad) and goal is (cx, cy). Image y points down, so
-    a positive heading error is clockwise on screen, which is a right turn when
-    the camera looks straight down. turn_sign = -1 swaps the turns for a mirrored view.
+    Image y points down, so a positive heading error is a right turn when the
+    camera looks straight down; turn_sign = -1 swaps the turns for a mirrored view.
     """
     dx, dy = goal[0] - robot[0], goal[1] - robot[1]
     if math.hypot(dx, dy) <= radius:
@@ -296,11 +253,8 @@ def sd_notify(state):
         return
     if addr.startswith("@"):
         addr = "\0" + addr[1:]
-    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
-        try:
-            sock.sendto(state.encode(), addr)
-        except OSError:
-            pass
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock, contextlib.suppress(OSError):
+        sock.sendto(state.encode(), addr)
 
 
 # ---------------------------------------------------------------- ESP32 link
@@ -325,35 +279,27 @@ class EspLink:
             attrs[4] = attrs[5] = termios.B115200
             termios.tcsetattr(fd, termios.TCSANOW, attrs)
             termios.tcflush(fd, termios.TCIFLUSH)
-        except termios.error as exc:
+        except termios.error:
             os.close(fd)
-            raise OSError(f"tty setup failed: {exc}") from exc  # termios.error is not an OSError
+            raise
         self._fd = fd
         asyncio.get_running_loop().add_reader(fd, self._readable)
 
     def send(self, obj):
-        """Write one line; raise OSError when the link fails."""
+        """Write one line; raise OSError when the link fails. The registry limits keep each line under 1024 bytes."""
         data = (json.dumps(obj, separators=(",", ":")) + "\n").encode()
-        if len(data) > ESP_LINE_LIMIT:
-            raise ValueError("serial line too long")
-        if self._fd is None:
-            raise OSError("link closed")
-        written = os.write(self._fd, data)
-        if written != len(data):
+        if os.write(self._fd, data) != len(data):
             raise OSError("short serial write")
 
     def close(self):
         """Stop to read and close the tty."""
-        if self._fd is None:
-            return
-        try:
+        if self._fd is not None:
             asyncio.get_running_loop().remove_reader(self._fd)
-        except RuntimeError:
-            pass
-        os.close(self._fd)
-        self._fd = None
+            os.close(self._fd)
+            self._fd = None
 
     def _readable(self):
+        """Read the tty and pass each JSON object line on; boot text and too long lines are dropped."""
         try:
             data = os.read(self._fd, 4096)
         except BlockingIOError:
@@ -364,8 +310,7 @@ class EspLink:
         if not data:
             self._on_lost("serial closed")
             return
-        self._buf += data
-        *lines, self._buf = self._buf.split(b"\n")
+        *lines, self._buf = (self._buf + data).split(b"\n")
         if len(self._buf) > ESP_LINE_LIMIT:
             self._buf = b""
         for line in lines:
@@ -381,7 +326,7 @@ class EspLink:
 
 
 class Action:
-    """The one running action: its id, kind, inner task and the ESP32 ids it sent."""
+    """The one running action: its id, kind, inner task, the ESP32 ids it sent and their frames."""
 
     def __init__(self, aid, kind):
         self.aid = aid
@@ -398,7 +343,6 @@ class Robotd:
     def __init__(self, serial_path, registry_path):
         self.serial_path = serial_path
         self.registry_path = registry_path
-        self.registry = self.reg_errors = self.caps = None
         self._load_registry()
         self.link = None
         self.link_up = False
@@ -425,53 +369,43 @@ class Robotd:
         self._last_activity = time.monotonic()
         self._tick_errors = 0
 
-    # ---- handlers table
-
     def handlers(self):
-        """Return the method table for dogproto.serve."""
-        return {
-            "robot.move": self.h_move, "robot.observe": self.h_observe, "robot.enable": self.h_enable,
-            "robot.disarm": self.h_disarm, "robot.stop": self.h_stop, "robot.do": self.h_do,
-            "robot.drive": self.h_drive, "robot.goto": self.h_goto, "robot.state": self.h_state,
-            "robot.capture": self.h_capture, "robot.test": self.h_test, "robot.reload": self.h_reload,
-        }
-
-    @property
-    def registry_ok(self):
-        """True when the registry loaded and broke no rule."""
-        return self.registry is not None and not self.reg_errors
+        """Return the method table for dogproto.serve: robot.x goes to h_x."""
+        return {m: getattr(self, "h_" + m[len("robot."):]) for m in dogproto.PARAMS if m.startswith("robot.")}
 
     def _load_registry(self):
-        """Read the registry and compute the local and cloud capabilities once."""
-        self.registry, self.reg_errors = load_registry(self.registry_path)
-        no_caps = {"drive": {d: False for d in DIRS}, "goto": False}
-        if self.registry is None:
-            self.caps = {False: no_caps, True: no_caps}
-        else:
-            self.caps = {False: capabilities(self.registry), True: capabilities(self.registry, cloud=True)}
+        """Read the registry; one that breaks a rule is replaced by an empty one, so nothing can load or move."""
+        try:
+            with open(self.registry_path) as handle:
+                doc = json.load(handle)
+            self.reg_errors = check_registry(doc)
+        except (OSError, ValueError) as exc:
+            self.reg_errors = [f"cannot read registry: {exc}"]
+        self.registry = normalize({} if self.reg_errors else doc)
+        self.caps = {cloud: capabilities(self.registry, cloud) for cloud in (False, True)}
 
     # ---- ESP32 messages
 
     def _on_esp(self, msg):
+        """Apply one bridge event."""
         self._esp_rx = time.monotonic()
         ev = msg.get("ev")
         if ev == "hello":
-            if msg.get("sid") == self._sid:
-                # The handshake repeats hello until a reply comes, so a slow or booting
-                # bridge can answer twice; a reply with our own sid is never a reset.
-                if self._hello is not None and not self._hello.done():
-                    self._hello.set_result(msg)
-            elif self.link_up:
-                self._link_lost("esp32 reset")
+            if msg.get("sid") != self._sid:
+                if self.link_up:
+                    self._link_lost("esp32 reset")
+            elif self._hello is not None and not self._hello.done():
+                # The handshake repeats hello, so a slow bridge can answer twice; our own sid is never a reset.
+                self._hello.set_result(msg)
         elif ev in ("ack", "nack"):
             future = self._acks.get(msg.get("id"))
             if future is not None and not future.done():
                 future.set_result(msg)
         elif ev == "tx":
             if self.action is not None and msg.get("id") in self.action.esp_ids:
-                self.action.frames += int(msg.get("frames", 1))
+                self.action.frames += msg.get("frames", 1)
         elif ev == "done":
-            future = self._dones.pop(msg.get("id"), None)
+            future = self._dones.get(msg.get("id"))
             if future is not None and not future.done():
                 future.set_result(msg)
         elif ev == "state":
@@ -485,6 +419,7 @@ class Robotd:
             self._capture.append({k: v for k, v in msg.items() if k != "ev"})
 
     def _link_lost(self, reason):
+        """Close the link; an armed dog goes to FAULT."""
         log.warning("esp32 link lost: %s", reason)
         was_up = self.link_up
         self._close_link()
@@ -492,18 +427,20 @@ class Robotd:
             self._to_fault(f"link lost: {reason}")
 
     def _close_link(self):
+        """Close the tty and fail each op that waits for the bridge."""
         if self.link is not None:
             self.link.close()
         self.link = None
         self.link_up = False
         self.esp_state = "down"
-        for future in list(self._acks.values()) + list(self._dones.values()):
+        for future in [*self._acks.values(), *self._dones.values()]:
             if not future.done():
                 future.set_exception(RpcError(dogproto.UNAVAILABLE, "esp32 link down"))
         self._acks.clear()
         self._dones.clear()
 
     async def _open_link(self):
+        """Open the tty, repeat hello until our own reply, then load the registry into bridge RAM."""
         link = EspLink(self.serial_path, self._on_esp, self._link_lost)
         link.open()
         self.link = link
@@ -517,18 +454,15 @@ class Robotd:
             link.send({"op": "hello", "sid": self._sid})
             await asyncio.wait({self._hello}, timeout=0.5)
         hello = self._hello.result()
-        loaded = 0
-        if self.registry is not None:
-            for name, cmd in self.registry["commands"].items():
-                if has_payload(cmd["ir"]):
-                    await self._esp_call("load", **ir_wire(name, cmd))
-                    loaded += 1
-        self._loaded = loaded
+        entries = [(name, cmd) for name, cmd in self.registry["commands"].items() if cmd["ir"] is not None]
+        for name, cmd in entries:
+            await self._esp_call("load", **ir_wire(name, cmd))
+        self._loaded = len(entries)
         self._esp_rx = time.monotonic()
         # Report the bridge state only now: a client that sees DISARMED must be able to arm at once.
         self.esp_state = hello.get("state", "?")
         self.link_up = True
-        log.info("esp32 link up: fw=%s boot=%s loaded=%d", hello.get("fw"), hello.get("boot"), loaded)
+        log.info("esp32 link up: fw=%s boot=%s loaded=%d", hello.get("fw"), hello.get("boot"), self._loaded)
 
     async def connector(self):
         """Open and re-open the ESP32 link forever; a new link always starts DISARMED."""
@@ -538,8 +472,6 @@ class Robotd:
                 try:
                     await self._open_link()
                     last_error = None
-                except asyncio.CancelledError:
-                    raise
                 except Exception as exc:  # any failure must leave the connector alive for the next try
                     if str(exc) != last_error:
                         last_error = str(exc)
@@ -547,62 +479,58 @@ class Robotd:
                     self._close_link()
             await asyncio.sleep(1.0)
 
-    def _esp_send(self, op, want_done=False, want_ack=False, **fields):
-        """Send one op with a new id and track it on the running action.
-
-        Return (id, done future or None, ack future or None). The futures exist
-        before the line leaves, so a fast reply in the same read is not lost.
-        """
+    def _esp_send(self, op, **fields):
+        """Send one op with a new id, counted on the running action; return the id."""
         if self.link is None:
             raise RpcError(dogproto.UNAVAILABLE, "esp32 link down")
         esp_id = next(self._esp_ids)
-        loop = asyncio.get_running_loop()
-        done = ack = None
-        if want_done:
-            done = self._dones[esp_id] = loop.create_future()
-        if want_ack:
-            ack = self._acks[esp_id] = loop.create_future()
         if self.action is not None:
             self.action.esp_ids.add(esp_id)
         try:
             self.link.send({"op": op, "id": esp_id, **fields})
         except OSError as exc:
-            self._dones.pop(esp_id, None)
-            self._acks.pop(esp_id, None)
             self._link_lost(str(exc))
             raise RpcError(dogproto.UNAVAILABLE, "esp32 link down") from exc
-        return esp_id, done, ack
+        return esp_id
 
-    async def _esp_call(self, op, want_done=False, **fields):
-        """Send one op and wait for its ack; return (id, done future); raise RpcError on nack or silence."""
-        esp_id, done, ack = self._esp_send(op, want_done=want_done, want_ack=True, **fields)
+    async def _esp_call(self, op, done_s=None, **fields):
+        """Send one op, wait for its ack and, with done_s, for its done; raise RpcError on nack or silence.
+
+        The reply futures exist before the next await, so a fast reply is never lost.
+        """
+        esp_id = self._esp_send(op, **fields)
+        loop = asyncio.get_running_loop()
+        ack = self._acks[esp_id] = loop.create_future()
+        if done_s:
+            done = self._dones[esp_id] = loop.create_future()
         try:
             # Not wait_for: on Python 3.11 it drops a cancel that arrives with the reply, so a stop could be lost.
             async with asyncio.timeout(ACK_WAIT_S):
                 reply = await ack
+            if reply.get("ev") == "nack":
+                raise RpcError(dogproto.FAULT, f"esp32 refused {op}: {reply.get('why', '?')}")
+            if done_s:
+                async with asyncio.timeout(done_s):
+                    await done
         except TimeoutError as exc:
-            self._dones.pop(esp_id, None)
-            raise RpcError(dogproto.TIMEOUT, f"esp32 did not answer {op}") from exc
+            raise RpcError(dogproto.TIMEOUT, f"esp32 did not finish {op}") from exc
         finally:
             self._acks.pop(esp_id, None)
-        if reply.get("ev") == "nack":
             self._dones.pop(esp_id, None)
-            raise RpcError(dogproto.FAULT, f"esp32 refused {op}: {reply.get('why', '?')}")
-        return esp_id, done
 
     def _esp_quiet(self, op, **fields):
         """Send an op and ignore a link failure; used on the stop path."""
-        try:
+        with contextlib.suppress(RpcError):
             self._esp_send(op, **fields)
-        except RpcError:
-            pass
 
     # ---- safety state
 
     def _touch(self):
+        """Restart the arm idle timer."""
         self._last_activity = time.monotonic()
 
     def _to_fault(self, reason):
+        """Go to FAULT and disarm; only robot.enable clears it."""
         log.error("FAULT: %s", reason)
         self.fault = reason
         self._disarm(reason)
@@ -617,41 +545,40 @@ class Robotd:
         return False
 
     def _disarm(self, reason):
-        """Disarm now. With an action running, only stop repeats here: the action's cleanup may still
-        need to send its stop_via command, which the bridge refuses once DISARMED, and _run_action
-        sends the bridge disarm after that cleanup."""
+        """Disarm now; a running action first sends its stop_via, and _run_action then sends the bridge disarm."""
         if self.armed:
             log.info("disarm: %s", reason)
         self.armed = False
         self._latch_stick()
         if self._cancel_action(reason):
-            self._esp_quiet("stop")
+            self._esp_quiet("stop")  # the bridge refuses stop_via once DISARMED
         else:
             self._esp_quiet("disarm")
 
     def _latch_stick(self):
-        """Drop the stick intent and ignore stick input until the stick is back at center.
-
-        padd sends the last stick value again at 20 Hz, so without the latch a stop
-        or disarm would be undone by the next tick while the stick stays pushed.
-        """
+        """Drop the stick intent and ignore the stick until it is back at center; padd repeats it at 20 Hz."""
         self._move = (0.0, 0.0, 0.0)
         self._stick = None
         self._stick_latched = True
 
+    def _require_link(self):
+        """Raise UNAVAILABLE while the bridge link is down."""
+        if not self.link_up:
+            raise RpcError(dogproto.UNAVAILABLE, "esp32 link down")
+
     def _require_ready(self):
+        """Raise unless robotd can start an action."""
         if self.fault:
             raise RpcError(dogproto.FAULT, self.fault)
         if not self.armed:
             raise RpcError(dogproto.NOT_ARMED, "not armed: ask the owner to press Start")
-        if not self.link_up:
-            raise RpcError(dogproto.UNAVAILABLE, "esp32 link down")
+        self._require_link()
 
     def health(self):
         """Return "ok", "degraded" or "fault" for the update gate and the console."""
         if self.fault:
             return "fault"
-        if not self.link_up or not self.registry_ok or self.degraded_windows >= DEGRADED_WINDOWS:
+        if not self.link_up or self.reg_errors or self.degraded_windows >= DEGRADED_WINDOWS:
             return "degraded"
         return "ok"
 
@@ -706,24 +633,21 @@ class Robotd:
 
     def _drive_stick(self, direction):
         """Keep the stick command held with short leases, or release it."""
-        name = None
-        if direction and self.caps[False]["drive"].get(direction):
-            name = self.registry["drive"][direction]
-        if name is None:
+        if not (direction and self.caps[False]["drive"][direction]):
             if self._stick is not None:
                 self._stick = None
                 self._esp_quiet("stop")
             return
         self._touch()
-        self._stick = name
+        self._stick = self.registry["drive"][direction]
         if self._cancel_action("preempted by local stick"):
             return  # hold from the next tick, after the action's own stop and stop_via have gone out
-        self._esp_quiet("hold", name=name, lease_ms=HOLD_LEASE_MS)
+        self._esp_quiet("hold", name=self._stick, lease_ms=HOLD_LEASE_MS)
 
-    # ---- action plumbing
+    # ---- actions
 
-    async def _run_action(self, kind, aid, conn, body):
-        """Run one action body with the busy, duplicate, ownership and stop rules."""
+    async def _run_action(self, kind, aid, body):
+        """Run body() as the one action with the busy, duplicate, ownership and stop rules."""
         if aid in self._results:
             ok, value = self._results[aid]
             if ok:
@@ -738,7 +662,7 @@ class Robotd:
         action = Action(aid, kind)
         self.action = action
         self._touch()
-        action.task = asyncio.ensure_future(body(action))
+        action.task = asyncio.ensure_future(body())
         # Every exit path records the id, so a retry with the same id never moves the dog again.
         try:
             result = await action.task
@@ -767,29 +691,17 @@ class Robotd:
         return result
 
     def _remember(self, aid, ok, value):
+        """Keep the result of the last RESULT_CACHE action ids."""
         self._results[aid] = (ok, value)
         while len(self._results) > RESULT_CACHE:
             self._results.popitem(last=False)
-
-    def _command(self, name, conn):
-        cmd = self.registry["commands"].get(name) if self.registry else None
-        if cmd is None:
-            raise RpcError(dogproto.UNAVAILABLE, f"no trick {name}")
-        if not cmd["verified"]:
-            raise RpcError(dogproto.UNAVAILABLE, f"{name} is not verified")
-        if conn.cloud and not cmd["cloud"]:
-            raise RpcError(dogproto.UNAVAILABLE, f"{name} is not enabled for remote use")
-        return cmd
 
     async def _hold(self, name, ms):
         """Hold one command for ms with renewed leases, then release it."""
         end = time.monotonic() + ms / 1000
         first = True
         try:
-            while True:
-                left = end - time.monotonic()
-                if left <= 0:
-                    break
+            while (left := end - time.monotonic()) > 0:
                 lease = max(1, int(min(HOLD_LEASE_MS, left * 1000)))
                 if first:
                     await self._esp_call("hold", name=name, lease_ms=lease)
@@ -800,53 +712,43 @@ class Robotd:
         finally:
             self._esp_quiet("stop")
 
-    async def _send_once(self, name):
-        """Send one command and wait until the bridge has transmitted it."""
-        _, done = await self._esp_call("send", want_done=True, name=name)
-        try:
-            async with asyncio.timeout(2.0):
-                await done
-        except TimeoutError as exc:
-            raise RpcError(dogproto.TIMEOUT, f"esp32 did not finish {name}") from exc
-
     async def _trick(self, name, cmd):
         """Run one verified command to its natural end or its limit."""
         kind = cmd["kind"]
         if kind == "hold":
-            await self._hold(name, cmd["max_run_ms"])
-            return {}
+            return await self._hold(name, cmd["max_run_ms"])
         cancelled = False
         try:
-            await self._send_once(name)
+            await self._esp_call("send", done_s=2.0, name=name)
             if kind == "episodic":
                 await asyncio.sleep((cmd["natural_ms"] or 0) / 1000)
             elif kind == "perpetual":
                 await asyncio.sleep(min(cmd["natural_ms"] or cmd["max_run_ms"], cmd["max_run_ms"]) / 1000)
-            return {}
         except asyncio.CancelledError:
             cancelled = True
             raise
         finally:
             # A perpetual trick always ends with its stop command; an episodic one only when stopped early.
-            via = cmd["stop_via"]
-            if via in self.registry["commands"] and (kind == "perpetual" or cancelled):
-                self._esp_quiet("send", name=via)
+            if cmd["stop_via"] in self.registry["commands"] and (kind == "perpetual" or cancelled):
+                self._esp_quiet("send", name=cmd["stop_via"])
 
     # ---- vision
 
     def _markers(self):
+        """Return (age in s, markers) of the last camera frame."""
         t_ns, markers = self._pose
-        age = time.monotonic() - t_ns / 1e9 if t_ns else math.inf
-        return age, markers
+        return (time.monotonic() - t_ns / 1e9 if t_ns else math.inf), markers
 
     def _robot_pose(self):
+        """Return the robot marker (cx, cy, heading), or None when it is not seen or the frame is old."""
         age, markers = self._markers()
-        robot_id = str(self.registry["goto"]["robot_marker"]) if self.registry else "1"
+        robot_id = str(self.registry["goto"]["robot_marker"])
         if age > VISION_MAX_AGE_S or robot_id not in markers:
             return None
         return tuple(markers[robot_id])
 
     def _observed(self, before):
+        """Return the camera result of an action, or None without a pose before and after."""
         after = self._robot_pose()
         if before is None or after is None:
             return None
@@ -856,9 +758,7 @@ class Robotd:
     # ---- method handlers
 
     async def h_move(self, params, conn):
-        """robot.move: store the stick intent; the loop applies it with the deadman."""
-        if not (_num(params["vx"]) and _num(params["vyaw"])):
-            raise RpcError(dogproto.INVALID_PARAMS, "vx and vyaw must be finite")
+        """robot.move: store the stick intent; the loop applies it with the deadman. dogproto refuses NaN."""
         vx = max(-1.0, min(1.0, float(params["vx"])))
         vyaw = max(-1.0, min(1.0, float(params["vyaw"])))
         if self._stick_latched:
@@ -878,11 +778,11 @@ class Robotd:
 
     async def h_enable(self, params, conn):
         """robot.enable: arm the dog; clears a FAULT once the link is healthy again."""
-        if not self.registry_ok:
+        if self.reg_errors:
             raise RpcError(dogproto.UNAVAILABLE, "registry not ready", self.reg_errors[:5])
-        if not self.link_up:
-            raise RpcError(dogproto.UNAVAILABLE, "esp32 link down")
+        self._require_link()
         await self._esp_call("arm", n=self._loaded)
+        self._require_link()  # a bridge reset right after its ack starts a new, DISARMED link
         self.fault = None
         self.armed = True
         self._touch()
@@ -903,8 +803,13 @@ class Robotd:
 
     async def h_do(self, params, conn):
         """robot.do: run one verified trick; replies when it ends."""
-        cmd = self._command(params["trick"], conn)
-        return await self._run_action("do", params["id"], conn, lambda a: self._trick(params["trick"], cmd))
+        name = params["trick"]
+        cmd = self.registry["commands"].get(name)
+        if cmd is None or not cmd["verified"]:
+            raise RpcError(dogproto.UNAVAILABLE, f"{name} is not a verified trick")
+        if conn.cloud and not cmd["cloud"]:
+            raise RpcError(dogproto.UNAVAILABLE, f"{name} is not enabled for remote use")
+        return await self._run_action("do", params["id"], lambda: self._trick(name, cmd))
 
     async def h_drive(self, params, conn):
         """robot.drive: hold one drive direction for a bounded time."""
@@ -914,17 +819,17 @@ class Robotd:
         if not self.caps[conn.cloud]["drive"][direction]:
             raise RpcError(dogproto.UNAVAILABLE, f"{direction} is not available")
         name = self.registry["drive"][direction]
-        limit = self._command(name, conn)["max_run_ms"]
+        limit = self.registry["commands"][name]["max_run_ms"]
         if not 50 <= ms <= limit:
             raise RpcError(dogproto.INVALID_PARAMS, f"ms must be 50..{limit}")
-        return await self._run_action("drive", params["id"], conn, lambda a: self._hold(name, ms))
+        return await self._run_action("drive", params["id"], lambda: self._hold(name, ms))
 
     async def h_goto(self, params, conn):
         """robot.goto: drive toward an ArUco marker with short pulses, 30 s limit."""
-        if not self.caps[conn.cloud]["goto"]:
+        caps = self.caps[conn.cloud]
+        if not caps["goto"]:
             raise RpcError(dogproto.UNAVAILABLE, "goto needs verified forward and turn commands")
-        caps = self.caps[conn.cloud]["drive"]
-        return await self._run_action("goto", params["id"], conn, lambda a: self._goto(str(params["marker"]), caps))
+        return await self._run_action("goto", params["id"], lambda: self._goto(str(params["marker"]), caps["drive"]))
 
     async def _goto(self, goal_id, caps):
         """Drive toward the goal marker; the goal is where the camera last saw it in this goto."""
@@ -968,58 +873,47 @@ class Robotd:
         return self.state(conn)
 
     def state(self, conn):
-        """Return the state object; a cloud caller sees only cloud tricks."""
+        """Return the state object; a cloud caller sees only cloud tricks and cloud capabilities."""
         age, _ = self._markers()
-        tricks = []
-        if self.registry:
-            for name, cmd in self.registry["commands"].items():
-                if cmd["verified"] and (cmd["cloud"] or not conn.cloud):
-                    tricks.append({"name": name, "kind": cmd["kind"], "say": cmd["say"], "cloud": cmd["cloud"]})
+        tricks = [{"name": name, "kind": cmd["kind"], "say": cmd["say"], "cloud": cmd["cloud"]}
+                  for name, cmd in self.registry["commands"].items()
+                  if cmd["verified"] and (cmd["cloud"] or not conn.cloud)]
         return {
             "api": dogproto.API_VERSION, "health": self.health(), "armed": self.armed, "fault": self.fault,
             "busy": None if self.action is None else {"kind": self.action.kind, "id": self.action.aid},
             "stick": self._stick, "esp": self.esp_state, "esp_max_loop_us": self.esp_max_loop_us,
             "loop_hz": round(self.loop_hz, 1),
             "vision_age_ms": None if math.isinf(age) else int(age * 1000),
-            "registry_ready": self.registry_ok, "registry_errors": self.reg_errors[:5],
+            "registry_ready": not self.reg_errors, "registry_errors": self.reg_errors[:5],
             "tricks": tricks, "caps": self.caps[conn.cloud],
         }
 
     async def h_capture(self, params, conn):
-        """robot.capture: record remote frames for ms; DISARMED only."""
-        if self.armed:
-            raise RpcError(dogproto.BUSY, "disarm before capture")
-        if not self.link_up:
-            raise RpcError(dogproto.UNAVAILABLE, "esp32 link down")
+        """robot.capture: record remote frames for ms; DISARMED only, one capture at a time."""
+        if self.armed or self._capture is not None:
+            raise RpcError(dogproto.BUSY, "a capture needs DISARMED and no other capture")
+        self._require_link()
         ms = params["ms"]
         if not 100 <= ms <= 10000:
             raise RpcError(dogproto.INVALID_PARAMS, "ms must be 100..10000")
-        self._capture = []
+        frames = self._capture = []
         try:
-            _, done = await self._esp_call("capture", want_done=True, ms=ms)
-            async with asyncio.timeout(ms / 1000 + 1.0):
-                await done
-            return {"frames": self._capture}
+            await self._esp_call("capture", done_s=ms / 1000 + 1.0, ms=ms)
+            return {"frames": frames}
         finally:
             self._capture = None
 
     async def h_test(self, params, conn):
         """robot.test: send any command with an IR payload for up to 1 s; READY only."""
         name, ms = params["name"], params["ms"]
-        cmd = self.registry["commands"].get(name) if self.registry else None
-        if cmd is None or not has_payload(cmd["ir"]):
+        cmd = self.registry["commands"].get(name)
+        if cmd is None or cmd["ir"] is None:
             raise RpcError(dogproto.UNAVAILABLE, f"no IR payload for {name}")
         if not 50 <= ms <= 1000:
             raise RpcError(dogproto.INVALID_PARAMS, "ms must be 50..1000")
-
-        async def body(action):
-            if cmd["repeat"] == "none":
-                await self._send_once(name)
-            else:
-                await self._hold(name, ms)
-            return {"name": name}
-
-        return await self._run_action("test", f"test-{time.monotonic_ns()}", conn, body)
+        once = cmd["repeat"] == "none"
+        return await self._run_action("test", f"test-{time.monotonic_ns()}", lambda: (
+            self._esp_call("send", done_s=2.0, name=name) if once else self._hold(name, ms)))
 
     async def h_reload(self, params, conn):
         """robot.reload: read the registry again and re-load the bridge; DISARMED only."""
@@ -1027,7 +921,7 @@ class Robotd:
             raise RpcError(dogproto.BUSY, "disarm before reload")
         self._load_registry()
         self._close_link()  # the connector opens it again and loads the new entries
-        return {"ready": self.registry_ok, "errors": self.reg_errors}
+        return {"ready": not self.reg_errors, "errors": self.reg_errors}
 
     async def shutdown(self):
         """Stop IR output and disarm before the process exits."""
