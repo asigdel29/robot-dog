@@ -35,6 +35,9 @@ HELLO_WAIT_S = 5.0
 ACK_WAIT_S = 0.5
 STICK_DEADBAND = 0.5
 HOLD_LEASE_MS = 300  # firmware caps leases at 400; 300 gives three renewals of margin
+HOLD_RENEW_S = 0.1
+VISION_MAX_AGE_S = 2.0
+RESULT_CACHE = 256
 MAX_TICK_ERRORS = 10
 DEGRADED_HZ = 15
 DEGRADED_WINDOWS = 5
@@ -204,6 +207,11 @@ def stick_dir(vx, vyaw):
     return "left" if vyaw > 0 else "right"
 
 
+def wrap(angle):
+    """Wrap an angle to (-pi, pi]."""
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
 def sd_notify(state):
     """Send one systemd notify message; do nothing outside systemd."""
     addr = os.environ.get("NOTIFY_SOCKET")
@@ -279,6 +287,18 @@ class EspLink:
 
 
 # ---------------------------------------------------------------- daemon
+
+
+class Action:
+    """The one running action: its id, kind, inner task, the ESP32 ids it sent and their frames."""
+
+    def __init__(self, aid, kind):
+        self.aid = aid
+        self.kind = kind
+        self.task = None
+        self.esp_ids = set()
+        self.frames = 0
+        self.reason = "stopped"
 
 
 class Robotd:
@@ -582,12 +602,115 @@ class Robotd:
             return  # hold from the next tick, after the action's own stop and stop_via have gone out
         self._esp_quiet("hold", name=self._stick, lease_ms=HOLD_LEASE_MS)
 
+    # ---- actions
+
+    async def _run_action(self, kind, aid, body):
+        """Run body() as the one action with the busy, duplicate, ownership and stop rules."""
+        if aid in self._results:
+            ok, value = self._results[aid]
+            if ok:
+                return value
+            raise RpcError(*value)
+        self._require_ready()
+        if self.action is not None:
+            raise RpcError(dogproto.BUSY, f"busy with {self.action.kind} {self.action.aid}")
+        if self._stick is not None:
+            raise RpcError(dogproto.BUSY, "the local stick is in control")
+        before = self._robot_pose()
+        action = Action(aid, kind)
+        self.action = action
+        self._touch()
+        action.task = asyncio.ensure_future(body())
+        # Every exit path records the id, so a retry with the same id never moves the dog again.
+        try:
+            result = await action.task
+            result = {**(result or {}), "transmitted": action.frames > 0, "frames": action.frames,
+                      "observed": self._observed(before)}
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                self._remember(aid, False, (dogproto.PREEMPTED, "owner disconnected"))
+                raise  # the owner connection closed; the inner task was cancelled with it
+            self._remember(aid, False, (dogproto.PREEMPTED, action.reason))
+            raise RpcError(dogproto.PREEMPTED, action.reason) from None
+        except RpcError as err:
+            self._remember(aid, False, (err.code, err.message))
+            raise
+        except Exception as exc:
+            log.exception("action %s failed", aid)
+            self._remember(aid, False, (dogproto.INTERNAL_ERROR, str(exc)))
+            raise RpcError(dogproto.INTERNAL_ERROR, str(exc)) from exc
+        finally:
+            self.action = None  # the only action: BUSY refuses a second one
+            self._touch()
+            if not self.armed:
+                self._esp_quiet("disarm")  # after the body cleanup, which needs READY for stop_via
+        self._remember(aid, True, result)
+        return result
+
+    def _remember(self, aid, ok, value):
+        """Keep the result of the last RESULT_CACHE action ids."""
+        self._results[aid] = (ok, value)
+        while len(self._results) > RESULT_CACHE:
+            self._results.popitem(last=False)
+
+    async def _hold(self, name, ms):
+        """Hold one command for ms with renewed leases, then release it."""
+        end = time.monotonic() + ms / 1000
+        first = True
+        try:
+            while (left := end - time.monotonic()) > 0:
+                lease = max(1, int(min(HOLD_LEASE_MS, left * 1000)))
+                if first:
+                    await self._esp_call("hold", name=name, lease_ms=lease)
+                    first = False
+                else:
+                    self._esp_send("hold", name=name, lease_ms=lease)
+                await asyncio.sleep(min(HOLD_RENEW_S, left))
+        finally:
+            self._esp_quiet("stop")
+
+    async def _trick(self, name, cmd):
+        """Run one verified command to its natural end or its limit."""
+        kind = cmd["kind"]
+        if kind == "hold":
+            return await self._hold(name, cmd["max_run_ms"])
+        cancelled = False
+        try:
+            await self._esp_call("send", done_s=2.0, name=name)
+            if kind == "episodic":
+                await asyncio.sleep((cmd["natural_ms"] or 0) / 1000)
+            elif kind == "perpetual":
+                await asyncio.sleep(min(cmd["natural_ms"] or cmd["max_run_ms"], cmd["max_run_ms"]) / 1000)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            # A perpetual trick always ends with its stop command; an episodic one only when stopped early.
+            if cmd["stop_via"] in self.registry["commands"] and (kind == "perpetual" or cancelled):
+                self._esp_quiet("send", name=cmd["stop_via"])
+
     # ---- vision
 
     def _markers(self):
         """Return (age in s, markers) of the last camera frame."""
         t_ns, markers = self._pose
         return (time.monotonic() - t_ns / 1e9 if t_ns else math.inf), markers
+
+    def _robot_pose(self):
+        """Return the robot marker (cx, cy, heading), or None when it is not seen or the frame is old."""
+        age, markers = self._markers()
+        robot_id = str(self.registry["goto"]["robot_marker"])
+        if age > VISION_MAX_AGE_S or robot_id not in markers:
+            return None
+        return tuple(markers[robot_id])
+
+    def _observed(self, before):
+        """Return the camera result of an action, or None without a pose before and after."""
+        after = self._robot_pose()
+        if before is None or after is None:
+            return None
+        return {"moved_px": round(math.hypot(after[0] - before[0], after[1] - before[1]), 1),
+                "turned_deg": round(math.degrees(wrap(after[2] - before[2])), 1)}
 
     # ---- method handlers
 
@@ -601,6 +724,14 @@ class Robotd:
                 return
             self._stick_latched = False
         self._move = (vx, vyaw, time.monotonic())
+
+    async def h_observe(self, params, conn):
+        """robot.observe: store the latest marker poses from mediad; refuse a malformed frame whole."""
+        markers = params["markers"]
+        for value in markers.values():
+            if not (isinstance(value, list) and len(value) == 3 and all(_num(v) for v in value)):
+                raise RpcError(dogproto.INVALID_PARAMS, "each marker must be [cx, cy, heading_rad]")
+        self._pose = (params["t_mono_ns"], markers)
 
     async def h_enable(self, params, conn):
         """robot.enable: arm the dog; clears a FAULT once the link is healthy again."""
@@ -629,6 +760,29 @@ class Robotd:
         self._esp_quiet("stop")
         self._cancel_action("stopped")
         return {"stop_transmitted": self.link_up}  # read after the send: a failed write drops the link
+
+    async def h_do(self, params, conn):
+        """robot.do: run one verified trick; replies when it ends."""
+        name = params["trick"]
+        cmd = self.registry["commands"].get(name)
+        if cmd is None or not cmd["verified"]:
+            raise RpcError(dogproto.UNAVAILABLE, f"{name} is not a verified trick")
+        if conn.cloud and not cmd["cloud"]:
+            raise RpcError(dogproto.UNAVAILABLE, f"{name} is not enabled for remote use")
+        return await self._run_action("do", params["id"], lambda: self._trick(name, cmd))
+
+    async def h_drive(self, params, conn):
+        """robot.drive: hold one drive direction for a bounded time."""
+        direction, ms = params["dir"], params["ms"]
+        if direction not in DIRS:
+            raise RpcError(dogproto.INVALID_PARAMS, f"dir must be one of {DIRS}")
+        if not self.caps[conn.cloud]["drive"][direction]:
+            raise RpcError(dogproto.UNAVAILABLE, f"{direction} is not available")
+        name = self.registry["drive"][direction]
+        limit = self.registry["commands"][name]["max_run_ms"]
+        if not 50 <= ms <= limit:
+            raise RpcError(dogproto.INVALID_PARAMS, f"ms must be 50..{limit}")
+        return await self._run_action("drive", params["id"], lambda: self._hold(name, ms))
 
     async def h_state(self, params, conn):
         """robot.state: report arm, link, health, tricks and capabilities."""
@@ -664,3 +818,15 @@ class Robotd:
             return {"frames": frames}
         finally:
             self._capture = None
+
+    async def h_test(self, params, conn):
+        """robot.test: send any command with an IR payload for up to 1 s; READY only."""
+        name, ms = params["name"], params["ms"]
+        cmd = self.registry["commands"].get(name)
+        if cmd is None or cmd["ir"] is None:
+            raise RpcError(dogproto.UNAVAILABLE, f"no IR payload for {name}")
+        if not 50 <= ms <= 1000:
+            raise RpcError(dogproto.INVALID_PARAMS, "ms must be 50..1000")
+        once = cmd["repeat"] == "none"
+        return await self._run_action("test", f"test-{time.monotonic_ns()}", lambda: (
+            self._esp_call("send", done_s=2.0, name=name) if once else self._hold(name, ms)))
