@@ -5,6 +5,7 @@ Feather when DOG_SERIAL names its port, which keeps the fake honest. The board
 needs no IR target: the tests load a dummy NEC entry.
 """
 
+import itertools
 import json
 import os
 import select
@@ -17,24 +18,26 @@ import tty
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ENTRY = {"name": "t", "proto": "NEC", "addr": 0, "cmd": 1, "bits": 32, "raw": [], "khz": 38,
-         "repeat": "nec", "period_ms": 108}
+ENTRY = {"name": "t", "proto": "NEC", "addr": 0, "cmd": 1, "raw": [], "khz": 38, "repeat": "nec", "period_ms": 108}
 _fake = None
+_port = os.environ.get("DOG_SERIAL")
 #: Timing slack: tight for the real board, wider for the fake, which shares a busy host.
-SLACK_S = 0.15 if os.environ.get("DOG_SERIAL") else 0.4
+SLACK_S = 0.15 if _port else 0.4
 
 
 def setUpModule():
-    global _fake
-    if os.environ.get("DOG_SERIAL"):
+    """Start the fake bridge unless DOG_SERIAL names a real board."""
+    global _fake, _port
+    if _port:
         return
     run_dir = tempfile.mkdtemp(prefix="dog-conf-")
     _fake = subprocess.Popen([sys.executable, os.path.join(ROOT, "sim", "fake_esp32.py"), "--run-dir", run_dir],
                              stdout=subprocess.PIPE, text=True)
-    os.environ["DOG_CONF_PORT"] = _fake.stdout.readline().split()[1]
+    _port = _fake.stdout.readline().split()[1]
 
 
 def tearDownModule():
+    """Stop the fake bridge."""
     if _fake is not None:
         _fake.terminate()
         _fake.wait(5)
@@ -44,20 +47,21 @@ class Port:
     """Raw access to the bridge, as robotd would see it."""
 
     def __init__(self):
-        path = os.environ.get("DOG_SERIAL") or os.environ["DOG_CONF_PORT"]
-        self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
+        self.fd = os.open(_port, os.O_RDWR | os.O_NOCTTY)
         tty.setraw(self.fd)
         attrs = termios.tcgetattr(self.fd)
         attrs[4] = attrs[5] = termios.B115200
         termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
         termios.tcflush(self.fd, termios.TCIFLUSH)
         self.buf = b""
-        self.ids = iter(range(1, 1_000_000))
+        self.ids = itertools.count(1)
 
     def close(self):
+        """Close the port."""
         os.close(self.fd)
 
     def send(self, **msg):
+        """Write one line."""
         os.write(self.fd, (json.dumps(msg) + "\n").encode())
 
     def op(self, op, **fields):
@@ -99,7 +103,7 @@ class Port:
             while time.monotonic() < deadline:
                 msg = self.read(deadline - time.monotonic())
                 if msg and msg.get("ev") == "hello" and msg.get("sid") == sid:
-                    self.ids = iter(range(1, 1_000_000))
+                    self.ids = itertools.count(1)
                     return msg
         raise AssertionError("no hello reply")
 
@@ -110,6 +114,7 @@ class Port:
         self.expect("ack", op_id=self.op("arm", n=1))
 
     def state(self):
+        """Send a heartbeat and return the state event."""
         self.send(op="hb", seq=1)
         return self.expect("state")
 
@@ -124,8 +129,10 @@ class Conformance(unittest.TestCase):
         self.port.send(op="disarm", id=999_999)
         self.port.close()
 
-    def test_hello_starts_disarmed(self):
+    def test_new_hello_disarms(self):
+        self.port.ready()
         self.assertEqual(self.port.hello()["state"], "DISARMED")
+        self.assertEqual(self.port.state()["s"], "DISARMED")
 
     def test_old_id_refused(self):
         self.port.hello()
@@ -161,7 +168,7 @@ class Conformance(unittest.TestCase):
         self.port.expect("ack", op_id=op_id)
         self.port.expect("done", op_id=op_id, timeout=1.0)
         self.assertLess(time.monotonic() - sent, 0.3 + SLACK_S)
-        self.assertIsNone(self._next_tx(0.3), "repeat frames after the lease ended")
+        self.assertEqual([m for m in self._events(0.3) if m.get("ev") == "tx"], [], "repeat frames after the lease")
 
     def test_lease_cap(self):
         self.port.ready()
@@ -174,11 +181,6 @@ class Conformance(unittest.TestCase):
         self.port.expect("fault", timeout=2.0)
         self.assertLess(time.monotonic() - last_hb, 1.1)
 
-    def test_new_hello_disarms(self):
-        self.port.ready()
-        self.port.hello()
-        self.assertEqual(self.port.state()["s"], "DISARMED")
-
     def test_capture_refused_when_ready(self):
         self.port.ready()
         self.port.expect("nack", op_id=self.port.op("capture", ms=500))
@@ -187,29 +189,25 @@ class Conformance(unittest.TestCase):
         self.port.hello()
         self.assertLess(self.port.state()["max_loop_us"], 100_000)
 
-    def test_load_limits(self):
+    def test_limits_and_types(self):
+        """Each field outside the limits of protocol.md 2.4, absent or of the wrong JSON type is refused."""
         self.port.hello()
         self.port.expect("ack", op_id=self.port.op("load", **{**ENTRY, "name": "d", "data": 0xE718FF00}))
-        for bad in ({"proto": "RC5"}, {"repeat": "toggle"}, {"proto": "raw", "raw": []}, {"raw": [560] * 121},
-                    {"proto": "raw", "raw": [60000, 60000, 30001]}, {"name": "\u00e9" * 16}, {"cmd": 0x100}):
-            self.assertEqual(self.port.expect("nack", op_id=self.port.op("load", **{**ENTRY, **bad}))["why"], "bad entry")
-        for i in range(23):
-            self.port.expect("ack", op_id=self.port.op("load", **{**ENTRY, "name": f"e{i}"}))
-        self.assertEqual(self.port.expect("nack", op_id=self.port.op("load", **ENTRY))["why"], "table full")
-
-    def test_wrong_field_types_refused(self):
-        self.port.hello()
         missing = {k: v for k, v in ENTRY.items() if k != "khz"}
         self.assertEqual(self.port.expect("nack", op_id=self.port.op("load", **missing))["why"], "bad entry")
-        for bad in ({"khz": None}, {"khz": "38"}, {"khz": 38.5}, {"addr": -1}, {"period_ms": True}, {"raw": "x"},
+        for bad in ({"proto": "RC5"}, {"repeat": "toggle"}, {"proto": "raw", "raw": []}, {"raw": [560] * 121},
+                    {"proto": "raw", "raw": [60000, 60000, 30001]}, {"name": "\u00e9" * 16}, {"cmd": 0x100},
+                    {"khz": None}, {"khz": "38"}, {"khz": 38.5}, {"addr": -1}, {"period_ms": True}, {"raw": "x"},
                     {"raw": [560.5]}, {"name": 5}, {"data": "x"}, {"data": -1}):
             self.assertEqual(self.port.expect("nack", op_id=self.port.op("load", **{**ENTRY, **bad}))["why"], "bad entry")
         self.assertEqual(self.port.expect("nack", op_id=self.port.op("capture", ms="x"))["why"], "bad ms")
-        self.port.expect("ack", op_id=self.port.op("load", **ENTRY))
+        for i in range(23):
+            self.port.expect("ack", op_id=self.port.op("load", **{**ENTRY, "name": f"e{i}"}))
+        self.assertEqual(self.port.expect("nack", op_id=self.port.op("load", **ENTRY))["why"], "table full")
         self.port.expect("nack", op_id=self.port.op("arm", n=True))
-        self.port.expect("ack", op_id=self.port.op("arm", n=1))
-        self.assertEqual(self.port.expect("nack", op_id=self.port.op("hold", name="t", lease_ms=300.0))["why"], "lease")
-        self.assertEqual(self.port.expect("nack", op_id=self.port.op("send", name=["t"]))["why"], "unknown name")
+        self.port.expect("ack", op_id=self.port.op("arm", n=24))
+        self.assertEqual(self.port.expect("nack", op_id=self.port.op("hold", name="d", lease_ms=300.0))["why"], "lease")
+        self.assertEqual(self.port.expect("nack", op_id=self.port.op("send", name=["d"]))["why"], "unknown name")
 
     def test_hold_without_repeat_sends_one_frame(self):
         self.port.hello()
@@ -227,14 +225,14 @@ class Conformance(unittest.TestCase):
             self.port.expect("ack", op_id=self.port.op("load", **{**ENTRY, "name": name}))
         self.port.expect("ack", op_id=self.port.op("arm", n=2))
         self.port.state()
-        events = self._events_until(lambda m: m.get("ev") == "fault", 2.0)
+        events = self._events(2.0, lambda m: m.get("ev") == "fault")
         self.assertEqual([m for m in events if m.get("ev") == "tx"], [{"ev": "tx", "id": 0, "frames": 1}])
 
     def test_send_ends_before_the_next_op(self):
         self.port.ready()
         send_id = self.port.op("send", name="t")
         disarm_id = self.port.op("disarm")
-        events = self._events_until(lambda m: m.get("ev") == "ack" and m.get("id") == disarm_id, 1.0)
+        events = self._events(1.0, lambda m: m.get("ev") == "ack" and m.get("id") == disarm_id)
         order = [(m["ev"], m["id"]) for m in events if m.get("id") in (send_id, disarm_id)]
         self.assertEqual(order, [("ack", send_id), ("tx", send_id), ("done", send_id), ("ack", disarm_id)])
 
@@ -265,30 +263,27 @@ class Conformance(unittest.TestCase):
         self.port.expect("ack", op_id=op_id)
         self.port.expect("done", op_id=op_id)
 
-    def _events_until(self, last, timeout):
-        """Return the events up to and with the first one for which last() is true; fail after timeout."""
+    def _events(self, timeout, last=None):
+        """Return the events up to and with the first one for which last() is true (fail after timeout).
+
+        Without last, return each event within timeout.
+        """
         events = []
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             msg = self.port.read(end - time.monotonic())
             if msg:
                 events.append(msg)
-                if last(msg):
+                if last and last(msg):
                     return events
-        self.fail(f"no closing event within {timeout} s: {events}")
+        if last:
+            self.fail(f"no closing event within {timeout} s: {events}")
+        return events
 
     def _frames_until_done(self, op_id):
         """Return the tx count until the done of op_id."""
-        events = self._events_until(lambda m: m.get("ev") == "done" and m.get("id") == op_id, 1.0)
+        events = self._events(1.0, lambda m: m.get("ev") == "done" and m.get("id") == op_id)
         return sum(m.get("ev") == "tx" for m in events)
-
-    def _next_tx(self, timeout):
-        end = time.monotonic() + timeout
-        while time.monotonic() < end:
-            msg = self.port.read(end - time.monotonic())
-            if msg and msg.get("ev") == "tx":
-                return msg
-        return None
 
 
 if __name__ == "__main__":

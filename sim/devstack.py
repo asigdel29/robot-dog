@@ -63,19 +63,17 @@ class Stack:
     work does not share the CPU with their latency checks.
     """
 
-    def __init__(self, registry=None, pose="320,240,0", media=False):
+    def __init__(self, registry=None, media=False):
         self.run_dir = tempfile.mkdtemp(prefix="dog-")
         self.registry_path = os.path.join(self.run_dir, "registry.json")
         with open(self.registry_path, "w") as handle:
             json.dump(DEMO_REGISTRY if registry is None else registry, handle)
-        self.pose = pose
         self.media = media
         self.console_port = free_port()
         self.console_token = secrets.token_hex(16)
         self.env = {**os.environ, "DOG_RUN_DIR": self.run_dir, "PYTHONUNBUFFERED": "1",
                     "DOG_CONSOLE_TOKEN": self.console_token}
         self.procs = {}
-        self._logs = []
         self._log_pos = 0
         self._log_rows = []
 
@@ -88,15 +86,12 @@ class Stack:
 
     def spawn(self, name, *args):
         """Start one process; its output goes to <run_dir>/<name>.out."""
-        log = open(os.path.join(self.run_dir, f"{name}.out"), "w")
-        self._logs.append(log)
-        self.procs[name] = subprocess.Popen([sys.executable, *args], env=self.env, stdout=log, stderr=log)
-        return self.procs[name]
+        with open(os.path.join(self.run_dir, f"{name}.out"), "w") as log:
+            self.procs[name] = subprocess.Popen([sys.executable, *args], env=self.env, stdout=log, stderr=log)
 
     def start(self):
         """Start fake_esp32, robotd and (with media=True) mediad, and wait until each is ready."""
-        self.spawn("fake_esp32", os.path.join(ROOT, "sim", "fake_esp32.py"), "--run-dir", self.run_dir,
-                   "--pose", self.pose)
+        self.spawn("fake_esp32", os.path.join(ROOT, "sim", "fake_esp32.py"), "--run-dir", self.run_dir)
         self.wait_for(lambda: os.path.exists(os.path.join(self.run_dir, "esp32")), "fake esp32 pty")
         self.start_robotd()
         if self.media:
@@ -171,23 +166,17 @@ class Stack:
     def log(self):
         """Return the fake bridge log as (t_mono_ns, "in"|"out", message) tuples.
 
-        Reads only the new bytes since the last call: a full re-read on each poll
-        takes enough CPU on a small CI runner to delay the daemons under test.
+        It parses only the new lines: a full parse on each poll takes enough CPU on
+        a small CI runner to delay the daemons under test.
         """
         with open(os.path.join(self.run_dir, "fake_esp32.log"), "rb") as handle:
             handle.seek(self._log_pos)
-            data = handle.read()
-        complete, _, _ = data.rpartition(b"\n")
+            complete = handle.read().rpartition(b"\n")[0]
         if complete:
             self._log_pos += len(complete) + 1
-        for line in complete.decode(errors="replace").splitlines():
-            parts = line.split(" ", 2)
-            if len(parts) != 3:
-                continue
-            try:
-                self._log_rows.append((int(parts[0]), parts[1], json.loads(parts[2])))
-            except ValueError:
-                continue
+            for line in complete.decode().splitlines():
+                t_ns, direction, msg = line.split(" ", 2)
+                self._log_rows.append((int(t_ns), direction, json.loads(msg)))
         return list(self._log_rows)
 
     def ops(self, op, since_ns=0):
@@ -219,8 +208,6 @@ class Stack:
                 proc.wait(5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        for log in self._logs:
-            log.close()
 
 
 def main():
