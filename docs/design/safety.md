@@ -39,7 +39,7 @@ There is no raw IR method and no free duration. The registry gives the limit for
 
 ## 4. Priority
 
-1. `robot.stop` and `robot.disarm`.
+1. `robot.stop` and `robot.disarm`. Each one also latches the stick: robotd ignores stick input until the stick is back at center. Thus a stick that stays pushed cannot undo a stop.
 2. Local stick input. It cancels a running cloud action with PREEMPTED.
 3. `robot.do`, `robot.drive` and `robot.goto`. Only one runs at a time.
 
