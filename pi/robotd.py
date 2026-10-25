@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import random
+import socket
 import termios
 import time
 import tty
@@ -25,8 +26,18 @@ from dogproto import RpcError
 
 log = logging.getLogger("robotd")
 
+LOOP_HZ = 20
+HEARTBEAT_TICKS = 4
+DEADMAN_S = 0.5
+ARM_IDLE_S = 600
+ESP_SILENCE_S = 1.0
 HELLO_WAIT_S = 5.0
 ACK_WAIT_S = 0.5
+STICK_DEADBAND = 0.5
+HOLD_LEASE_MS = 300  # firmware caps leases at 400; 300 gives three renewals of margin
+MAX_TICK_ERRORS = 10
+DEGRADED_HZ = 15
+DEGRADED_WINDOWS = 5
 ESP_LINE_LIMIT = 1024
 
 PROTOS = ("NEC", "raw")
@@ -161,6 +172,15 @@ def check_registry(doc):
     return errors
 
 
+def capabilities(doc, cloud=False):
+    """Return the usable drive directions and goto of a valid registry; cloud=True also needs each cloud flag."""
+    norm = normalize(doc)
+    cmds = norm["commands"]
+    drive = {d: bool(t in cmds and cmds[t]["verified"] and (cmds[t]["cloud"] or not cloud))
+             for d, t in norm["drive"].items()}
+    return {"drive": drive, "goto": drive["forward"] and (drive["left"] or drive["right"])}
+
+
 def ir_wire(name, cmd):
     """Return the load op fields for one command."""
     ir = cmd["ir"]
@@ -170,6 +190,29 @@ def ir_wire(name, cmd):
     if "data" in ir:
         wire["data"] = ir["data"]  # the captured NEC frame, sent byte for byte
     return wire
+
+
+# ---------------------------------------------------------------- pure helpers
+
+
+def stick_dir(vx, vyaw):
+    """Map stick axes to one drive direction, or None inside the dead band; the larger axis wins."""
+    if max(abs(vx), abs(vyaw)) < STICK_DEADBAND:
+        return None
+    if abs(vx) >= abs(vyaw):
+        return "forward" if vx > 0 else "back"
+    return "left" if vyaw > 0 else "right"
+
+
+def sd_notify(state):
+    """Send one systemd notify message; do nothing outside systemd."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock, contextlib.suppress(OSError):
+        sock.sendto(state.encode(), addr)
 
 
 # ---------------------------------------------------------------- ESP32 link
@@ -280,6 +323,7 @@ class Robotd:
         except (OSError, ValueError) as exc:
             self.reg_errors = [f"cannot read registry: {exc}"]
         self.registry = normalize({} if self.reg_errors else doc)
+        self.caps = {cloud: capabilities(self.registry, cloud) for cloud in (False, True)}
 
     # ---- ESP32 messages
 
@@ -460,7 +504,151 @@ class Robotd:
         if not self.link_up:
             raise RpcError(dogproto.UNAVAILABLE, "esp32 link down")
 
+    def _require_ready(self):
+        """Raise unless robotd can start an action."""
+        if self.fault:
+            raise RpcError(dogproto.FAULT, self.fault)
+        if not self.armed:
+            raise RpcError(dogproto.NOT_ARMED, "not armed: ask the owner to press Start")
+        self._require_link()
+
+    def health(self):
+        """Return "ok", "degraded" or "fault" for the update gate and the console."""
+        if self.fault:
+            return "fault"
+        if not self.link_up or self.reg_errors or self.degraded_windows >= DEGRADED_WINDOWS:
+            return "degraded"
+        return "ok"
+
+    # ---- loop
+
+    async def run_loop(self):
+        """Run the 20 Hz loop: watchdogs, heartbeat, deadman, arm expiry and the stick."""
+        period = 1.0 / LOOP_HZ
+        next_t = time.monotonic()
+        tick = 0
+        window_start, window_ticks = next_t, 0
+        while True:
+            next_t += period
+            delay = next_t - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            else:
+                next_t = time.monotonic()  # skip missed ticks
+            try:
+                self.tick(tick)
+                self._tick_errors = 0
+            except Exception:
+                log.exception("tick failed")
+                self._tick_errors += 1
+                if self._tick_errors >= MAX_TICK_ERRORS:
+                    self._to_fault("loop errors")
+            sd_notify("WATCHDOG=1")
+            tick += 1
+            window_ticks += 1
+            now = time.monotonic()
+            if now - window_start >= 1.0:
+                self.loop_hz = window_ticks / (now - window_start)
+                self.degraded_windows = self.degraded_windows + 1 if self.loop_hz < DEGRADED_HZ else 0
+                window_start, window_ticks = now, 0
+
+    def tick(self, tick):
+        """One loop step; never awaits."""
+        now = time.monotonic()
+        if self.link_up and now - self._esp_rx > ESP_SILENCE_S:
+            self._link_lost("esp32 silent")
+        if self.link_up and tick % HEARTBEAT_TICKS == 0:
+            try:
+                self.link.send({"op": "hb", "seq": tick})
+            except OSError as exc:
+                self._link_lost(str(exc))
+        if self.armed and now - self._last_activity > ARM_IDLE_S:
+            self._disarm("idle")
+        vx, vyaw, t_move = self._move
+        if now - t_move > DEADMAN_S:
+            vx = vyaw = 0.0
+        self._drive_stick(stick_dir(vx, vyaw) if self.armed and self.link_up else None)
+
+    def _drive_stick(self, direction):
+        """Keep the stick command held with short leases, or release it."""
+        if not (direction and self.caps[False]["drive"][direction]):
+            if self._stick is not None:
+                self._stick = None
+                self._esp_quiet("stop")
+            return
+        self._touch()
+        self._stick = self.registry["drive"][direction]
+        if self._cancel_action("preempted by local stick"):
+            return  # hold from the next tick, after the action's own stop and stop_via have gone out
+        self._esp_quiet("hold", name=self._stick, lease_ms=HOLD_LEASE_MS)
+
+    # ---- vision
+
+    def _markers(self):
+        """Return (age in s, markers) of the last camera frame."""
+        t_ns, markers = self._pose
+        return (time.monotonic() - t_ns / 1e9 if t_ns else math.inf), markers
+
     # ---- method handlers
+
+    async def h_move(self, params, conn):
+        """robot.move: store the stick intent; the loop applies it with the deadman. dogproto refuses NaN."""
+        vx = max(-1.0, min(1.0, float(params["vx"])))
+        vyaw = max(-1.0, min(1.0, float(params["vyaw"])))
+        if self._stick_latched:
+            # After a stop or disarm, a stick that stays pushed must not move the dog again.
+            if stick_dir(vx, vyaw) is not None:
+                return
+            self._stick_latched = False
+        self._move = (vx, vyaw, time.monotonic())
+
+    async def h_enable(self, params, conn):
+        """robot.enable: arm the dog; clears a FAULT once the link is healthy again."""
+        if self.reg_errors:
+            raise RpcError(dogproto.UNAVAILABLE, "registry not ready", self.reg_errors[:5])
+        self._require_link()
+        disarms = self._disarms
+        await self._esp_call("arm", n=self._loaded)
+        if self._disarms != disarms:  # a disarm reached the bridge after the arm
+            raise RpcError(dogproto.PREEMPTED, "disarmed while the dog was arming")
+        self._require_link()  # a bridge reset right after its ack starts a new, DISARMED link
+        self.fault = None
+        self.armed = True
+        self._touch()
+        log.info("armed")
+        return self.state(conn)
+
+    async def h_disarm(self, params, conn):
+        """robot.disarm: cancel the action and disarm."""
+        self._disarm("request")
+        return self.state(conn)
+
+    async def h_stop(self, params, conn):
+        """robot.stop: stop IR output now and cancel the action; stay armed."""
+        self._latch_stick()
+        self._esp_quiet("stop")
+        self._cancel_action("stopped")
+        return {"stop_transmitted": self.link_up}  # read after the send: a failed write drops the link
+
+    async def h_state(self, params, conn):
+        """robot.state: report arm, link, health, tricks and capabilities."""
+        return self.state(conn)
+
+    def state(self, conn):
+        """Return the state object; a cloud caller sees only cloud tricks and cloud capabilities."""
+        age, _ = self._markers()
+        tricks = [{"name": name, "kind": cmd["kind"], "say": cmd["say"], "cloud": cmd["cloud"]}
+                  for name, cmd in self.registry["commands"].items()
+                  if cmd["verified"] and (cmd["cloud"] or not conn.cloud)]
+        return {
+            "api": dogproto.API_VERSION, "health": self.health(), "armed": self.armed, "fault": self.fault,
+            "busy": None if self.action is None else {"kind": self.action.kind, "id": self.action.aid},
+            "stick": self._stick, "esp": self.esp_state, "esp_max_loop_us": self.esp_max_loop_us,
+            "loop_hz": round(self.loop_hz, 1),
+            "vision_age_ms": None if math.isinf(age) else int(age * 1000),
+            "registry_ready": not self.reg_errors, "registry_errors": self.reg_errors[:5],
+            "tricks": tricks, "caps": self.caps[conn.cloud],
+        }
 
     async def h_capture(self, params, conn):
         """robot.capture: record remote frames for ms; DISARMED only, one capture at a time."""
