@@ -136,5 +136,5 @@ The bridge refuses a `load` that it cannot store or send. The `why` is `table fu
 
 - `proto` is `NEC`, another protocol name from the IRremote decoder, or `raw` when the decoder does not know the protocol.
 - `raw` gives the mark and space durations in microseconds. The first value is a mark. `raw` is empty when the frame has more than 120 durations.
-- `gap_us` is the time from the start of the last frame to the start of this frame. It is 0 for the first frame of a capture. robotctl uses it as `period_ms`.
+- `gap_us` is the time from the start of the frame before to the start of this frame. It is 0 for the first frame of a capture. robotctl uses it as `period_ms`.
 - `repeat` is true for a short repeat frame with no data bits, for example the NEC repeat frame. A full frame that the remote sends again has `repeat` false.
