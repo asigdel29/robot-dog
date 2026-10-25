@@ -1,0 +1,2 @@
+# Python packages that pip installs into each Pi release venv. Apt gives OpenCV, NumPy and evdev.
+websockets==15.0.1

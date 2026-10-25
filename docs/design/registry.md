@@ -6,7 +6,7 @@ This document owns the registry format, its rules and the capture procedure. Whe
 
 - The live file is `/etc/dog/registry.json`. It is outside the release.
 - `robotctl` is the only writer. robotd only reads it.
-- The repo keeps a template in `config/registry.json`.
+- The repo keeps a template in `config/registry.json`. The postinstall hook copies it only when no live file exists.
 - Raw captures go to `/var/lib/dog/captures/`. Keep them. They are the evidence for each entry.
 
 ## 2. Format

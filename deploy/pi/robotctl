@@ -1,0 +1,3 @@
+#!/bin/sh
+# robotctl launcher: postinstall installs it as /usr/local/bin/robotctl; it runs robotctl from the current release.
+exec /opt/dog/current/.venv/bin/python /opt/dog/current/pi/robotctl.py "$@"
