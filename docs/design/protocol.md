@@ -150,3 +150,7 @@ robotd checks the same limits when it reads the registry (`check_registry`). Thu
 - The receiver clips each mark and space at 12750 µs. A space longer than 8 ms ends a frame.
 - `gap_us` is the time from the start of the frame before to the start of this frame. It is 0 for the first frame of a capture. robotctl uses it as `period_ms`.
 - `repeat` is true for a short repeat frame with no data bits, for example the NEC repeat frame. A full frame that the remote sends again has `repeat` false.
+
+## 3. Pi to hub (WSS)
+
+`docs/design/cloud.md` owns this link. It gives the frames between `linkd` and the hub, the robot tools, the voice loop, the time limits, the caps and the tokens. The hub sends only methods from `CLOUD_METHODS`, each with a `sent_at` field. The Pi sends `link.hello`, `voice.utterance` and `voice.cancel`.
