@@ -24,6 +24,8 @@ The code is in `pi/linkd.py`, `hub/hub.py` and `sim/stub_hermes.py`. The tests a
 - Each message is one JSON-RPC 2.0 object in one text frame. The frame limit is 2 MiB.
 - A frame with `NaN` or `Infinity` is not valid JSON. The receiver drops it.
 - Each side sends a ping each 5 s. A side closes the link when no pong arrives in 5 s.
+- linkd waits 1 s for the close handshake. Thus linkd drops a silent hub in 11 s or less and disarms the dog. Measured: 11.0 s with a frozen hub process.
+- The hub ignores a reply whose `id` is not an integer, and a binary frame.
 - The first frame from linkd is `link.hello {api, version, device}`. `version` is the release directory name.
 - The hub closes the link with code 1008 when the first frame in 10 s is not a `link.hello` for `dog-01`.
 - The hub has one device. A new link replaces the old link. The hub closes the old link with code 4000.
@@ -31,14 +33,16 @@ The code is in `pi/linkd.py`, `hub/hub.py` and `sim/stub_hermes.py`. The tests a
 
 ### 2.2 Requests from the hub
 
-The hub sends only requests. Each request has a top-level `sent_at` field: the Unix time in milliseconds. linkd does these checks in this sequence:
+The hub sends only requests. Each request has a top-level `sent_at` field: the Unix time in milliseconds. linkd records the time when the frame arrives. Then it does these checks in this sequence:
 
 1. The method must be in `CLOUD_METHODS` and must not be `media.subscribe`. Otherwise linkd returns METHOD_NOT_FOUND.
-2. `sent_at` must be a number. Otherwise linkd returns STALE.
+2. `sent_at` must be a finite number. Otherwise linkd returns STALE.
 3. The Pi clock must have NTP sync. Otherwise linkd returns STALE.
-4. The request must be 1500 ms old or less. Otherwise linkd returns STALE.
+4. The difference between the arrival time and `sent_at` must be 1500 ms or less, in the past or in the future. Otherwise linkd returns STALE.
 
-linkd reads the NTP state with `timedatectl show -p NTPSynchronized --value` and reads it again after 30 s. The flag `--assume-synced` skips this check. Use it only for tests and dev work.
+linkd does not do checks 2 to 4 for `robot.stop`, `robot.disarm` and `audio.stop`. These methods only reduce motion or sound, so linkd always sends them.
+
+A background task reads the NTP state with `timedatectl show -p NTPSynchronized --value` each 30 s. The check never blocks a request. When the check fails or times out, linkd keeps the last value and logs it. Until the first answer, the value is "not synced". The flag `--assume-synced` skips the check. Use it only for tests and dev work.
 
 linkd removes `sent_at` and sends the request to a daemon:
 
@@ -49,7 +53,8 @@ linkd removes `sent_at` and sends the request to a daemon:
 
 - Each request runs in its own task. Replies are matched by `id`. Thus a stop can overtake a goto that is in progress.
 - linkd waits 40 s for a daemon reply.
-- When a daemon socket does not answer, linkd returns UNAVAILABLE.
+- When a daemon socket does not answer, linkd returns UNAVAILABLE. When the daemon does not reply in 40 s, linkd returns TIMEOUT.
+- When the local bus cannot carry a value, for example `1e999` in `params`, linkd returns INVALID_PARAMS.
 - linkd does not send other frames from the hub to a daemon.
 
 ### 2.3 Notifications from the Pi
@@ -69,7 +74,7 @@ When the link closes, or when linkd gets SIGTERM, linkd does these steps:
 2. Close the connections to robotd and mediad. robotd then cancels the actions of those connections.
 3. Wait 1 s. Then connect again.
 
-After each failed attempt, linkd doubles the wait, up to 30 s. A successful connection sets the wait to 1 s again. A reconnect never arms the dog, because `robot.enable` is not a cloud method. Only a person at the Pi can arm the dog.
+After each attempt, linkd doubles the wait, up to 30 s. Only a link that stayed up for more than 10 s sets the wait to 1 s again. Thus a hub that closes each link at once does not cause a disarm each second. A reconnect never arms the dog, because `robot.enable` is not a cloud method. Only a person at the Pi can arm the dog.
 
 ## 3. Hub
 
@@ -150,6 +155,7 @@ The server instructions and the tool descriptions give these rules to Hermes:
 | `stop` | none | `robot.stop` | `{"stop_transmitted": <bool>}` |
 
 - The hub makes a new action `id` for each motion call.
+- `get_state` and `look` have the annotation `readOnlyHint: true`. After a lost tool session, Hermes retries only read-only tools.
 - robotd does all arm checks and all motion limits. The hub does not repeat them.
 - A failure comes back as a tool error. Its text is for the model.
 
@@ -178,6 +184,8 @@ The server instructions and the tool descriptions give these rules to Hermes:
 | Request age | 1500 ms | linkd |
 | First frame (`link.hello`) | 10 s | hub |
 | Ping interval and pong timeout | 5 s and 5 s | linkd and hub |
+| Close handshake | 1 s | linkd |
+| Session that resets the reconnect wait | more than 10 s | linkd |
 | Reconnect wait | 1 s to 30 s | linkd |
 | Read gap on the Hermes event stream | 30 s | hub. Hermes sends a keepalive each 10 s. |
 | OpenAI request | 30 s, one retry | hub |
@@ -194,22 +202,37 @@ The limits are nested: robotd 30 s, then the hub 35 s, then Hermes 60 s. When He
 4. The hub adds the audio seconds to the STT count (section 3.3).
 5. The hub puts the PCM16 mono audio in a WAV file in memory. It sends the file to OpenAI STT.
 6. Stop fast path: when the text matches `^\W*(stop|halt|freeze|no)\b` (any case), the hub sends `robot.stop` first.
-7. The hub starts a Hermes run with the text (section 6.2). The run also starts after a stop phrase, so Hermes can answer.
-8. The hub reads the event stream. It adds the text of each `message.delta` to a buffer.
+7. The hub starts a Hermes run with the text (section 6.3). The run also starts after a stop phrase, so Hermes can answer.
+8. The hub reads the event stream. It skips a `data:` line that is not a JSON object, for example `data: [DONE]`.
+   It adds the text of each `message.delta` to a buffer. A `delta` that is not a string counts as empty text.
    When a different event, for example a tool call, comes between two deltas, the hub adds one space between them.
    It does not add the space when one side already has whitespace.
 9. The hub cuts whole sentences from the buffer. A sentence ends at `.`, `!` or `?` before a space.
 10. The hub sends each sentence to OpenAI TTS with `response_format="pcm"` (24 kHz, 16-bit, mono).
 11. The hub sends the audio to the dog with `audio.play {pcm16_b64, rate: 24000}`. Each part is 10 s or less, so it fits in one frame.
+    Before each part, the hub waits while more than 10 s of audio or 16 parts are in the mediad queue (section 6.2).
 12. At `run.completed`, the hub speaks the text that is still in the buffer. When no delta arrived, it speaks the `output` field.
 
 - Only one turn runs at a time. A new utterance cancels the old turn.
 - `voice.cancel` (barge-in) cancels the turn. The hub sends a stop for its Hermes run and drops the sentences that it did not play.
 - When the create request of the run has no reply yet, the hub keeps that request open. It sends the stop when the run id arrives.
 - A cancelled turn never sends `audio.play`.
+- When a turn ends without a terminal run event, the hub stops its Hermes run. Examples: an HTTP error on the event stream, or a TTS failure.
 - mediad clears its own play queue on a push-to-talk press, before `voice.cancel` arrives.
 
-### 6.2 Hermes run API
+### 6.2 Play queue
+
+mediad sends no report of play progress. Thus the hub estimates the end time of each part that it queued. It uses the duration of the audio and the time it sent the part.
+
+- The hub waits before `audio.play` while more than 10 s of audio is ahead in the queue.
+- The hub also waits while 16 parts, the size of the mediad queue, are ahead.
+- A push-to-talk press clears the mediad queue. Thus `voice.utterance` and `voice.cancel` also clear the estimate.
+- mediad answers `audio.play` with BUSY while push-to-talk is down, and when its queue is full. The hub logs `audio.play dropped`, drops that part and continues the turn.
+- When `say` loses a part this way, its result is `{"spoken": false, ...}`.
+
+Measured with `stub_hermes`: 14 parts of 1 s each went to the dog over 3.0 s. The first 11 went at once.
+
+### 6.3 Hermes run API
 
 These are the calls that the hub makes. Sources: the Hermes "API Server" page, sections "Runs API", "Idempotency keys", "Long-term memory scoping" and "Terminal run status". The frame shape comes from the Hermes source file `gateway/platforms/api_server_runs.py`.
 
@@ -230,7 +253,7 @@ Not verified against a live Hermes server:
 - The frame shape. The docs do not show it, so it comes from the Hermes source (main branch, read on 2026-10-25). Phase 4 must check it against the live server.
 - That Hermes sends another event, for example `tool.started`, between the text of two model turns. The hub adds a space only after such an event (step 8 in section 6.1).
 
-### 6.3 Latency log
+### 6.4 Latency log
 
 The hub writes one line for each turn, in milliseconds after the utterance arrived:
 

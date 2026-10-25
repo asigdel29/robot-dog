@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import signal
 import subprocess
@@ -28,11 +29,17 @@ from dogproto import RpcError
 
 log = logging.getLogger("linkd")
 
-#: A hub request older than this (by its sent_at) is refused with STALE.
+#: A hub request whose sent_at differs from the Pi clock by more than this is refused with STALE.
 STALE_MS = 1500
+#: These only reduce motion, so linkd never refuses them for age or clock sync.
+ALWAYS_FORWARD = frozenset({"robot.stop", "robot.disarm", "audio.stop"})
 PING_S = 5
+#: A silent hub is dropped after ping interval + pong timeout + this close timeout.
+CLOSE_S = 1
 RECONNECT_MIN_S = 1
 RECONNECT_MAX_S = 30
+#: Only a session longer than this resets the reconnect wait, so a hub that closes at once gets the backoff.
+STABLE_SESSION_S = 2 * PING_S
 #: Longer than the hub wait (35 s), which is longer than the robotd goto limit (30 s).
 LOCAL_TIMEOUT_S = 40
 CLOCK_CHECK_S = 30
@@ -48,13 +55,13 @@ def release_version():
 
 
 def ntp_synced():
-    """Return True when systemd says the clock is NTP-synced; STALE checks need a true clock."""
+    """Return True or False from systemd's NTP sync flag, or None when the check fails; STALE needs a true clock."""
     try:
         out = subprocess.run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
                              capture_output=True, text=True, timeout=2)
     except (OSError, subprocess.TimeoutExpired):
-        return False
-    return out.stdout.strip() == "yes"
+        return None
+    return {"yes": True, "no": False}.get(out.stdout.strip())
 
 
 class Link:
@@ -64,30 +71,48 @@ class Link:
         self.url = url
         self.token = token
         self.device = device
-        self.assume_synced = assume_synced
+        #: The last known NTP state; False until the first check answers.
+        self.clock_synced = assume_synced
+        self._assume_synced = assume_synced
+        self._clock_task = None
         self.ws = None
         self._local = {}
         self._local_lock = asyncio.Lock()
         self._tasks = set()
-        self._clock = (False, -CLOCK_CHECK_S)
 
     async def run(self):
         """Connect to the hub forever; wait 1 s to 30 s between attempts."""
+        if not self._assume_synced:
+            self._clock_task = asyncio.ensure_future(self._watch_clock())
         delay = RECONNECT_MIN_S
         while True:
+            started = None
             try:
                 async with connect(self.url, additional_headers={"Authorization": f"Bearer {self.token}"},
                                    max_size=dogproto.MEDIA_LIMIT, ping_interval=PING_S, ping_timeout=PING_S,
-                                   open_timeout=10) as ws:
-                    delay = RECONNECT_MIN_S
+                                   close_timeout=CLOSE_S, open_timeout=10) as ws:
+                    started = time.monotonic()
                     try:
                         await self._session(ws)
                     finally:
                         await self._drop_local()
-            except (OSError, TimeoutError, websockets.exceptions.WebSocketException) as exc:
+            except (OSError, websockets.exceptions.WebSocketException) as exc:
                 log.warning("hub link: %s", exc)
+            if started is not None and time.monotonic() - started > STABLE_SESSION_S:
+                delay = RECONNECT_MIN_S
             await asyncio.sleep(delay)
             delay = min(delay * 2, RECONNECT_MAX_S)
+
+    async def _watch_clock(self):
+        """Read the NTP state each CLOCK_CHECK_S off the event loop; a failed check keeps the last value."""
+        while True:
+            synced = await asyncio.to_thread(ntp_synced)
+            if synced is None:
+                log.warning("NTP state unknown; keeping synced=%s", self.clock_synced)
+            elif synced != self.clock_synced:
+                log.info("NTP synced: %s", synced)
+                self.clock_synced = synced
+            await asyncio.sleep(CLOCK_CHECK_S)
 
     async def _session(self, ws):
         """Serve one hub connection until it closes."""
@@ -95,13 +120,12 @@ class Link:
         self.ws = ws
         await ws.send(json.dumps({"jsonrpc": "2.0", "method": "link.hello", "params": {
             "api": dogproto.API_VERSION, "version": release_version(), "device": self.device}}))
-        subscriber = asyncio.ensure_future(self._subscribe())
+        self._spawn(self._subscribe())
         try:
             async for frame in ws:
-                self._spawn(self._handle(ws, frame))
+                self._spawn(self._handle(ws, frame, time.time() * 1000))
         finally:
             self.ws = None
-            subscriber.cancel()
             for task in list(self._tasks):
                 task.cancel()
             log.warning("hub link down")
@@ -111,7 +135,7 @@ class Link:
         try:
             await dogproto.call_once(dogproto.sock_path("robotd", cloud=True), "robot.disarm", timeout=2)
             log.info("disarmed after hub link loss")
-        except (OSError, RpcError, TimeoutError, ConnectionError) as exc:
+        except (OSError, RpcError) as exc:
             log.error("disarm after hub link loss failed: %s", exc)
         async with self._local_lock:
             for client in self._local.values():
@@ -140,7 +164,7 @@ class Link:
                 client = await self._client("mediad")
                 await client.call("media.subscribe")
                 await client.closed.wait()
-            except (OSError, RpcError, TimeoutError, ConnectionError) as exc:
+            except (OSError, RpcError) as exc:
                 log.debug("mediad subscribe: %s", exc)
             await asyncio.sleep(1)
 
@@ -155,8 +179,8 @@ class Link:
         with contextlib.suppress(websockets.exceptions.ConnectionClosed):
             await ws.send(json.dumps(msg, separators=(",", ":")))
 
-    async def _handle(self, ws, frame):
-        """Answer one hub request; frames that are not requests are ignored."""
+    async def _handle(self, ws, frame, received_ms):
+        """Answer one hub request; frames that are not valid requests are ignored."""
         try:
             msg = dogproto.decode(frame)
         except ValueError:
@@ -165,41 +189,37 @@ class Link:
             return
         reply = {"jsonrpc": "2.0", "id": msg["id"]}
         try:
-            reply["result"] = await self._forward(msg)
+            reply["result"] = await self._forward(msg, received_ms)
         except RpcError as err:
             reply["error"] = err.to_obj()
+        except ValueError as exc:  # for example 1e999 in params: the local bus refuses Infinity
+            reply["error"] = RpcError(dogproto.INVALID_PARAMS, str(exc)).to_obj()
         except TimeoutError:
             reply["error"] = RpcError(dogproto.TIMEOUT, f"no daemon reply in {LOCAL_TIMEOUT_S} s").to_obj()
-        except (OSError, ConnectionError) as exc:
+        except OSError as exc:
             reply["error"] = RpcError(dogproto.UNAVAILABLE, f"daemon not reachable: {exc}").to_obj()
         await self._send(ws, reply)
 
-    async def _forward(self, msg):
+    async def _forward(self, msg, received_ms):
         """Check one hub request and send it, without sent_at, to the daemon that owns it."""
         method = msg.get("method")
         # linkd owns the mediad subscription; a second one from the hub would duplicate each utterance.
         if not isinstance(method, str) or method not in dogproto.CLOUD_METHODS or method == "media.subscribe":
             raise RpcError(dogproto.METHOD_NOT_FOUND, f"unknown method {method}")
-        sent_at = msg.get("sent_at")
-        if isinstance(sent_at, bool) or not isinstance(sent_at, (int, float)):
-            raise RpcError(dogproto.STALE, "request has no sent_at")
-        if not await self._clock_synced():
-            raise RpcError(dogproto.STALE, "the Pi clock is not NTP-synced")
-        age_ms = time.time() * 1000 - sent_at
-        if age_ms > STALE_MS:
-            raise RpcError(dogproto.STALE, f"request is {age_ms:.0f} ms old")
+        if method not in ALWAYS_FORWARD:
+            self._check_fresh(msg.get("sent_at"), received_ms)
         client = await self._client(ROUTES[method.split(".", 1)[0]])
         return await client.call(method, msg.get("params"), timeout=LOCAL_TIMEOUT_S)
 
-    async def _clock_synced(self):
-        """Return the NTP sync state, checked again each CLOCK_CHECK_S in a thread so a stop never waits on it."""
-        if self.assume_synced:
-            return True
-        synced, checked = self._clock
-        if time.monotonic() - checked >= CLOCK_CHECK_S:
-            synced = await asyncio.to_thread(ntp_synced)
-            self._clock = (synced, time.monotonic())
-        return synced
+    def _check_fresh(self, sent_at, received_ms):
+        """Raise STALE unless sent_at is finite, the clock is synced and the two clocks agree within STALE_MS."""
+        if isinstance(sent_at, bool) or not isinstance(sent_at, (int, float)) or not math.isfinite(sent_at):
+            raise RpcError(dogproto.STALE, "request has no valid sent_at")
+        if not self.clock_synced:
+            raise RpcError(dogproto.STALE, "the Pi clock is not NTP-synced")
+        age_ms = received_ms - sent_at
+        if abs(age_ms) > STALE_MS:
+            raise RpcError(dogproto.STALE, f"request age {age_ms:.0f} ms is outside +-{STALE_MS} ms")
 
 
 def hub_url_ok(url):
@@ -226,5 +246,7 @@ async def main(argv=None):
 
 if __name__ == "__main__":
     logging.basicConfig(level=os.environ.get("DOG_LOG", "INFO"), format="%(name)s %(levelname)s %(message)s")
+    # The websockets DEBUG log prints the handshake headers, which include the device token.
+    logging.getLogger("websockets").setLevel(logging.INFO)
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(main(sys.argv[1:]))

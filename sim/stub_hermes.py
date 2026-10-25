@@ -6,7 +6,8 @@ endpoints that the hub uses (/v1/audio/transcriptions, /v1/audio/speech). When
 a run input contains "bark", the stream calls do_trick("bark") on the hub's
 /tools endpoint with a real Model Context Protocol client, in the middle of the
 stream, as Hermes does. Each request is recorded: GET /_stub/requests returns
-the list, and POST /_stub/config sets the transcript, the reply and the delays.
+the list, and POST /_stub/config changes the transcript, the reply, the delays,
+the event stream status, extra raw stream lines and the length of each speech reply.
 """
 
 import argparse
@@ -26,7 +27,8 @@ from mcp.client.streamable_http import streamable_http_client
 
 #: Text that a test can change with POST /_stub/config.
 config = {"transcript": "hello dog", "reply": ["Sure,", " I can do that.", " Here I go!"], "delta_delay": 0.05,
-          "create_delay": 0, "tools_url": "", "tools_token": ""}
+          "create_delay": 0, "events_status": 200, "junk_lines": [], "speech_seconds": 0.1,
+          "tools_url": "", "tools_token": ""}
 requests = []
 runs = {}
 app = FastAPI()
@@ -44,7 +46,7 @@ def hermes_headers(request):
 
 @app.post("/_stub/config")
 async def set_config(request: Request):
-    """Change the transcript, the reply deltas, the delay between deltas or the delay of the create reply."""
+    """Change any config value: transcript, reply, delays, events_status, junk_lines or speech_seconds."""
     config.update(await request.json())
     return config
 
@@ -82,6 +84,8 @@ async def run_events(run_id: str, request: Request):
     record("/v1/runs/events", headers=hermes_headers(request), run_id=run_id)
     if run_id not in runs:
         return Response(status_code=404)
+    if config["events_status"] != 200:
+        return Response(status_code=config["events_status"])
     return StreamingResponse(_events(run_id), media_type="text/event-stream")
 
 
@@ -97,6 +101,8 @@ async def _events(run_id):
         return f"id: {seq}\ndata: {json.dumps(payload)}\n\n"
 
     yield ": open\n\n"
+    for line in config["junk_lines"]:
+        yield f"{line}\n\n"
     text = ""
     for index, delta in enumerate(config["reply"]):
         if index == 1 and "bark" in run["input"].lower():
@@ -140,10 +146,10 @@ async def transcriptions(request: Request):
 
 @app.post("/v1/audio/speech")
 async def speech(request: Request):
-    """Return 0.1 s of silent 24 kHz PCM16 for any text."""
+    """Return speech_seconds of silent 24 kHz PCM16 for any text."""
     body = await request.json()
     record("/v1/audio/speech", body=body)
-    return Response(content=b"\x00\x00" * 2400, media_type="audio/pcm")
+    return Response(content=b"\x00\x00" * int(24000 * config["speech_seconds"]), media_type="audio/pcm")
 
 
 def main():

@@ -34,6 +34,7 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
 
 log = logging.getLogger("hub")
 
@@ -58,6 +59,7 @@ PING_S = 5
 MOTION_PER_MIN = 30
 SAY_MAX_CHARS = 300
 NOT_ARMED = -32001
+BUSY = -32002
 #: Stable per-channel key, so Hermes keeps one voice conversation for the dog.
 VOICE_SESSION_KEY = f"{DEVICE_ID}-voice"
 STOP_RE = re.compile(r"^\W*(stop|halt|freeze|no)\b", re.IGNORECASE)
@@ -66,6 +68,10 @@ RUN_FAILED_EVENTS = ("run.failed", "run.cancelled", "run.interrupted")
 TTS_RATE = 24000
 #: 10 s of 24 kHz PCM16 per audio.play: well under the 2 MiB frame limit after base64.
 PLAY_CHUNK_BYTES = TTS_RATE * 2 * 10
+#: The hub waits before audio.play while more audio than this is queued at mediad.
+MAX_QUEUED_AUDIO_S = 10
+#: Size of the mediad play queue; a full queue answers BUSY.
+MEDIAD_QUEUE_ITEMS = 16
 
 TOOL_RULES = inspect.cleandoc("""
     Tools for a toy robot dog in a marked play area.
@@ -92,7 +98,11 @@ def speech():
 
 
 class DeviceError(Exception):
-    """A failed request to the dog; the message is written for the model to read."""
+    """A failed request to the dog; the message is written for the model to read, code is the Pi error code."""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
 
 
 def _describe(error):
@@ -146,13 +156,16 @@ class Device:
                 future.set_exception(DeviceError("the dog went offline during the request"))
 
     def on_reply(self, ws, msg):
-        """Complete the request that a reply from ws answers."""
-        owner, future = self._pending.get(msg.get("id"), (None, None))
+        """Complete the request that a reply from ws answers; a reply without an int id is ignored."""
+        msg_id = msg.get("id")
+        if isinstance(msg_id, bool) or not isinstance(msg_id, int):
+            return
+        owner, future = self._pending.get(msg_id, (None, None))
         if owner is not ws or future.done():
             return
         error = msg.get("error")
         if isinstance(error, dict):
-            future.set_exception(DeviceError(_describe(error)))
+            future.set_exception(DeviceError(_describe(error), error.get("code")))
         else:
             future.set_result(msg.get("result"))
 
@@ -244,11 +257,52 @@ async def synthesize(text):
     return reply.content
 
 
-async def play(pcm):
-    """Send PCM16 speech to the dog speaker in parts that fit one link frame."""
-    for start in range(0, len(pcm), PLAY_CHUNK_BYTES):
-        part = base64.b64encode(pcm[start:start + PLAY_CHUNK_BYTES]).decode()
-        await device.call("audio.play", {"pcm16_b64": part, "rate": TTS_RATE})
+class Speaker:
+    """Sends speech to the dog speaker and keeps the mediad play queue short.
+
+    mediad reports no play progress, so the hub estimates when each queued part
+    ends. It waits before audio.play while more than MAX_QUEUED_AUDIO_S of audio
+    or a full queue is ahead.
+    """
+
+    def __init__(self):
+        self._ends = collections.deque()
+
+    def clear(self):
+        """Forget the queued parts; mediad clears its queue on each push-to-talk press."""
+        self._ends.clear()
+
+    async def play(self, pcm):
+        """Queue PCM16 speech in parts that fit one link frame; return False when mediad dropped a part (BUSY)."""
+        complete = True
+        for start in range(0, len(pcm), PLAY_CHUNK_BYTES):
+            part = pcm[start:start + PLAY_CHUNK_BYTES]
+            await self._wait_for_room()
+            try:
+                await device.call("audio.play", {"pcm16_b64": base64.b64encode(part).decode(), "rate": TTS_RATE})
+            except DeviceError as exc:
+                if exc.code != BUSY:
+                    raise
+                log.info("audio.play dropped: %s", exc)  # push-to-talk is down, or the queue is full
+                complete = False
+                continue
+            begin = max(time.monotonic(), self._ends[-1] if self._ends else 0.0)
+            self._ends.append(begin + len(part) / 2 / TTS_RATE)
+        return complete
+
+    async def _wait_for_room(self):
+        """Wait until the parts ahead are short enough and the mediad queue has room."""
+        while True:
+            now = time.monotonic()
+            while self._ends and self._ends[0] <= now:
+                self._ends.popleft()
+            if not self._ends or (self._ends[-1] - now <= MAX_QUEUED_AUDIO_S
+                                  and len(self._ends) < MEDIAD_QUEUE_ITEMS):
+                return
+            await asyncio.sleep(self._ends[0] - now)
+
+
+speaker = Speaker()
 
 
 # ---------------------------------------------------------------- voice loop
@@ -280,18 +334,24 @@ class Voice:
 
     def cancel(self, reason):
         """End the current turn: stop its Hermes run and drop the speech not yet played."""
+        speaker.clear()
         if self._turn is None or self._turn.done():
             return
         log.info("voice turn cancelled: %s", reason)
         if self._create is not None:
-            task = asyncio.ensure_future(self._stop_run(self._create))
-            self._stops.add(task)
-            task.add_done_callback(self._stops.discard)
+            self._stop_later(self._create)
+            self._create = None  # the turn's own cleanup must not send a second stop
         self._turn.cancel()
         self._turn = None
 
+    def _stop_later(self, create):
+        """Start a stop of the run that create makes, and keep a reference to the task."""
+        task = asyncio.ensure_future(self._stop_run(create))
+        self._stops.add(task)
+        task.add_done_callback(self._stops.discard)
+
     async def _stop_run(self, create):
-        """Stop the Hermes run of a cancelled turn, as soon as its create request gives the run id.
+        """Stop a Hermes run as soon as its create request gives the run id.
 
         Hermes answers a stop at once and stops the run at its next safe point.
         """
@@ -300,8 +360,8 @@ class Voice:
             reply = await http.post(f"{HERMES_URL}/v1/runs/{run_id}/stop", headers=_hermes_auth())
             reply.raise_for_status()
             log.info("Hermes run %s stopped", run_id)
-        except (httpx2.HTTPError, KeyError, ValueError) as exc:
-            log.warning("stop of a cancelled Hermes run failed: %s", exc)
+        except Exception as exc:
+            log.warning("stop of a Hermes run failed: %r", exc)
 
     async def _run_turn(self, params):
         """Run one turn and log the time of each stage for the latency budget."""
@@ -350,7 +410,7 @@ class Voice:
         create = asyncio.ensure_future(self._create_run(utt_id, text))
         self._create = create
         # last: the final character of the reply so far; gap: a non-delta event came after it.
-        pending, last, gap = "", "", False
+        pending, last, gap, ended = "", "", False, False
         try:
             # The shield keeps the create request alive when the turn is cancelled, so cancel() can stop the run.
             run_id = await asyncio.shield(create)
@@ -360,11 +420,17 @@ class Voice:
                     # Skip ":" keepalive comments, "id:" lines and the blank line after each event.
                     if not line.startswith("data:"):
                         continue
-                    event = json.loads(line[5:])
+                    try:
+                        event = json.loads(line[5:])
+                    except ValueError:
+                        continue  # for example "data: [DONE]"
+                    if not isinstance(event, dict):
+                        continue
                     name = event.get("event")
                     if name == "message.delta":
                         marks.setdefault("first_delta", time.monotonic())
-                        delta = event.get("delta") or ""
+                        delta = event.get("delta")
+                        delta = delta if isinstance(delta, str) else ""
                         # Text before and after a tool call must not fuse into one word.
                         if gap and last and delta and not last.isspace() and not delta[0].isspace():
                             delta = " " + delta
@@ -374,10 +440,13 @@ class Voice:
                         for sentence in whole:
                             sentences.put_nowait(sentence)
                     elif name == "run.completed":
-                        if not last:
-                            pending = event.get("output") or ""
+                        ended = True
+                        output = event.get("output")
+                        if not last and isinstance(output, str):
+                            pending = output
                         break
                     elif name in RUN_FAILED_EVENTS:
+                        ended = True
                         log.warning("Hermes run %s ended: %s %s", run_id, name, event.get("error", ""))
                         break
                     else:
@@ -387,6 +456,8 @@ class Voice:
         finally:
             if self._create is create:
                 self._create = None
+                if not ended:  # the turn failed or the stream broke: do not leave the run going
+                    self._stop_later(create)
 
     async def _speak(self, sentences, marks):
         """Speak each queued sentence on the dog in order, until None arrives or the TTS cap is reached."""
@@ -395,7 +466,7 @@ class Voice:
             if pcm is None:
                 return
             marks.setdefault("first_tts", time.monotonic())
-            await play(pcm)
+            await speaker.play(pcm)
             marks.setdefault("first_play", time.monotonic())
 
 
@@ -413,9 +484,15 @@ tools = MCPServer("dog", instructions=TOOL_RULES)
 _motion_times = collections.deque()
 
 
-def tool(fn):
-    """Register fn as a robot tool; its docstring, without indentation, is the description that Hermes reads."""
-    return tools.tool(description=inspect.cleandoc(fn.__doc__))(fn)
+def tool(read_only=False):
+    """Register a robot tool; its docstring, without indentation, is the description that Hermes reads.
+
+    read_only marks a tool that never moves or speaks; Hermes retries only those after a lost tool session.
+    """
+    def register(fn):
+        annotations = ToolAnnotations(read_only_hint=True) if read_only else None
+        return tools.tool(description=inspect.cleandoc(fn.__doc__), annotations=annotations)(fn)
+    return register
 
 
 async def _device(method, params=None):
@@ -437,7 +514,7 @@ async def _motion(method, params):
     return await _device(method, {**params, "id": uuid.uuid4().hex})
 
 
-@tool
+@tool(read_only=True)
 async def get_state():
     """Return the dog state: link up or down, armed, busy, fault, tricks and caps.
 
@@ -449,7 +526,7 @@ async def get_state():
     return {"link": "up", **await _device("robot.state")}
 
 
-@tool
+@tool()
 async def do_trick(name: str):
     """Do one trick by name; use only a name from get_state tricks.
 
@@ -460,7 +537,7 @@ async def do_trick(name: str):
     return await _motion("robot.do", {"trick": name})
 
 
-@tool
+@tool()
 async def drive(direction: Literal["forward", "back", "left", "right"], ms: int):
     """Drive one direction for ms milliseconds: 50 up to the registry limit, at most 1000.
 
@@ -471,7 +548,7 @@ async def drive(direction: Literal["forward", "back", "left", "right"], ms: int)
     return await _motion("robot.drive", {"dir": direction, "ms": ms})
 
 
-@tool
+@tool()
 async def go_to_marker(marker_id: int):
     """Walk to the ArUco marker with this id in short steps, for at most 30 s.
 
@@ -481,7 +558,7 @@ async def go_to_marker(marker_id: int):
     return await _motion("robot.goto", {"marker": marker_id})
 
 
-@tool
+@tool(read_only=True)
 async def look():
     """Return a JPEG photo of the play area from the camera above it, and its age in ms.
 
@@ -491,7 +568,7 @@ async def look():
     return [Image(data=base64.b64decode(snap["jpeg_b64"]), format="jpeg"), f"photo age: {snap['age_ms']} ms"]
 
 
-@tool
+@tool()
 async def say(text: str):
     """Speak text through the dog speaker; at most 300 characters."""
     text = text.strip()
@@ -504,13 +581,13 @@ async def say(text: str):
     if pcm is None:
         raise ToolError("the daily speech limit is reached; the dog cannot speak again until tomorrow")
     try:
-        await play(pcm)
+        complete = await speaker.play(pcm)
     except DeviceError as exc:
         raise ToolError(str(exc)) from None
-    return {"spoken": True, "chars": len(text)}
+    return {"spoken": complete, "chars": len(text)}
 
 
-@tool
+@tool()
 async def stop():
     """Stop the dog now: end IR output and cancel the running action. The dog stays armed. Never rate limited."""
     return await _device("robot.stop")
@@ -580,7 +657,7 @@ async def device_link(ws: WebSocket):
         while True:
             try:
                 msg = _decode(await ws.receive_text())
-            except ValueError:
+            except (ValueError, KeyError):  # KeyError: a binary frame has no text
                 continue
             if not isinstance(msg, dict):
                 continue
