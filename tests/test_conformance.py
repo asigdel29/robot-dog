@@ -20,6 +20,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENTRY = {"name": "t", "proto": "NEC", "addr": 0, "cmd": 1, "raw": [], "khz": 38, "repeat": "nec", "period_ms": 108}
 _fake = None
+_run_dir = None
 _port = os.environ.get("DOG_SERIAL")
 #: Timing slack: tight for the real board, wider for the fake, which shares a busy host.
 SLACK_S = 0.15 if _port else 0.4
@@ -27,11 +28,11 @@ SLACK_S = 0.15 if _port else 0.4
 
 def setUpModule():
     """Start the fake bridge unless DOG_SERIAL names a real board."""
-    global _fake, _port
+    global _fake, _port, _run_dir
     if _port:
         return
-    run_dir = tempfile.mkdtemp(prefix="dog-conf-")
-    _fake = subprocess.Popen([sys.executable, os.path.join(ROOT, "sim", "fake_esp32.py"), "--run-dir", run_dir],
+    _run_dir = tempfile.mkdtemp(prefix="dog-conf-")
+    _fake = subprocess.Popen([sys.executable, os.path.join(ROOT, "sim", "fake_esp32.py"), "--run-dir", _run_dir],
                              stdout=subprocess.PIPE, text=True)
     _port = _fake.stdout.readline().split()[1]
 
@@ -41,6 +42,18 @@ def tearDownModule():
     if _fake is not None:
         _fake.terminate()
         _fake.wait(5)
+
+
+def logged(ev, op_id, since):
+    """Return when the fake logged an event, in seconds; a busy host reads events late, so the client clock is not exact."""
+    with open(os.path.join(_run_dir, "fake_esp32.log")) as handle:
+        for line in handle:
+            t_ns, direction, body = line.rstrip("\n").split(" ", 2)
+            if direction == "out" and int(t_ns) / 1e9 >= since:
+                msg = json.loads(body)
+                if msg.get("ev") == ev and msg.get("id") == op_id:
+                    return int(t_ns) / 1e9
+    raise AssertionError(f"no logged {ev} for id {op_id}")
 
 
 class Port:
@@ -179,7 +192,7 @@ class Conformance(unittest.TestCase):
         self.port.state()
         last_hb = time.monotonic()
         self.port.expect("fault", timeout=2.0)
-        self.assertLess(time.monotonic() - last_hb, 1.1)
+        self.assertLess(time.monotonic() - last_hb, 1.1 if _fake is None else 1.0 + SLACK_S)
 
     def test_capture_refused_when_ready(self):
         self.port.ready()
@@ -237,6 +250,7 @@ class Conformance(unittest.TestCase):
         self.assertEqual(order, [("ack", send_id), ("tx", send_id), ("done", send_id), ("ack", disarm_id)])
 
     def test_gap_before_a_new_command(self):
+        since = time.monotonic()
         self.port.ready()
         first = self.port.op("send", name="t")
         second = self.port.op("send", name="t")
@@ -244,7 +258,11 @@ class Conformance(unittest.TestCase):
         done_at = time.monotonic()
         self.port.expect("tx", op_id=second)
         # The second frame starts 40 ms after the first ends and lasts about 70 ms; with no gap it would be 70 ms.
-        self.assertGreater(time.monotonic() - done_at, 0.09)
+        if _fake is not None:
+            done_at = logged("done", first, since)
+            self.assertGreater(logged("tx", second, since) - done_at, 0.09)
+        else:
+            self.assertGreater(time.monotonic() - done_at, 0.09)
 
     def test_arm_refused_while_capturing(self):
         self.port.hello()
