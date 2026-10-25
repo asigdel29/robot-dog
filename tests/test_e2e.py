@@ -1,8 +1,9 @@
 """End-to-end tests of the dog stack on one machine, against the fake ESP32.
 
 Each check maps to a row of the verification table in the plan: stop latency,
-watchdog after a robotd crash, cloud refusals, arm rules, duplicates and the
-simulated goto. Numbers are printed so a run can go into docs/test-log.md.
+watchdog after a robotd crash, cloud refusals, arm rules, duplicates, the
+simulated goto through mediad's fake camera and the pose rate and age. Numbers
+are printed so a run can go into docs/test-log.md.
 """
 
 import asyncio
@@ -213,7 +214,7 @@ class RobotdStack(unittest.TestCase):
 
 
 class PoseFeeder(threading.Thread):
-    """Stands in for mediad: turns the fake toy pose into robot.observe with a goal marker."""
+    """Stands in for mediad: turns the fake toy pose into robot.observe with a goal marker (used by test_link)."""
 
     def __init__(self, stack, goal):
         super().__init__(daemon=True)
@@ -270,27 +271,52 @@ def random_goal(rng, pose):
             min(400, max(80, pose["y"] + dist * math.sin(angle))))
 
 
-class SimGoto(unittest.TestCase):
-    """Simulated goto with poses from PoseFeeder."""
+class CameraPose(unittest.TestCase):
+    """mediad's fake camera draws the markers and the real ArUco detection finds them."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stack = Stack(media=True)
+        cls.addClassCleanup(cls.stack.stop)
+        cls.stack.start()
 
     def test_goto_random_goals(self):
-        """9 of 10 random goals reached."""
+        """9 of 10 random goals reached with poses from the camera path."""
         rng = random.Random(7)
         reached = 0
-        with Stack() as stack:
-            stack.call("robot.enable")
-            for seed in range(10):
-                feeder = PoseFeeder(stack, random_goal(rng, stack.sim_pose()))
-                feeder.start()
-                time.sleep(0.3)
-                try:
-                    result = stack.call("robot.goto", {"marker": 2, "id": aid()}, cloud=True, timeout=40)
-                finally:
-                    feeder.halt.set()
-                    feeder.join()
-                reached += result["reached"]
-                print(f"\ngoto {seed}: {result['reason']} in {result['steps']} steps")
+        self.stack.call("robot.enable")
+        for seed in range(10):
+            goal = random_goal(rng, self.stack.sim_pose())
+            self.stack.set_goal_markers({"2": list(goal)})
+            time.sleep(0.3)
+            result = self.stack.call("robot.goto", {"marker": 2, "id": aid()}, cloud=True, timeout=40)
+            reached += result["reached"]
+            print(f"\ngoto {seed}: {result['reason']} in {result['steps']} steps")
         self.assertGreaterEqual(reached, 9)
+
+    def test_pose_rate_and_age(self):
+        """Pose rate 10 Hz or more and vision age p95 under 200 ms, from robot.state samples."""
+
+        async def sample(seconds):
+            client = await dogproto.Client.connect(self.stack.sock("robotd"))
+            ages = []
+            try:
+                end = time.monotonic() + seconds
+                while time.monotonic() < end:
+                    ages.append((await client.call("robot.state"))["vision_age_ms"])
+                    await asyncio.sleep(0.005)
+            finally:
+                await client.close()
+            return ages
+
+        seconds = 3.0
+        ages = asyncio.run(sample(seconds))
+        rate = sum(1 for before, after in zip(ages, ages[1:]) if after < before) / seconds
+        p95 = statistics.quantiles(ages, n=20)[18]
+        print(f"\npose rate {rate:.1f} Hz, vision age p50={statistics.median(ages):.0f} ms p95={p95:.0f} ms "
+              f"max={max(ages)} ms ({len(ages)} samples)")
+        self.assertGreaterEqual(rate, 10)
+        self.assertLess(p95, 200)
 
 
 if __name__ == "__main__":

@@ -360,3 +360,20 @@ async def call_once(path, method, params=None, timeout=5.0):
         return await client.call(method, params, timeout)
     finally:
         await client.close()
+
+
+async def keep_connected(path, on_connect, retry_s=1.0):
+    """Keep one client connection to path open forever; on_connect(client) receives each new one.
+
+    A restarted daemon is reached again within retry_s. Callers check client.closed before each use.
+    """
+    while True:
+        try:
+            client = await Client.connect(path)
+        except OSError:
+            pass
+        else:
+            log.info("connected to %s", path)
+            on_connect(client)
+            await client.closed.wait()
+        await asyncio.sleep(retry_s)
