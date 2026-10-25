@@ -478,15 +478,14 @@ static void emitCap() {
   event["cmd"] = d.command;
   event["bits"] = d.numberOfBits;
   JsonArray raw = event["raw"].to<JsonArray>();
+  bool fits = d.rawlen <= MAX_RAW + 1;  // rawbuf[0] is unused; a longer frame was cut by the buffer
   uint32_t frameTicks = 0;
   for (IRRawlenType i = 1; i < d.rawlen; i++) {
-    frameTicks += IrReceiver.irparams.rawbuf[i];
-  }
-  uint8_t durations = d.rawlen > 0 ? d.rawlen - 1 : 0;
-  if (durations <= MAX_RAW) {  // a longer frame was cut by the buffer and cannot be replayed
-    for (IRRawlenType i = 1; i < d.rawlen; i++) {
-      int32_t us = IrReceiver.irparams.rawbuf[i] * MICROS_PER_TICK;
-      raw.add(i & 1 ? us - MARK_EXCESS_MICROS : us + MARK_EXCESS_MICROS);
+    int32_t ticks = IrReceiver.irparams.rawbuf[i];
+    frameTicks += ticks;
+    if (fits) {
+      int32_t us = ticks * MICROS_PER_TICK;
+      raw.add(i & 1 ? us - MARK_EXCESS_MICROS : us + MARK_EXCESS_MICROS);  // odd index: mark
     }
   }
   // Start-to-start time, the value robotctl uses as period_ms; ISR ticks, so loop jitter does not count.
