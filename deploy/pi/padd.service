@@ -13,7 +13,6 @@ Group=dog
 ExecStart=/opt/dog/current/.venv/bin/python /opt/dog/current/pi/padd.py --config /etc/dog/dog.toml
 Restart=always
 RestartSec=1
-Environment=PYTHONUNBUFFERED=1
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

@@ -16,9 +16,6 @@ Group=dog
 ExecStart=/opt/dog/current/.venv/bin/python /opt/dog/current/pi/robotd.py --config /etc/dog/dog.toml
 Restart=always
 RestartSec=1
-Environment=PYTHONUNBUFFERED=1
-# robotd needs dialout (serial port) and doglink (cloud socket group) from the dog user's groups.
-# It makes no network connection, so it gets unix sockets only.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/run/dog
@@ -32,6 +29,7 @@ RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
+# robotd makes no network connection.
 RestrictAddressFamilies=AF_UNIX
 # The IR bridge is a USB serial device (ttyUSB for the CP2102N of the Feather V2, ttyACM for CDC boards).
 DevicePolicy=closed

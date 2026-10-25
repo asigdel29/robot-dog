@@ -1,5 +1,5 @@
 # linkd.service: runs linkd, the only dog process with internet access (the WSS link to the hub).
-# It runs as doglink, which has no device groups, and it can open only the -cloud sockets.
+# It runs as doglink, which has no device groups and can open only the -cloud sockets.
 
 [Unit]
 Description=Robot dog cloud link (linkd)
@@ -12,11 +12,9 @@ StartLimitIntervalSec=0
 User=doglink
 Group=doglink
 EnvironmentFile=/etc/dog/link.env
-# linkd takes no arguments; it reads only /etc/dog/link.env.
 ExecStart=/opt/dog/current/.venv/bin/python /opt/dog/current/pi/linkd.py
 Restart=always
 RestartSec=1
-Environment=PYTHONUNBUFFERED=1
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
