@@ -90,13 +90,13 @@ class StubMediad(threading.Thread):
         self.loop = asyncio.get_running_loop()
         self._halt = asyncio.Event()
         methods = ("media.snapshot", "media.subscribe", "audio.play", "audio.stop")
-        handlers = {method: functools.partial(self._handle, method) for method in methods}
+        handlers = {method: functools.partial(self._on_call, method) for method in methods}
         server = await dogproto.serve(self.path, handlers, cloud=True, limit=dogproto.MEDIA_LIMIT)
         self.ready.set()
         await self._halt.wait()
         server.close()
 
-    async def _handle(self, method, params, conn):
+    async def _on_call(self, method, params, conn):
         """Answer one method; a play is recorded, or refused with BUSY while busy is True."""
         if method == "media.snapshot":
             return {"jpeg_b64": base64.b64encode(FAKE_JPEG).decode(), "age_ms": 12}
