@@ -12,8 +12,10 @@ import asyncio
 import contextlib
 import datetime
 import fcntl
+import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import statistics
@@ -250,6 +252,19 @@ def quiet(cmd, timeout=HOOK_TIMEOUT_S, **kwargs):
         raise UpdateError(f"{name} failed with exit code {proc.returncode}")
 
 
+def check_sha256(tarball):
+    """Compare the tarball with the digest in its sibling .sha256 file; raise InputError on a mismatch."""
+    try:
+        with open(f"{tarball}.sha256") as handle:
+            expected = handle.read().split()[0].lower()
+        with open(tarball, "rb") as handle:
+            actual = hashlib.file_digest(handle, "sha256").hexdigest()
+    except (OSError, IndexError) as err:
+        raise InputError(f"cannot read the release or its .sha256 file: {err}") from None
+    if actual != expected:
+        raise InputError(f"sha256 mismatch for {tarball}; the file is damaged or incomplete")
+
+
 def extract(tarball):
     """Extract a release tarball into releases/<VERSION> and return the version."""
     releases = os.path.join(dog_root(), "releases")
@@ -257,9 +272,19 @@ def extract(tarball):
     staging = tempfile.mkdtemp(prefix=".incoming-", dir=releases)
     try:
         with tarfile.open(tarball, "r:gz") as tar:
+            for member in tar.getmembers():
+                parts = member.name.split("/")
+                if not (member.isfile() or member.isdir()) or member.name.startswith("/") or ".." in parts:
+                    raise InputError(f"unsafe tar member {member.name}")
             tar.extractall(staging, filter="data")
         with open(os.path.join(staging, "VERSION")) as handle:
             version = handle.read().strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", version):
+            raise InputError(f"bad VERSION {version!r}")
+        if version == link_version("current"):
+            raise InputError(f"{version} is already the current release")
+        if version == link_version("previous"):
+            raise InputError(f"{version} is the previous release; use robotctl update rollback")
         os.chmod(staging, 0o755)  # mkdtemp makes it 0700; the dog users must read the release
         target = os.path.join(releases, version)
         shutil.rmtree(target, ignore_errors=True)
@@ -370,6 +395,7 @@ def prune():
 
 def update_apply(tarball):
     """Install a release tarball: digest, extract, preinstall, venv, activate with the health gate, prune."""
+    check_sha256(tarball)
     version = extract(tarball)
     say(f"extracted {version}")
     try:
