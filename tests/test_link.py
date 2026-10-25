@@ -43,7 +43,7 @@ DEVICE_TOKEN = "device-secret"
 TOOLS_TOKEN = "tools-secret"
 HERMES_KEY = "hermes-secret"
 OPENAI_KEY = "openai-secret"
-TOOL_NAMES = {"get_state", "do_trick", "drive", "go_to_marker", "look", "stop"}
+TOOL_NAMES = {"get_state", "do_trick", "drive", "go_to_marker", "look", "say", "stop"}
 FAKE_JPEG = b"\xff\xd8\xff\xe0fake jpeg\xff\xd9"
 
 
@@ -157,6 +157,9 @@ class LinkStack(Stack):
                 "HERMES_API_KEY": HERMES_KEY, "OPENAI_API_KEY": OPENAI_KEY, "OPENAI_BASE_URL": f"{self.stub_url}/v1",
                 "DOG_STT_MODEL": "stub-stt", "DOG_TTS_MODEL": "stub-tts", "DOG_TTS_VOICE": "stub-voice",
                 "DOG_HUB_STATE": os.path.join(self.run_dir, "hubstate"), **self.hub_env})
+            self.spawn("stub_hermes", os.path.join(ROOT, "sim", "stub_hermes.py"), "--port", str(stub_port),
+                       "--tools-url", f"{self.hub_url}/tools/")
+            self.wait_for(lambda: answers(f"{self.stub_url}/_stub/requests"), "stub_hermes", timeout=20)
             self.hub_port = hub_port
             self.spawn("hub", os.path.join(ROOT, "hub", "hub.py"), "--port", str(hub_port))
             self.wait_for(lambda: answers(f"{self.hub_url}/healthz"), "hub /healthz", timeout=20)
@@ -217,7 +220,7 @@ class Tools(LinkTestCase):
     """The robot tools over the Model Context Protocol, through the hub and linkd to robotd."""
 
     def test_tool_list_and_tokens(self):
-        """Six tools, two read-only; /tools needs TOOLS_TOKEN, /device needs DEVICE_TOKEN and a text hello."""
+        """Seven tools, two read-only; /tools needs TOOLS_TOKEN, /device needs DEVICE_TOKEN and a text hello."""
         listed = self.stack.tools(lambda client: client.list_tools())
         self.assertEqual({tool.name for tool in listed.tools}, TOOL_NAMES)
         read_only = {t.name for t in listed.tools if t.annotations and t.annotations.read_only_hint}
@@ -256,6 +259,10 @@ class Tools(LinkTestCase):
         result = self.stack.tools(lambda client: client.call_tool("look", {}))
         self.assertEqual(result.content[0].mime_type, "image/jpeg")
         self.assertEqual(base64.b64decode(result.content[0].data), FAKE_JPEG)
+        self.assertFalse(self.stack.tool("say", {"text": "Woof."})[0])
+        self.stack.wait_for(lambda: len(self.stack.mediad.plays) == 1, "audio.play from say")
+        self.assertEqual(self.stack.mediad.plays[0][1]["rate"], 24000)
+        self.assertTrue(self.stack.tool("say", {"text": "x" * 301})[0])
         error, text = self.stack.tool("stop")
         self.assertFalse(error, text)
         self.assertTrue(json.loads(text)["stop_transmitted"])
@@ -323,6 +330,21 @@ class Tools(LinkTestCase):
             self.stack.tool(name, arguments)
         except Exception:
             pass
+
+
+class DailyCaps(LinkTestCase):
+    """Over a daily cap the dog says nothing new, and the hub logs it."""
+
+    hub_env = {"DOG_TTS_CHARS_PER_DAY": "10", "DOG_STT_MINUTES_PER_DAY": "0.001"}
+
+    def test_caps(self):
+        """say stops at the TTS cap; an utterance over the STT cap gets no STT call."""
+        self.assertFalse(self.stack.tool("say", {"text": "Woof."})[0])
+        error, text = self.stack.tool("say", {"text": "Woof, woof."})
+        self.assertTrue(error)
+        self.assertIn("daily speech limit", text)
+        with open(os.path.join(self.stack.run_dir, "hubstate", "usage.json")) as handle:
+            self.assertEqual(json.load(handle)["tts_chars"], 5)
 
 
 class FakeHub:
