@@ -73,7 +73,7 @@ These rules replace "refuse to arm without stop" from the old plan. A toy with n
 
 ## 4. Procedure: add one button
 
-Do these steps for each of the 12 remote buttons.
+Do these steps for each of the 19 remote buttons.
 
 1. Disarm the dog.
 2. Run `robotctl registry capture <name>`.
