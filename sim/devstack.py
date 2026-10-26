@@ -107,6 +107,40 @@ class Stack:
         """Make one request to a daemon of this stack."""
         return asyncio.run(dogproto.call_once(self.sock(service, cloud), method, params, timeout))
 
+    def sim_pose(self):
+        """Return the simulated toy pose written by the fake bridge."""
+        with open(os.path.join(self.run_dir, "sim_pose.json")) as handle:
+            return json.load(handle)
+
+    def log(self):
+        """Return the fake bridge log as (t_mono_ns, "in"|"out", message) tuples.
+
+        It parses only the new lines: a full parse on each poll takes enough CPU on
+        a small CI runner to delay the daemons under test.
+        """
+        with open(os.path.join(self.run_dir, "fake_esp32.log"), "rb") as handle:
+            handle.seek(self._log_pos)
+            complete = handle.read().rpartition(b"\n")[0]
+        if complete:
+            self._log_pos += len(complete) + 1
+            for line in complete.decode().splitlines():
+                t_ns, direction, msg = line.split(" ", 2)
+                self._log_rows.append((int(t_ns), direction, json.loads(msg)))
+        return list(self._log_rows)
+
+    def ops(self, op, since_ns=0):
+        """Return logged ops of one kind sent to the fake after since_ns."""
+        return [(t, m) for t, d, m in self.log() if d == "in" and m.get("op") == op and t >= since_ns]
+
+    def wait_ops(self, op, count, since_ns=0, timeout=1.0):
+        """Wait until the fake has logged count ops of one kind; a reply can arrive before the log line."""
+        end = time.monotonic() + timeout
+        while True:
+            rows = self.ops(op, since_ns)
+            if len(rows) >= count or time.monotonic() > end:
+                return rows
+            time.sleep(0.02)
+
     def kill(self, name, sig=signal.SIGKILL):
         """Send a signal to one process and wait for it to exit."""
         proc = self.procs[name]
