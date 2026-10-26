@@ -7,13 +7,18 @@ hub, to send linkd frames that the real hub never sends. Voice latency lines are
 printed for docs/test-log.md.
 """
 
+import asyncio
+import base64
+import functools
 import json
 import os
 import queue
 import signal
 import sys
 import threading
+import time
 import unittest
+import uuid
 
 import websockets.sync.server
 
@@ -22,9 +27,68 @@ sys.path.insert(0, os.path.join(ROOT, "pi"))
 sys.path.insert(0, os.path.join(ROOT, "sim"))
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
+import dogproto  # noqa: E402
 from devstack import Stack  # noqa: E402
 
 DEVICE_TOKEN = "device-secret"
+FAKE_JPEG = b"\xff\xd8\xff\xe0fake jpeg\xff\xd9"
+
+
+class StubMediad(threading.Thread):
+    """Stands in for mediad's cloud socket: snapshot, subscribe, audio.play and audio.stop."""
+
+    def __init__(self, path):
+        super().__init__(daemon=True)
+        self.path = path
+        #: (t_mono_ns, params) of each accepted audio.play.
+        self.plays = []
+        #: True plays the part of a held push-to-talk: audio.play answers BUSY.
+        self.busy = False
+        self.subscribers = []
+        self.ready = threading.Event()
+        self.loop = None
+        self._halt = None
+
+    def run(self):
+        """Serve the socket until halt()."""
+        asyncio.run(self._serve())
+
+    async def _serve(self):
+        """Serve the four methods on the cloud socket."""
+        self.loop = asyncio.get_running_loop()
+        self._halt = asyncio.Event()
+        methods = ("media.snapshot", "media.subscribe", "audio.play", "audio.stop")
+        handlers = {method: functools.partial(self._on_call, method) for method in methods}
+        server = await dogproto.serve(self.path, handlers, cloud=True, limit=dogproto.MEDIA_LIMIT)
+        self.ready.set()
+        await self._halt.wait()
+        server.close()
+
+    async def _on_call(self, method, params, conn):
+        """Answer one method; a play is recorded, or refused with BUSY while busy is True."""
+        if method == "media.snapshot":
+            return {"jpeg_b64": base64.b64encode(FAKE_JPEG).decode(), "age_ms": 12}
+        if method == "media.subscribe":
+            self.subscribers.append(conn)
+        if method == "audio.play":
+            if self.busy:
+                raise dogproto.RpcError(dogproto.BUSY, "push-to-talk is down")
+            self.plays.append((time.monotonic_ns(), params))
+        return {}
+
+    def notify(self, method, params):
+        """Send one notification to each subscriber; callable from the test thread."""
+        def send():
+            """Notify each subscriber; runs on the server loop."""
+            for conn in self.subscribers:
+                conn.notify(method, params)
+        self.loop.call_soon_threadsafe(send)
+
+    def halt(self):
+        """Stop the socket server."""
+        if self.loop is not None:
+            self.loop.call_soon_threadsafe(self._halt.set)
+        self.join(5)
 
 
 class LinkStack(Stack):
@@ -39,6 +103,9 @@ class LinkStack(Stack):
     def start(self):
         """Start every process and wait until linkd is linked."""
         super().start()
+        self.mediad = StubMediad(self.sock("mediad", cloud=True))
+        self.mediad.start()
+        self.mediad.ready.wait(5)
         self.env.update({"DOG_HUB_URL": self.hub_ws or f"ws://127.0.0.1:{self.hub_port}/device",
                          "DOG_DEVICE_TOKEN": DEVICE_TOKEN})
         self.spawn("linkd", os.path.join(ROOT, "pi", "linkd.py"), "--assume-synced")
@@ -46,6 +113,8 @@ class LinkStack(Stack):
     def stop(self):
         """Stop the processes and the stub mediad."""
         super().stop()
+        if self.mediad is not None:
+            self.mediad.halt()
 
     def armed(self):
         """Return the armed flag of robotd."""
@@ -90,12 +159,65 @@ class LinkdRules(unittest.TestCase):
         self.stack.start()
         self.conn = self.hub.conns.get(timeout=10)
         self.hello = json.loads(self.conn.recv(timeout=5))
+        self.ids = iter(range(1, 1000))
+
+    def request(self, method, params=None, age_ms=0):
+        """Send one request as the hub does and return its id."""
+        msg_id = next(self.ids)
+        self.conn.send(json.dumps({"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params or {},
+                                   "sent_at": int(time.time() * 1000) - age_ms}))
+        return msg_id
+
+    def reply(self):
+        """Return the next frame from linkd that is a reply."""
+        while True:
+            msg = json.loads(self.conn.recv(timeout=10))
+            if "id" in msg:
+                return msg
 
     def test_hello_and_bearer(self):
         """linkd sends the bearer header and then link.hello."""
         self.assertEqual(self.conn.request.headers["Authorization"], f"Bearer {DEVICE_TOKEN}")
         self.assertEqual(self.hello["method"], "link.hello")
         self.assertEqual({k: self.hello["params"][k] for k in ("api", "device")}, {"api": 1, "device": "dog-01"})
+
+    def test_only_cloud_methods(self):
+        """Arming, stick motion, a second subscription and link methods get METHOD_NOT_FOUND."""
+        for method in ("robot.enable", "robot.move", "media.subscribe", "link.hello"):
+            self.request(method)
+            self.assertEqual(self.reply()["error"]["code"], dogproto.METHOD_NOT_FOUND, method)
+        self.assertFalse(self.stack.armed())
+        self.request("robot.state")
+        self.assertIn("armed", self.reply()["result"])
+
+    def test_nan_and_infinity_refused(self):
+        """A frame with NaN is dropped; 1e999 in params gets INVALID_PARAMS."""
+        self.conn.send('{"jsonrpc": "2.0", "id": 500, "method": "robot.state", "params": {}, "sent_at": NaN}')
+        state = self.request("robot.state")
+        self.assertEqual(self.reply()["id"], state, "a frame with NaN must be dropped")
+        self.conn.send('{"jsonrpc": "2.0", "id": 501, "method": "robot.state", "params": {"x": 1e999}, "sent_at": %d}'
+                       % (time.time() * 1000))
+        reply = self.reply()
+        self.assertEqual((reply["id"], reply["error"]["code"]), (501, dogproto.INVALID_PARAMS))
+
+    def test_stop_overtakes_drive(self):
+        """A stop gets its reply before the drive that it ends, which gets PREEMPTED."""
+        self.assertTrue(self.stack.call("robot.enable")["armed"])
+        drive = self.request("robot.drive", {"dir": "forward", "ms": 1000, "id": uuid.uuid4().hex})
+        time.sleep(0.1)
+        stop = self.request("robot.stop")
+        first, second = self.reply(), self.reply()
+        self.assertEqual((first["id"], second["id"]), (stop, drive))
+        self.assertEqual(second["error"]["code"], dogproto.PREEMPTED)
+
+    def test_forwards_utterance_and_bargein(self):
+        """mediad utterances and barge-ins reach the hub as voice.utterance and voice.cancel."""
+        self.stack.wait_for(lambda: self.stack.mediad.subscribers, "linkd subscribed to mediad")
+        self.stack.mediad.notify("media.utterance", {"id": "u1", "rate": 16000, "pcm16_b64": ""})
+        self.stack.mediad.notify("media.bargein", {})
+        frames = [json.loads(self.conn.recv(timeout=5)) for _ in range(2)]
+        self.assertEqual([f["method"] for f in frames], ["voice.utterance", "voice.cancel"])
+        self.assertEqual(frames[0]["params"]["id"], "u1")
 
     def test_link_loss_disarms(self):
         """A closed link and a SIGTERM of linkd both disarm the dog; a reconnect does not arm it."""
@@ -107,6 +229,15 @@ class LinkdRules(unittest.TestCase):
         self.assertTrue(self.stack.call("robot.enable")["armed"])
         self.stack.kill("linkd", signal.SIGTERM)
         self.assertFalse(self.stack.armed(), "disarm on SIGTERM")
+
+    def test_backoff_after_short_sessions(self):
+        """A hub that closes each link at once gets 1, 2, 4 s waits, not a reconnect and disarm each second."""
+        self.hub.close_at_once = True
+        self.conn.close()
+        time.sleep(6.0)
+        attempts = self.hub.conns.qsize()
+        print(f"\nreconnects in 6 s against a hub that closes at once: {attempts}")
+        self.assertLessEqual(attempts, 3)
 
 
 if __name__ == "__main__":
