@@ -151,6 +151,32 @@ class Conformance(unittest.TestCase):
         self.port.expect("ack", op_id=self.port.op("arm", n=1))
         self.assertEqual(self.port.state()["s"], "READY")
 
+    def test_send_refused_when_disarmed(self):
+        self.port.hello()
+        self.port.expect("ack", op_id=self.port.op("load", **ENTRY))
+        self.port.expect("nack", op_id=self.port.op("send", name="t"))
+
+    def test_send_transmits_once(self):
+        self.port.ready()
+        op_id = self.port.op("send", name="t")
+        self.port.expect("ack", op_id=op_id)
+        self.assertEqual(self.port.expect("tx", op_id=op_id)["frames"], 1)
+        self.port.expect("done", op_id=op_id)
+
+    def test_lease_expiry_stops_repeats(self):
+        self.port.ready()
+        op_id = self.port.op("hold", name="t", lease_ms=300)
+        sent = time.monotonic()
+        self.port.expect("ack", op_id=op_id)
+        self.port.expect("done", op_id=op_id, timeout=1.0)
+        if TIMED:
+            self.assertLess(time.monotonic() - sent, 0.3 + SLACK_S)
+        self.assertEqual([m for m in self._events(0.3) if m.get("ev") == "tx"], [], "repeat frames after the lease")
+
+    def test_lease_cap(self):
+        self.port.ready()
+        self.port.expect("nack", op_id=self.port.op("hold", name="t", lease_ms=500))
+
     def test_heartbeat_loss_faults(self):
         self.port.ready()
         self.port.state()
@@ -159,9 +185,43 @@ class Conformance(unittest.TestCase):
         if TIMED:
             self.assertLess(time.monotonic() - last_hb, 1.1 if _fake is None else 1.0 + SLACK_S)
 
+    def test_capture_refused_when_ready(self):
+        self.port.ready()
+        self.port.expect("nack", op_id=self.port.op("capture", ms=500))
+
     def test_loop_time(self):
         self.port.hello()
         self.assertLess(self.port.state()["max_loop_us"], 100_000)
+
+    def test_limits_and_types(self):
+        """Each field outside the limits of protocol.md 2.4, absent or of the wrong JSON type is refused."""
+        self.port.hello()
+        self.port.expect("ack", op_id=self.port.op("load", **{**ENTRY, "name": "d", "data": 0xE718FF00}))
+        missing = {k: v for k, v in ENTRY.items() if k != "khz"}
+        self.assertEqual(self.port.expect("nack", op_id=self.port.op("load", **missing))["why"], "bad entry")
+        for bad in ({"proto": "RC5"}, {"repeat": "toggle"}, {"proto": "raw", "raw": []}, {"raw": [560] * 121},
+                    {"proto": "raw", "raw": [60000, 60000, 30001]}, {"name": "\u00e9" * 16}, {"cmd": 0x100},
+                    {"khz": None}, {"khz": "38"}, {"khz": 38.5}, {"addr": -1}, {"period_ms": True}, {"raw": "x"},
+                    {"raw": [560.5]}, {"name": 5}, {"data": "x"}, {"data": -1}):
+            self.assertEqual(self.port.expect("nack", op_id=self.port.op("load", **{**ENTRY, **bad}))["why"], "bad entry")
+        self.assertEqual(self.port.expect("nack", op_id=self.port.op("capture", ms="x"))["why"], "bad ms")
+        for i in range(23):
+            self.port.expect("ack", op_id=self.port.op("load", **{**ENTRY, "name": f"e{i}"}))
+        self.assertEqual(self.port.expect("nack", op_id=self.port.op("load", **ENTRY))["why"], "table full")
+        self.port.expect("nack", op_id=self.port.op("arm", n=True))
+        self.port.expect("ack", op_id=self.port.op("arm", n=24))
+        self.assertEqual(self.port.expect("nack", op_id=self.port.op("hold", name="d", lease_ms=300.0))["why"], "lease")
+        self.assertEqual(self.port.expect("nack", op_id=self.port.op("send", name=["d"]))["why"], "unknown name")
+
+    def test_hold_without_repeat_sends_one_frame(self):
+        self.port.hello()
+        self.port.expect("ack", op_id=self.port.op("load", **{**ENTRY, "repeat": "none"}))
+        self.port.expect("ack", op_id=self.port.op("arm", n=1))
+        self.assertEqual(self._frames_until_done(self.port.op("hold", name="t", lease_ms=300)), 1)
+
+    def test_short_lease_sends_one_frame(self):
+        self.port.ready()
+        self.assertEqual(self._frames_until_done(self.port.op("hold", name="t", lease_ms=5)), 1)
 
     def test_heartbeat_loss_sends_stop_once(self):
         self.port.hello()
@@ -171,6 +231,42 @@ class Conformance(unittest.TestCase):
         self.port.state()
         events = self._events(2.0, lambda m: m.get("ev") == "fault")
         self.assertEqual([m for m in events if m.get("ev") == "tx"], [{"ev": "tx", "id": 0, "frames": 1}])
+
+    def test_send_ends_before_the_next_op(self):
+        self.port.ready()
+        send_id = self.port.op("send", name="t")
+        disarm_id = self.port.op("disarm")
+        events = self._events(1.0, lambda m: m.get("ev") == "ack" and m.get("id") == disarm_id)
+        order = [(m["ev"], m["id"]) for m in events if m.get("id") in (send_id, disarm_id)]
+        self.assertEqual(order, [("ack", send_id), ("tx", send_id), ("done", send_id), ("ack", disarm_id)])
+
+    def test_gap_before_a_new_command(self):
+        self.port.ready()
+        first = self.port.op("send", name="t")
+        second = self.port.op("send", name="t")
+        self.port.expect("done", op_id=first)
+        done_at = time.monotonic()
+        self.port.expect("tx", op_id=second)
+        # The second frame starts 40 ms after the first ends and lasts about 70 ms; with no gap it would be 70 ms.
+        if TIMED:
+            self.assertGreater(time.monotonic() - done_at, 0.09)
+
+    def test_arm_refused_while_capturing(self):
+        self.port.hello()
+        self.port.expect("ack", op_id=self.port.op("load", **ENTRY))
+        cap_id = self.port.op("capture", ms=300)
+        self.port.expect("ack", op_id=cap_id)
+        self.assertEqual(self.port.expect("nack", op_id=self.port.op("arm", n=1))["why"], "capturing")
+        self.port.expect("done", op_id=cap_id)
+        self.port.expect("ack", op_id=self.port.op("arm", n=1))
+
+    def test_send_after_stop(self):
+        self.port.ready()
+        self.port.expect("ack", op_id=self.port.op("hold", name="t", lease_ms=300))
+        self.port.expect("ack", op_id=self.port.op("stop"))
+        op_id = self.port.op("send", name="t")
+        self.port.expect("ack", op_id=op_id)
+        self.port.expect("done", op_id=op_id)
 
     def _events(self, timeout, last=None):
         """Return the events up to and with the first one for which last() is true (fail after timeout).
@@ -188,6 +284,11 @@ class Conformance(unittest.TestCase):
         if last:
             self.fail(f"no closing event within {timeout} s: {events}")
         return events
+
+    def _frames_until_done(self, op_id):
+        """Return the tx count until the done of op_id."""
+        events = self._events(1.0, lambda m: m.get("ev") == "done" and m.get("id") == op_id)
+        return sum(m.get("ev") == "tx" for m in events)
 
 
 if __name__ == "__main__":
