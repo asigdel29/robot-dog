@@ -51,9 +51,12 @@ SNAPSHOT_PX = (16, 4096)
 CONSOLE_COOKIE = "dog_console"
 CONSOLE_MIN_TOKEN_CHARS = 32
 CONSOLE_MAX_CONNECTIONS = 16
+#: Console buttons that map to one robotd request without parameters.
+CONSOLE_BUTTONS = {"/arm": "robot.enable", "/disarm": "robot.disarm", "/stop": "robot.stop"}
 HTTP_HEAD_LIMIT = 8192
 HTTP_BODY_LIMIT = 1024
 HTTP_READ_S = 3.0
+TRICK_WAIT_S = 35.0
 
 
 # ---------------------------------------------------------------- vision
@@ -404,12 +407,70 @@ class Mediad:
 # ---------------------------------------------------------------- LAN console
 
 
+CONSOLE_PAGE = b"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dog console</title>
+<style>
+body{margin:0 auto;padding:16px;max-width:640px;font-family:system-ui,sans-serif;background:#111;color:#eee}
+button{width:100%;margin:4px 0;padding:14px;border:0;border-radius:10px;font-size:1.2rem;background:#444;color:#fff}
+#stop{padding:28px;font-size:2rem;background:#d11}
+img{width:100%;aspect-ratio:4/3;background:#333}
+pre{white-space:pre-wrap}
+</style></head><body>
+<button id="stop">STOP</button><button id="arm">Arm</button><button id="disarm">Disarm</button>
+<img id="cam" alt="Camera image"><pre id="state">Loading</pre><div id="tricks"></div><pre id="reply"></pre>
+<script>
+const $ = id => document.getElementById(id);
+history.replaceState(null, '', '/');
+async function post(path, body) {
+  $('reply').textContent = path + ' ...';
+  try {
+    const r = await fetch(path, {method: 'POST', body: JSON.stringify(body || {})});
+    $('reply').textContent = path + ': ' + await r.text();
+  } catch (e) { $('reply').textContent = path + ': ' + e; }
+  poll();
+}
+for (const id of ['stop', 'arm', 'disarm']) $(id).onclick = () => post('/' + id);
+let trickNames;
+async function poll() {
+  try {
+    const s = await (await fetch('/state')).json();
+    $('state').textContent = s.error ? 'robotd: ' + s.error : `armed: ${s.armed}  health: ${s.health}  fault: ${s.fault}
+esp32: ${s.esp}  busy: ${JSON.stringify(s.busy)}
+vision age: ${s.vision_age_ms} ms  frame age: ${s.frame_age_ms} ms`;
+    const names = (s.tricks || []).map(t => t.name);
+    if (names.join() !== trickNames) {  // a new button under a finger would lose the tap
+      trickNames = names.join();
+      $('tricks').replaceChildren(...names.map(name => {
+        const b = document.createElement('button');
+        b.textContent = name;
+        b.onclick = () => post('/do', {trick: name});
+        return b;
+      }));
+    }
+  } catch (e) { $('state').textContent = String(e); }
+}
+function nextFrame() { setTimeout(() => { $('cam').src = '/snapshot.jpg?t=' + Date.now(); }, 500); }
+$('cam').onload = $('cam').onerror = nextFrame;
+nextFrame();
+poll();
+setInterval(poll, 1000);
+</script></body></html>
+"""
+
+
 def http_response(status, content_type, body, extra=()):
     """Return the bytes of one HTTP/1.1 response that closes the connection."""
     head = [f"HTTP/1.1 {status} {HTTPStatus(status).phrase}", f"Content-Type: {content_type}",
             f"Content-Length: {len(body)}", "Cache-Control: no-store", "X-Content-Type-Options: nosniff",
             "X-Frame-Options: DENY", "Connection: close", *extra]
     return ("\r\n".join(head) + "\r\n\r\n").encode() + body
+
+
+def json_response(status, value):
+    """Return an HTTP response with a JSON body."""
+    return http_response(status, "application/json", json.dumps(value).encode())
 
 
 async def read_request(reader):
@@ -487,15 +548,47 @@ class Console:
 
     async def route(self, method, path, query, headers, body):
         """Return the response bytes for one parsed request."""
+        if method == "GET" and path == "/" and "token" in query:
+            if not self._token_ok(query["token"][0]):
+                return http_response(401, "text/plain", b"wrong console token\n")
+            # The page itself, not a redirect: a browser does not send a Strict cookie on a
+            # redirect that another app started. The page removes the token from the address bar.
+            cookie = f"Set-Cookie: {CONSOLE_COOKIE}={self._cookie.decode()}; HttpOnly; SameSite=Strict; Path=/"
+            return http_response(200, "text/html; charset=utf-8", CONSOLE_PAGE, (cookie,))
         if not self._authorized(headers):
             return http_response(401, "text/plain", b"open /?token=<console token> first\n")
+        origin = headers.get("origin")
+        if method == "POST" and origin is not None and origin != f"http://{headers.get('host', '')}":
+            return http_response(403, "text/plain", b"cross-origin request refused\n")
+        if (method, path) == ("GET", "/"):
+            return http_response(200, "text/html; charset=utf-8", CONSOLE_PAGE)
         if (method, path) == ("GET", "/snapshot.jpg"):
             try:
                 jpeg, _ = await self.media.snapshot(FRAME_W)
             except RpcError as err:
                 return http_response(503, "text/plain", err.message.encode())
             return http_response(200, "image/jpeg", jpeg)
+        if (method, path) == ("GET", "/state"):
+            _, state = await self._robot("robot.state")
+            return json_response(200, {**state, "frame_age_ms": self.media.frame_age_ms()})
+        if method == "POST" and path in CONSOLE_BUTTONS:
+            return json_response(*await self._robot(CONSOLE_BUTTONS[path]))
+        if (method, path) == ("POST", "/do"):
+            try:
+                params = {"trick": dogproto.decode(body)["trick"], "id": uuid.uuid4().hex}
+            except (ValueError, TypeError, KeyError, RecursionError):
+                return json_response(400, {"error": 'body must be {"trick": name}'})
+            return json_response(*await self._robot("robot.do", params, TRICK_WAIT_S))
         return http_response(404, "text/plain", b"not found\n")
+
+    async def _robot(self, method, params=None, timeout=5.0):
+        """Call robotd on its local socket; return (HTTP status, JSON value)."""
+        try:
+            return 200, await dogproto.call_once(dogproto.sock_path("robotd"), method, params, timeout)
+        except RpcError as err:
+            return 409, {"error": err.message, "code": err.code}
+        except (OSError, TimeoutError) as exc:
+            return 503, {"error": f"robotd not reachable: {exc}"}
 
 
 # ---------------------------------------------------------------- start-up

@@ -206,6 +206,7 @@ def main():
     with Stack(media=True) as stack:
         print(f"run dir: {stack.run_dir}")
         print(f"robotctl: DOG_RUN_DIR={stack.run_dir} python pi/robotctl.py --config /dev/null state")
+        print(f"console: http://127.0.0.1:{stack.console_port}/?token={stack.console_token}")
         try:
             while all(p.poll() is None for p in stack.procs.values()):
                 time.sleep(0.5)

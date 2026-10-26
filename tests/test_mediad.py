@@ -8,6 +8,8 @@ printed so a run can go into docs/test-log.md.
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import http.client
 import math
 import os
@@ -364,6 +366,12 @@ class MediaStack(unittest.TestCase):
         finally:
             conn.close()
 
+    def cookie(self):
+        """Log in with the token and return the Cookie header value."""
+        status, headers, _ = self.request("GET", "/?token=" + self.stack.console_token)
+        self.assertEqual(status, 200)
+        return headers["Set-Cookie"].split(";")[0]
+
     def test_console_needs_token(self):
         for method, path in (("GET", "/"), ("GET", "/state"), ("GET", "/snapshot.jpg"), ("POST", "/stop"),
                              ("POST", "/arm")):
@@ -371,6 +379,48 @@ class MediaStack(unittest.TestCase):
         self.assertEqual(self.request("GET", "/?token=wrong")[0], 401)
         self.assertEqual(self.request("POST", "/arm", {"Authorization": "Bearer wrong"})[0], 401)
         self.assertEqual(self.request("GET", "/state", {"Cookie": "dog_console=wrong"})[0], 401)
+
+    def test_console_cookie_flow(self):
+        status, headers, body = self.request("GET", "/?token=" + self.stack.console_token)
+        self.assertEqual(status, 200)
+        self.assertIn(b"STOP", body)
+        set_cookie = headers["Set-Cookie"]
+        self.assertIn("HttpOnly", set_cookie)
+        self.assertIn("SameSite=Strict", set_cookie)
+        token = self.stack.console_token
+        derived = hmac.new(token.encode(), b"cookie", hashlib.sha256).hexdigest()
+        self.assertEqual(set_cookie.split(";")[0], "dog_console=" + derived)
+        self.assertNotIn(token, set_cookie)
+        self.assertEqual(self.request("GET", "/state", {"Cookie": "dog_console=" + token})[0], 401)
+        # Another app on the same host can set a cookie that a strict parser refuses.
+        cookie = {"Cookie": 'other={"a":1}; ' + set_cookie.split(";")[0]}
+        status, headers, body = self.request("GET", "/", cookie)
+        self.assertEqual(status, 200)
+        self.assertIn(b"STOP", body)
+        status, headers, body = self.request("GET", "/snapshot.jpg", cookie)
+        self.assertEqual((status, headers["Content-Type"], body[:2]), (200, "image/jpeg", b"\xff\xd8"))
+        status, _, body = self.request("GET", "/state", cookie)
+        self.assertEqual(status, 200)
+        self.assertIn(b'"armed"', body)
+        self.assertIn(b'"frame_age_ms"', body)
+
+    def test_console_stop_arm_and_trick(self):
+        cookie = {"Cookie": self.cookie()}
+        status, _, body = self.request("POST", "/stop", cookie)
+        self.assertEqual(status, 200)
+        self.assertIn(b"stop_transmitted", body)
+        status, _, body = self.request("POST", "/arm", cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(self.stack.call("robot.state")["armed"])
+        status, _, body = self.request("POST", "/do", {**cookie, "Content-Type": "application/json"},
+                                       b'{"trick": "bark"}')
+        self.assertEqual(status, 200)
+        self.assertIn(b'"transmitted": true', body)
+        for bad in (b"", b"[]", b"[" * 1000):
+            self.assertEqual(self.request("POST", "/do", cookie, bad)[0], 400, bad[:8])
+        bearer = {"Authorization": "Bearer " + self.stack.console_token}
+        self.assertEqual(self.request("POST", "/disarm", bearer)[0], 200)
+        self.assertFalse(self.stack.call("robot.state")["armed"])
 
     def test_console_connection_limit(self):
         port = self.stack.console_port
@@ -387,6 +437,8 @@ class MediaStack(unittest.TestCase):
         finally:
             for conn in idle:
                 conn.close()
+        bearer = {"Authorization": "Bearer " + self.stack.console_token}
+        self.stack.wait_for(lambda: self.request("GET", "/state", bearer)[0] == 200, "console after the limit")
 
     def test_short_token_turns_the_console_off(self):
         port = free_port()
@@ -406,6 +458,14 @@ class MediaStack(unittest.TestCase):
             proc.terminate()
             _, err = proc.communicate(timeout=5)
         self.assertIn("must have 32 characters or more", err)
+
+    def test_console_refuses_cross_origin_post(self):
+        self.stack.call("robot.disarm")
+        cookie = {"Cookie": self.cookie()}
+        self.assertEqual(self.request("POST", "/arm", {**cookie, "Origin": "http://evil.example"})[0], 403)
+        self.assertFalse(self.stack.call("robot.state")["armed"])
+        same = f"http://127.0.0.1:{self.stack.console_port}"
+        self.assertEqual(self.request("POST", "/stop", {**cookie, "Origin": same})[0], 200)
 
 
 if __name__ == "__main__":
