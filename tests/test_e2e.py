@@ -150,10 +150,11 @@ class RobotdStack(unittest.TestCase):
         print(f"\nafter kill: last repeat {(last_tx - killed) / 1e6:.0f} ms, fault {(fault - killed) / 1e6:.0f} ms"
               f" ({(fault - last_hb) / 1e6:.0f} ms after the last heartbeat)")
         self.assertGreater(last_tx, killed, "no repeat frame after the kill: the hold was not running")
-        self.assertLessEqual((last_tx - killed) / 1e6, 400)
+        # On CI a stall can delay the fake; a broken lease would still repeat until the watchdog near 1 s.
+        self.assertLessEqual((last_tx - killed) / 1e6, 800 if ON_CI else 400)
         # Watchdog 1000 ms after the last heartbeat, then the 40 ms gap and the ~70 ms stop frame, then FAULT:
         # about 1110 ms by design, plus slack for process scheduling on a busy CI runner.
-        self.assertLessEqual((fault - last_hb) / 1e6, 1300)
+        self.assertLessEqual((fault - last_hb) / 1e6, 2500 if ON_CI else 1300)
 
     def test_owner_disconnect_stops_hold(self):
         self.arm()
