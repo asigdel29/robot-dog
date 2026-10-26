@@ -3,5 +3,6 @@
 starlette==1.10.0
 uvicorn==0.54.0
 mcp==2.3.0
+openai==3.37.0
 httpx2==2.16.0
 websockets==17.3
