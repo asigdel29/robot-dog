@@ -380,6 +380,64 @@ class VoiceLoop(LinkTestCase):
                          {("stub-tts", "stub-voice", "pcm")})
         self.wait_latency_line()
 
+    def test_tool_call_during_stream(self):
+        """Hermes calls do_trick through /tools while the voice loop waits on its stream: no deadlock.
+
+        The text around the tool call gets exactly one space, also after an empty delta.
+        """
+        self.arm()
+        self.stack.stub_config(transcript="please bark")
+        self.stack.utter()
+        self.stack.wait_for(lambda: len(self.stack.mediad.plays) >= 2, "reply played after the tool call")
+        self.assertEqual([m["name"] for _, m in self.stack.wait_ops("send", 1)], ["bark"])
+        call = self.stack.stub_requests("tool:do_trick")[0]
+        self.assertFalse(call["is_error"], call["text"])
+        self.assertTrue(json.loads(call["text"])["transmitted"])
+        self.wait_latency_line()
+        self.stack.stub_config(reply=["Okay.", "", "Done!"])
+        self.stack.utter()
+        self.stack.wait_for(lambda: len(self.stack.mediad.plays) >= 4, "second reply played")
+        spoken = [r["body"]["input"] for r in self.stack.stub_requests("/v1/audio/speech")]
+        self.assertEqual(spoken, ["Sure, I can do that.", "Here I go!", "Okay.", "Done!"])
+
+    def test_bargein_stops_run(self):
+        """A barge-in stops the Hermes run and the speech that is not sent yet."""
+        self.stack.stub_config(reply=[" One."] * 40, delta_delay=0.1)
+        self.stack.utter()
+        self.stack.wait_for(lambda: self.stack.mediad.plays, "first sentence played")
+        self.stack.mediad.notify("media.bargein", {})
+        self.stack.wait_for(lambda: self.stack.stub_requests("/v1/runs/stop"), "run stop at Hermes")
+        stop = self.stack.stub_requests("/v1/runs/stop")[0]
+        self.assertEqual(stop["run_id"], self.stack.stub_requests("/v1/runs")[0]["run_id"])
+        self.assertEqual(stop["headers"]["authorization"], f"Bearer {HERMES_KEY}")
+        time.sleep(0.3)
+        played = len(self.stack.mediad.plays)
+        time.sleep(1.0)
+        self.assertEqual(len(self.stack.mediad.plays), played, "audio.play after barge-in")
+        self.assertLess(played, 10)
+
+    def test_bargein_while_run_is_created(self):
+        """A barge-in before Hermes answers the create request still stops that run, and nothing plays."""
+        self.stack.stub_config(create_delay=1.0)
+        self.stack.utter()
+        self.stack.wait_for(lambda: self.stack.stub_requests("/v1/runs"), "create request at Hermes")
+        self.stack.mediad.notify("media.bargein", {})
+        self.stack.wait_for(lambda: self.stack.stub_requests("/v1/runs/stop"), "run stop at Hermes", timeout=5)
+        stop = self.stack.stub_requests("/v1/runs/stop")[0]
+        self.assertEqual(stop["run_id"], self.stack.stub_requests("/v1/runs")[0]["run_id"])
+        time.sleep(0.5)
+        self.assertEqual(self.stack.stub_requests("/v1/runs/events"), [])
+        self.assertEqual(self.stack.mediad.plays, [])
+
+    def test_failed_turn_stops_run(self):
+        """A turn that ends without a terminal run event stops its Hermes run."""
+        self.stack.stub_config(events_status=500)
+        self.stack.utter()
+        self.stack.wait_for(lambda: self.stack.stub_requests("/v1/runs/stop"), "run stop after a failed turn")
+        self.assertEqual(self.stack.stub_requests("/v1/runs/stop")[0]["run_id"],
+                         self.stack.stub_requests("/v1/runs")[0]["run_id"])
+        self.assertEqual(self.stack.mediad.plays, [])
+
     def test_long_reply_waits_for_queue_room(self):
         """At most 10 s of audio is queued at mediad; the rest waits for room."""
         self.stack.stub_config(reply=[f" Part {n}." for n in range(14)], delta_delay=0.01, speech_seconds=1.0)
@@ -392,6 +450,26 @@ class VoiceLoop(LinkTestCase):
         spread = (self.stack.mediad.plays[-1][0] - first) / 1e9
         print(f"\nlong reply: 14 parts of 1 s sent over {spread:.1f} s")
         self.assertGreater(spread, 2.5)
+
+    def test_busy_play_is_dropped(self):
+        """mediad answers BUSY while push-to-talk is down: the part is dropped and the turn goes on."""
+        self.stack.mediad.busy = True
+        self.stack.utter()
+        self.stack.wait_for(lambda: self.stack.latency_lines(), "turn end")
+        log = self.stack.out("hub")
+        self.assertEqual(log.count("audio.play dropped"), 2)
+        self.assertNotIn("failed", log)
+        self.assertEqual(json.loads(self.stack.tool("say", {"text": "Woof."})[1])["spoken"], False)
+
+    def test_stop_phrase_before_hermes(self):
+        """A stop phrase reaches the bridge as a stop before the Hermes run starts."""
+        self.stack.stub_config(transcript="Stop! Stop right there.")
+        self.stack.utter()
+        self.stack.wait_for(lambda: self.stack.stub_requests("/v1/runs"), "Hermes run")
+        run_ns = self.stack.stub_requests("/v1/runs")[0]["t_ns"]
+        stops = self.stack.wait_ops("stop", 1)
+        self.assertTrue(stops, "robot.stop did not reach the bridge")
+        self.assertLess(stops[0][0], run_ns)
 
 
 class DailyCaps(LinkTestCase):

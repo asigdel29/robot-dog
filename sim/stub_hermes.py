@@ -12,10 +12,14 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import time
 import uuid
 
+import httpx2
 import uvicorn
+from mcp import Client
+from mcp.client.streamable_http import streamable_http_client
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
@@ -23,6 +27,7 @@ from starlette.routing import Route
 #: What a test can change: STT text, reply deltas, delays (s), event stream status, raw SSE lines, TTS length (s).
 config = {"transcript": "hello dog", "reply": ["Sure,", " I can do that.", " Here I go!"], "delta_delay": 0.05,
           "create_delay": 0, "events_status": 200, "junk_lines": [], "speech_seconds": 0.1, "tools_url": ""}
+TOOLS_TOKEN = os.environ.get("TOOLS_TOKEN", "")
 requests = []
 #: Run id to (input text, stop event).
 runs = {}
@@ -59,6 +64,14 @@ async def create_run(request):
     return JSONResponse({"run_id": run_id, "status": "started"}, status_code=202)
 
 
+async def stop_run(request):
+    """Stop a run; its stream ends with run.cancelled."""
+    run_id = request.path_params["run_id"]
+    record("/v1/runs/stop", headers=hermes_headers(request), run_id=run_id)
+    runs[run_id][1].set()
+    return JSONResponse({"run_id": run_id, "status": "stopping"})
+
+
 async def run_events(request):
     """Stream the run events in the Hermes SSE format, or answer with events_status."""
     run_id = request.path_params["run_id"]
@@ -79,10 +92,26 @@ async def _events(text, stopped):
     for line in config["junk_lines"]:
         yield f"{line}\n\n"
     for index, delta in enumerate(config["reply"]):
+        if index == 1 and "bark" in text:
+            yield _frame("tool.started", tool="mcp_dog_do_trick")
+            await call_tool("do_trick", {"name": "bark"})
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stopped.wait(), config["delta_delay"])
+        if stopped.is_set():
+            yield _frame("run.cancelled")
+            return
         yield _frame("message.delta", delta=delta)
     yield _frame("run.completed", output="".join(config["reply"]))
+
+
+async def call_tool(name, arguments):
+    """Call one hub tool as a Model Context Protocol client and record the result."""
+    headers = {"Authorization": f"Bearer {TOOLS_TOKEN}"}
+    async with httpx2.AsyncClient(headers=headers, timeout=httpx2.Timeout(10, read=60)) as http:
+        async with Client(streamable_http_client(config["tools_url"], http_client=http)) as client:
+            result = await client.call_tool(name, arguments)
+    text = " ".join(getattr(block, "text", "") for block in result.content)
+    record(f"tool:{name}", is_error=result.is_error, text=text)
 
 
 async def transcriptions(request):
@@ -104,6 +133,7 @@ app = Starlette(routes=[
     Route("/_stub/config", set_config, methods=["POST"]),
     Route("/_stub/requests", get_requests),
     Route("/v1/runs", create_run, methods=["POST"]),
+    Route("/v1/runs/{run_id}/stop", stop_run, methods=["POST"]),
     Route("/v1/runs/{run_id}/events", run_events),
     Route("/v1/audio/transcriptions", transcriptions, methods=["POST"]),
     Route("/v1/audio/speech", speech, methods=["POST"]),
