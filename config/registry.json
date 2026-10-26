@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "robot": {"model": "supireo-y8359", "id": "dog-01"},
+  "commands": {},
+  "drive": {"forward": null, "left": null, "right": null, "back": null},
+  "goto": {"robot_marker": 1, "goal_radius_px": 40, "area_px": [[0, 0], [640, 0], [640, 480], [0, 480]],
+           "turn_ms": 200, "forward_ms": 300, "settle_ms": 300, "turn_sign": 1}
+}
