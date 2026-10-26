@@ -8,9 +8,12 @@ printed so a run can go into docs/test-log.md.
 
 import asyncio
 import base64
+import http.client
 import math
 import os
+import socket
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
@@ -27,7 +30,7 @@ sys.path.insert(0, os.path.join(ROOT, "sim"))
 
 import dogproto  # noqa: E402
 import mediad  # noqa: E402
-from devstack import Stack  # noqa: E402
+from devstack import Stack, free_port  # noqa: E402
 
 #: Stub aplay: records its pid and never reads stdin, like a long playback.
 STUB_APLAY = """#!/bin/sh
@@ -215,6 +218,21 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.play_refused(media))
         self.assertEqual(len(self.utterances()), 1)
 
+    async def test_console_error_gets_500(self):
+        class BrokenMedia:
+            async def snapshot(self, max_px):
+                raise RuntimeError("broken camera path")
+
+        token = "t" * 32
+        server = await asyncio.start_server(mediad.Console(BrokenMedia(), token).handle, "127.0.0.1", 0)
+        self.addCleanup(server.close)
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.sockets[0].getsockname()[1])
+        with self.assertLogs("mediad", "ERROR"):
+            writer.write(f"GET /snapshot.jpg HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n".encode())
+            status = await reader.readline()
+        writer.close()
+        self.assertIn(b" 500 ", status)
+
 
 class MediaStack(unittest.TestCase):
     """mediad in the dev stack: snapshot, audio, cloud rules and the console."""
@@ -335,6 +353,59 @@ class MediaStack(unittest.TestCase):
         with self.assertRaises(dogproto.RpcError) as ctx:
             self.media("audio.ptt", {"down": True}, cloud=True)
         self.assertEqual(ctx.exception.code, dogproto.METHOD_NOT_FOUND)
+
+    def request(self, method, path, headers=None, body=None):
+        """Send one HTTP request to the console; return (status, headers, body)."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.stack.console_port, timeout=40)
+        try:
+            conn.request(method, path, body=body, headers=headers or {})
+            resp = conn.getresponse()
+            return resp.status, resp.headers, resp.read()
+        finally:
+            conn.close()
+
+    def test_console_needs_token(self):
+        for method, path in (("GET", "/"), ("GET", "/state"), ("GET", "/snapshot.jpg"), ("POST", "/stop"),
+                             ("POST", "/arm")):
+            self.assertEqual(self.request(method, path)[0], 401, f"{method} {path}")
+        self.assertEqual(self.request("GET", "/?token=wrong")[0], 401)
+        self.assertEqual(self.request("POST", "/arm", {"Authorization": "Bearer wrong"})[0], 401)
+        self.assertEqual(self.request("GET", "/state", {"Cookie": "dog_console=wrong"})[0], 401)
+
+    def test_console_connection_limit(self):
+        port = self.stack.console_port
+        idle = [socket.create_connection(("127.0.0.1", port)) for _ in range(mediad.CONSOLE_MAX_CONNECTIONS)]
+        try:
+            time.sleep(0.3)
+            with socket.create_connection(("127.0.0.1", port)) as extra:
+                extra.settimeout(2)
+                self.assertEqual(extra.recv(64), b"", "connection over the limit is closed at once")
+            idle[0].settimeout(mediad.HTTP_READ_S + 2)
+            start = time.monotonic()
+            self.assertTrue(idle[0].recv(64).startswith(b"HTTP/1.1 400"))
+            self.assertLess(time.monotonic() - start, mediad.HTTP_READ_S + 1)
+        finally:
+            for conn in idle:
+                conn.close()
+
+    def test_short_token_turns_the_console_off(self):
+        port = free_port()
+        run_dir = tempfile.mkdtemp()
+        proc = subprocess.Popen(
+            [sys.executable, os.path.join(ROOT, "pi", "mediad.py"), "--fake-camera", "--fake-audio",
+             "--config", os.path.join(run_dir, "absent.toml"), "--console-bind", "127.0.0.1",
+             "--console-port", str(port)],
+            env={**os.environ, "DOG_RUN_DIR": run_dir, "DOG_CONSOLE_TOKEN": "x" * 31},
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            self.stack.wait_for(lambda: os.path.exists(os.path.join(run_dir, "mediad-cloud.sock")), "mediad start")
+            time.sleep(0.2)
+            with self.assertRaises(ConnectionRefusedError):
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        finally:
+            proc.terminate()
+            _, err = proc.communicate(timeout=5)
+        self.assertIn("must have 32 characters or more", err)
 
 
 if __name__ == "__main__":

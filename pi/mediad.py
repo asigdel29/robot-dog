@@ -10,6 +10,8 @@ import asyncio
 import base64
 import contextlib
 import functools
+import hashlib
+import hmac
 import json
 import logging
 import math
@@ -18,7 +20,9 @@ import sys
 import threading
 import time
 import tomllib
+import urllib.parse
 import uuid
+from http import HTTPStatus
 
 import cv2
 import numpy as np
@@ -44,6 +48,12 @@ MAX_PLAY_S = 30
 PLAY_RATES = (8000, 48000)
 PLAY_QUEUE_MAX = 16
 SNAPSHOT_PX = (16, 4096)
+CONSOLE_COOKIE = "dog_console"
+CONSOLE_MIN_TOKEN_CHARS = 32
+CONSOLE_MAX_CONNECTIONS = 16
+HTTP_HEAD_LIMIT = 8192
+HTTP_BODY_LIMIT = 1024
+HTTP_READ_S = 3.0
 
 
 # ---------------------------------------------------------------- vision
@@ -391,6 +401,103 @@ class Mediad:
             self._release_ptt()
 
 
+# ---------------------------------------------------------------- LAN console
+
+
+def http_response(status, content_type, body, extra=()):
+    """Return the bytes of one HTTP/1.1 response that closes the connection."""
+    head = [f"HTTP/1.1 {status} {HTTPStatus(status).phrase}", f"Content-Type: {content_type}",
+            f"Content-Length: {len(body)}", "Cache-Control: no-store", "X-Content-Type-Options: nosniff",
+            "X-Frame-Options: DENY", "Connection: close", *extra]
+    return ("\r\n".join(head) + "\r\n\r\n").encode() + body
+
+
+async def read_request(reader):
+    """Return (method, path, query, headers, body) of one request; raise ValueError when it is malformed."""
+    head = await reader.readuntil(b"\r\n\r\n")
+    lines = head.decode("latin-1").split("\r\n")
+    method, target, version = lines[0].split(" ")
+    if not version.startswith("HTTP/1."):
+        raise ValueError("not HTTP/1")
+    headers = {}
+    for line in lines[1:]:
+        if line:
+            name, _, value = line.partition(":")
+            headers[name.strip().lower()] = value.strip()
+    if "transfer-encoding" in headers:
+        raise ValueError("chunked bodies are not supported")
+    length = int(headers.get("content-length", "0"))
+    if not 0 <= length <= HTTP_BODY_LIMIT:
+        raise ValueError("body too large")
+    body = await reader.readexactly(length) if length else b""
+    url = urllib.parse.urlsplit(target)
+    return method, url.path, urllib.parse.parse_qs(url.query), headers, body
+
+
+class Console:
+    """The LAN console: the page, the snapshot, the state, and the arm, disarm, stop and trick buttons.
+
+    Each endpoint needs the token in a Bearer header, or the HttpOnly SameSite=Strict
+    cookie that GET /?token=... sets. The cookie holds an HMAC of the token, not the token.
+    """
+
+    def __init__(self, media, token):
+        self.media = media
+        self._token = token.encode()
+        self._cookie = hmac.new(self._token, b"cookie", hashlib.sha256).hexdigest().encode()
+        self._open = 0
+
+    def _token_ok(self, candidate):
+        """Return True when candidate is the console token; constant time."""
+        return hmac.compare_digest(candidate.encode(), self._token)
+
+    def _authorized(self, headers):
+        """Return True when the request has the token in a Bearer header or the cookie value in the cookie."""
+        auth = headers.get("authorization", "")
+        if auth.startswith("Bearer ") and self._token_ok(auth[len("Bearer "):]):
+            return True
+        # A plain split: SimpleCookie drops every cookie after one that it cannot parse.
+        cookies = dict(part.strip().partition("=")[::2] for part in headers.get("cookie", "").split(";"))
+        return hmac.compare_digest(cookies.get(CONSOLE_COOKIE, "").encode(), self._cookie)
+
+    async def handle(self, reader, writer):
+        """Serve one HTTP request on one connection, then close it; refuse more than 16 open connections."""
+        if self._open >= CONSOLE_MAX_CONNECTIONS:
+            writer.close()
+            return
+        self._open += 1
+        try:
+            try:
+                request = await asyncio.wait_for(read_request(reader), HTTP_READ_S)
+            except (ValueError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError):
+                response = http_response(400, "text/plain", b"bad request\n")
+            else:
+                try:
+                    response = await self.route(*request)
+                except Exception:
+                    log.exception("console request failed")
+                    response = http_response(500, "text/plain", b"internal error\n")
+            writer.write(response)
+            await writer.drain()
+        except ConnectionError:
+            pass
+        finally:
+            self._open -= 1
+            writer.close()
+
+    async def route(self, method, path, query, headers, body):
+        """Return the response bytes for one parsed request."""
+        if not self._authorized(headers):
+            return http_response(401, "text/plain", b"open /?token=<console token> first\n")
+        if (method, path) == ("GET", "/snapshot.jpg"):
+            try:
+                jpeg, _ = await self.media.snapshot(FRAME_W)
+            except RpcError as err:
+                return http_response(503, "text/plain", err.message.encode())
+            return http_response(200, "image/jpeg", jpeg)
+        return http_response(404, "text/plain", b"not found\n")
+
+
 # ---------------------------------------------------------------- start-up
 
 
@@ -414,6 +521,14 @@ async def main(argv=None):
     await dogproto.serve(dogproto.sock_path("mediad"), media.handlers(), limit=dogproto.MEDIA_LIMIT, group="dog")
     await dogproto.serve(dogproto.sock_path("mediad", cloud=True), media.handlers(), cloud=True,
                          limit=dogproto.MEDIA_LIMIT, group="doglink")
+    token = os.environ.get("DOG_CONSOLE_TOKEN", "")
+    if len(token) >= CONSOLE_MIN_TOKEN_CHARS:
+        bind = args.console_bind or cfg.get("console_bind", "127.0.0.1")
+        port = args.console_port or cfg.get("console_port", 8080)
+        await asyncio.start_server(Console(media, token).handle, bind, port, limit=HTTP_HEAD_LIMIT)
+        log.info("console on http://%s:%d", bind, port)
+    else:
+        log.error("DOG_CONSOLE_TOKEN must have %d characters or more; the LAN console is off", CONSOLE_MIN_TOKEN_CHARS)
     open_source = FakeCamera if args.fake_camera else functools.partial(open_camera, cfg.get("camera", "/dev/video0"))
     deliver = functools.partial(asyncio.get_running_loop().call_soon_threadsafe, media.on_frame)
     threading.Thread(target=capture_loop, args=(open_source, deliver), daemon=True).start()
