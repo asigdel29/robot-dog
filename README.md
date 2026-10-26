@@ -3,7 +3,7 @@
 [![test](https://github.com/asigdel29/robot-dog/actions/workflows/test.yml/badge.svg)](https://github.com/asigdel29/robot-dog/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-This project gives a voice and an agent to a toy robot dog. A Raspberry Pi sends the same infrared (IR) commands as the toy remote. A Hermes Agent on a server listens, talks, does web tasks and starts verified tricks.
+This project gives a voice and an agent to a toy robot dog. A small board sends the same infrared (IR) commands as the toy remote. A Hermes Agent on a server listens, talks, does web tasks and starts verified tricks.
 
 ## Contents
 
@@ -27,7 +27,7 @@ This project gives a voice and an agent to a toy robot dog. A Raspberry Pi sends
 
 ## Overview
 
-The toy is a SUPIREO Y8359 robot dog. It has an IR remote with 12 buttons and small wheels under its feet. It has no servos and no interface for its joints. Thus this project controls the toy at the level of its remote buttons.
+The toy is a SUPIREO Y8359 robot dog. It has an IR remote with 19 buttons and small wheels under its feet. It has no servos and no interface for its joints. It has no Wi-Fi and no Bluetooth, and its USB-C port only charges it. Thus this project controls the toy at the level of its remote buttons.
 
 The software architecture follows [microduck](https://github.com/pollen-robotics/microduck) by Pollen Robotics:
 
@@ -40,7 +40,7 @@ The software architecture follows [microduck](https://github.com/pollen-robotics
 
 This repo copies no microduck code.
 
-Status: the software works against a simulated IR bridge and a simulated toy. The hardware phases are open. The GitHub issues give the full plan and its order.
+Status: the Pi path works against a simulated IR bridge and a simulated toy. The current hardware plan is the Atom Echo path in `docs/design/echo.md`. Its firmware is not written yet (#143). The GitHub issues give the full plan and its order.
 
 ## Features
 
@@ -90,9 +90,21 @@ flowchart LR
 
 ## Hardware
 
+### Atom Echo path (now)
+
+| Part | Job | Buy |
+| --- | --- | --- |
+| SUPIREO Y8359 robot dog and its remote | The robot. The remote is necessary to record the IR codes. | Owned |
+| M5Stack Atom Echo (SKU C008-C) | Wi-Fi, microphone, speaker, button. Runs the action engine. | [Amazon](https://www.amazon.com/dp/B0C7QSVPB2), [Hackster](https://hackster.io/products/buy/74003) |
+| M5Stack Unit IR (SKU U002), with a Grove cable | IR emitter and IR receiver. | [Amazon](https://www.amazon.com/dp/B08TCC28VZ), [Hackster](https://hackster.io/products/buy/71896) |
+| USB-C data cable and a 5 V USB charger | Flash and power for the board. | Owned |
+
+`docs/design/echo.md` gives the pins, the setup and the plan.
+
+### Pi path (camera phase, later)
+
 | Part | Job |
 | --- | --- |
-| SUPIREO Y8359 robot dog and its remote | The robot. The remote is necessary to record the IR codes. |
 | Raspberry Pi 5 (2 GB), 27 W power supply, case with fan, 32 GB microSD | Runs the Pi daemons. |
 | Adafruit ESP32 Feather V2 (#5900) | IR bridge. |
 | Adafruit IR transceiver (#5990) and JST PH 4-pin cable (#3950) | IR receiver and emitter. |
@@ -265,6 +277,7 @@ robot-dog/
 | `docs/design/media.md` | Camera, markers, audio, LAN console and gamepad. |
 | `docs/design/cloud.md` | The Pi link, the robot tools and the voice loop. |
 | `docs/design/release.md` | The release format, the health gate and the rollback. |
+| `docs/design/echo.md` | The Atom Echo device: toy checks, parts, pins, methods, safety rules and plan. |
 | `docs/runbook.md` | Procedures for the server and the Pi. |
 | `docs/test-log.md` | Measured test results. |
 | `firmware/README.md` | Toolchain, flash procedure and wire connections. |
