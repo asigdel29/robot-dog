@@ -9,14 +9,21 @@
 // dog moving. robotd sends the IR registry to RAM at each handshake, so a new
 // capture never needs a new flash. The firmware never starts WiFi or Bluetooth.
 
+#include <IRremote.hpp>
 #include <ArduinoJson.h>
 
 static const char FW_VERSION[] = "ir_bridge-1";  ///< reported in hello, so robotd logs which build runs
+static const uint8_t IR_OUT_PIN = 27;  ///< IRout pad: ESP32 output into the emitter driver
 static const size_t LINE_LIMIT = 1024;  ///< longest line in either direction; longer input lines are discarded
+static const uint32_t HB_TIMEOUT_MS = 1000;  ///< robotd silence that trips the watchdog while armed
+static const uint16_t MAX_LEASE_MS = 400;  ///< longest motion that one hold op can buy
 static const uint8_t MAX_ENTRIES = 24;  ///< RAM table size; the remote has 12 buttons
 static const uint8_t MAX_RAW = 120;  ///< raw durations per entry, the same cap as robotd's registry rule
 static const uint32_t MAX_FRAME_US = 150000;  ///< longest raw frame, so one frame bounds the longest loop pass
 static const size_t NAME_LEN = 32;   ///< entry name buffer in bytes, with the terminating zero
+/// Quiet time before the first frame of a new command, so the toy sees a new press and not
+/// the tail of the last one. Calibration knob: the remote's own gap between presses is longer.
+static const uint32_t MIN_GAP_MS = 40;
 
 /** Reported bridge states from protocol.md. */
 enum State : uint8_t { DISARMED, READY, EXECUTING, FAULT };
@@ -40,16 +47,47 @@ struct Entry {
   uint16_t raw[MAX_RAW];   ///< microseconds, mark first
 };
 
+/** The one held command: its lease is the firmware deadman. */
+struct Hold {
+  bool active;          ///< a hold owns the emitter
+  uint8_t entry;        ///< index into entries
+  int64_t id;           ///< the latest hold op, which tx and done report
+  uint32_t leaseEnd;    ///< millis() at which the deadman ends the hold
+  uint32_t nextFrame;   ///< millis() at which the next frame is due
+  bool first;           ///< the next frame starts a new command: a full frame after the gap
+};
+
+/** A send that waits for the gap; ops after it wait too, so they keep their order. */
+struct PendingSend {
+  bool active;    ///< a send is accepted and not yet on the air
+  uint8_t entry;  ///< index into entries
+  int64_t id;     ///< the send op, which tx and done report
+};
+
 static State state = DISARMED;     ///< start-up never moves the dog
 static bool haveSession = false;   ///< false until the first hello; ops before it are refused
 static int64_t lastId = 0;         ///< ids must grow within a session, so a replayed op is refused
 static uint32_t bootId = 0;        ///< random at boot, so robotd can tell a reset
 static Entry entries[MAX_ENTRIES]; ///< the registry, loaded by robotd at each hello
 static uint8_t entryCount = 0;     ///< loaded part of entries; arm checks it
+static Hold hold = {};             ///< the one held command
+static PendingSend pendingSend = {};  ///< the send that waits for the gap
+static uint32_t frameEndMs = 0;    ///< millis() at the end of the last frame, for the gap
+static uint32_t lastHbMs = 0;      ///< millis() of the last hb or arm, for the watchdog
 static uint32_t maxLoopUs = 0;     ///< worst loop pass since boot, reported in state
 static char lineBuf[LINE_LIMIT + 1];  ///< the serial line being received
 static size_t lineLen = 0;         ///< used part of lineBuf
 static bool lineTooLong = false;   ///< discard input until the next newline
+
+/** True when millis() time t has come; correct across the 49-day wrap. */
+static bool reached(uint32_t now, uint32_t t) {
+  return (int32_t)(now - t) >= 0;
+}
+
+/** True when the emitter has been quiet for MIN_GAP_MS, so a new command may start. */
+static bool gapDone() {
+  return millis() - frameEndMs >= MIN_GAP_MS;
+}
 
 /** Write one event line. One buffer fits the largest event, a cap frame of MAX_RAW durations. */
 static void emit(const JsonDocument &event) {
@@ -76,6 +114,15 @@ static void nack(JsonVariantConst id, const char *why) {
   emit(event);
 }
 
+/** Report one IR frame sent for an op; id 0 is the watchdog stop. */
+static void emitTx(int64_t id) {
+  JsonDocument event;
+  event["ev"] = "tx";
+  event["id"] = id;
+  event["frames"] = 1;
+  emit(event);
+}
+
 /** Report the session and the boot; robotd matches sid to its own hello, and sid 0 marks a reset. */
 static void emitHello(int64_t sid) {
   JsonDocument event;
@@ -97,8 +144,34 @@ static int findEntry(const char *name) {
   return -1;
 }
 
+/** Send one frame of an entry. This blocks for the frame time, the longest block in the loop. */
+static void transmit(const Entry &e, bool full) {
+  if (!full && e.repeat == REPEAT_NEC) {
+    IrSender.sendNECRepeat();
+  } else if (e.nec && e.hasData) {
+    IrSender.sendNECRaw(e.data, 0);
+  } else if (e.nec) {
+    IrSender.sendNEC(e.addr, e.cmd, 0);
+  } else {
+    IrSender.sendRaw(e.raw, e.rawLen, e.khz);
+  }
+  frameEndMs = millis();
+}
+
+/** End the hold with its done event, and leave EXECUTING. */
+static void endHold() {
+  if (hold.active) {
+    hold.active = false;
+    emitId("done", hold.id);
+  }
+  if (state == EXECUTING) {
+    state = READY;
+  }
+}
+
 /** hello: start a new session. The bridge forgets entries, ids, the hold and the capture, without done. */
 static void opHello(JsonObjectConst in) {
+  hold.active = false;
   entryCount = 0;
   lastId = 0;
   state = DISARMED;
@@ -108,6 +181,7 @@ static void opHello(JsonObjectConst in) {
 
 /** hb: feed the watchdog and report the state. */
 static void opHb(JsonObjectConst in) {
+  lastHbMs = millis();
   JsonDocument event;
   event["ev"] = "state";
   event["s"] = STATE_NAMES[state];
@@ -210,6 +284,68 @@ static const char *opArm(JsonObjectConst in, int64_t id) {
   if (state == DISARMED || state == FAULT) {
     state = READY;
   }
+  lastHbMs = millis();
+  emitId("ack", id);
+  return nullptr;
+}
+
+/** send: one full frame after the gap, READY only. serviceSend puts it on the air. */
+static const char *opSend(JsonObjectConst in, int64_t id) {
+  if (state != READY) {
+    return "not ready";  // EXECUTING means a hold owns the emitter
+  }
+  int index = findEntry(in["name"] | "");
+  if (index < 0) {
+    return "unknown name";
+  }
+  emitId("ack", id);
+  pendingSend.active = true;
+  pendingSend.entry = index;
+  pendingSend.id = id;
+  return nullptr;
+}
+
+/** hold: repeat a command until the lease ends. The same name extends the lease; another name
+    replaces the hold without done and keeps the frame cadence. */
+static const char *opHold(JsonObjectConst in, int64_t id) {
+  if (state != READY && state != EXECUTING) {
+    return "not ready";
+  }
+  int index = findEntry(in["name"] | "");
+  if (index < 0) {
+    return "unknown name";
+  }
+  JsonVariantConst lease = in["lease_ms"];
+  if (!lease.is<int>() || lease.as<int>() < 1 || lease.as<int>() > MAX_LEASE_MS) {
+    return "lease";
+  }
+  uint32_t now = millis();
+  if (!hold.active) {
+    hold.nextFrame = now;
+  }
+  if (!hold.active || hold.entry != index) {
+    hold.entry = index;
+    hold.first = true;
+  }
+  hold.active = true;
+  hold.id = id;
+  hold.leaseEnd = now + lease.as<int>();
+  state = EXECUTING;
+  emitId("ack", id);
+  return nullptr;
+}
+
+/** stop: end the hold now; the bridge stays armed. */
+static const char *opStop(int64_t id) {
+  endHold();
+  emitId("ack", id);
+  return nullptr;
+}
+
+/** disarm: end the hold and go to DISARMED. */
+static const char *opDisarm(int64_t id) {
+  endHold();
+  state = DISARMED;
   emitId("ack", id);
   return nullptr;
 }
@@ -246,6 +382,14 @@ static void handleLine(const char *line, size_t len) {
     why = opLoad(in, id);
   } else if (strcmp(op, "arm") == 0) {
     why = opArm(in, id);
+  } else if (strcmp(op, "send") == 0) {
+    why = opSend(in, id);
+  } else if (strcmp(op, "hold") == 0) {
+    why = opHold(in, id);
+  } else if (strcmp(op, "stop") == 0) {
+    why = opStop(id);
+  } else if (strcmp(op, "disarm") == 0) {
+    why = opDisarm(id);
   } else {
     why = "unknown op";
   }
@@ -257,6 +401,9 @@ static void handleLine(const char *line, size_t len) {
 /** Read serial input and handle at most one line, so one pass never runs more than one op.
     A waiting send holds back later ops, so a disarm cannot overtake it. */
 static void readSerial() {
+  if (pendingSend.active) {
+    return;
+  }
   while (Serial.available() > 0) {
     char c = Serial.read();
     if (c != '\n') {
@@ -278,8 +425,71 @@ static void readSerial() {
   }
 }
 
+/** Heartbeat watchdog: robotd silent for HB_TIMEOUT_MS while armed means stop output, send the
+    `stop` entry once, then FAULT. The hold and a waiting send end without done. */
+static void checkHeartbeat() {
+  if ((state != READY && state != EXECUTING) || millis() - lastHbMs <= HB_TIMEOUT_MS) {
+    return;
+  }
+  hold.active = false;
+  pendingSend.active = false;
+  int stop = findEntry("stop");
+  if (stop >= 0) {
+    uint32_t quiet = millis() - frameEndMs;
+    if (quiet < MIN_GAP_MS) {
+      delay(MIN_GAP_MS - quiet);
+    }
+    transmit(entries[stop], true);
+    emitTx(0);
+  }
+  state = FAULT;
+  JsonDocument event;
+  event["ev"] = "fault";
+  event["why"] = "heartbeat";
+  emit(event);
+}
+
+/** Put the waiting send on the air once the gap has passed. */
+static void serviceSend() {
+  if (!pendingSend.active || !gapDone()) {
+    return;
+  }
+  pendingSend.active = false;
+  transmit(entries[pendingSend.entry], true);
+  emitTx(pendingSend.id);
+  emitId("done", pendingSend.id);
+}
+
+/** Lease expiry and repeat frames of the hold, scheduled from frame start so the period does not drift.
+    The first frame always goes out, so a lease shorter than one pass still gives one frame. */
+static void serviceHold() {
+  if (!hold.active) {
+    return;
+  }
+  uint32_t now = millis();
+  if (!hold.first && (int32_t)(now - hold.leaseEnd) > 0) {
+    endHold();
+    return;
+  }
+  const Entry &e = entries[hold.entry];
+  if (!reached(now, hold.nextFrame) || (!hold.first && e.repeat == REPEAT_NONE)) {
+    return;
+  }
+  if (hold.first && !gapDone()) {
+    return;
+  }
+  transmit(e, hold.first);
+  hold.first = false;
+  hold.nextFrame = now + e.periodMs;
+  emitTx(hold.id);
+}
+
 /** Boot: emitter off, serial up, then one hello with sid 0. Start-up never transmits. */
 void setup() {
+  pinMode(IR_OUT_PIN, OUTPUT);
+  digitalWrite(IR_OUT_PIN, LOW);
+  IrSender.begin(IR_OUT_PIN);
+  Serial.setRxBufferSize(1024);  // ops wait here while a frame of up to 150 ms is on the air
   Serial.begin(115200);
   bootId = esp_random() >> 1;  // differs at each reset, so robotd can see one
   emitHello(0);
@@ -288,7 +498,10 @@ void setup() {
 /** One pass: watchdog, one op, the send, hold frames, capture frames. max_loop_us is the worst pass. */
 void loop() {
   uint32_t start = micros();
+  checkHeartbeat();
   readSerial();
+  serviceSend();
+  serviceHold();
   uint32_t took = micros() - start;
   if (took > maxLoopUs) {
     maxLoopUs = took;
