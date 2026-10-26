@@ -7,6 +7,7 @@ replies with aplay and serves the owner console. docs/design/media.md owns the r
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import functools
 import json
@@ -22,6 +23,7 @@ import cv2
 import numpy as np
 
 import dogproto
+from dogproto import RpcError
 
 log = logging.getLogger("mediad")
 
@@ -33,6 +35,11 @@ FAKE_ROBOT_MARKER = 1  # goto.robot_marker of the dev stack registry
 FAKE_MARKER_PX = 36  # 6 px for each cell of a 4x4 marker with its border
 FAKE_MARGIN_PX = 6  # white quiet zone around each fake marker
 FAKE_FLOOR_GRAY = 150
+JPEG_QUALITY = 80
+MAX_PLAY_S = 30
+PLAY_RATES = (8000, 48000)
+PLAY_QUEUE_MAX = 16
+SNAPSHOT_PX = (16, 4096)
 
 
 # ---------------------------------------------------------------- vision
@@ -169,6 +176,21 @@ def capture_loop(open_source, deliver):
         time.sleep(CAMERA_RETRY_S)
 
 
+def encode_jpeg(frame, max_px):
+    """Return frame as JPEG bytes, scaled down so that its long side is at most max_px."""
+    height, width = frame.shape[:2]
+    scale = max_px / max(width, height)
+    if scale < 1:
+        frame = cv2.resize(frame, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
+    return cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])[1].tobytes()
+
+
+def audio_log(event):
+    """Append one fake speaker event with its monotonic time in ns to DOG_RUN_DIR/audio_out.log."""
+    with open(os.path.join(dogproto.run_dir(), "audio_out.log"), "a") as handle:
+        handle.write(f"{time.monotonic_ns()} {event}\n")
+
+
 # ---------------------------------------------------------------- daemon
 
 
@@ -181,12 +203,103 @@ class Mediad:
         self.mic = mic
         self.frame = None  # (t_mono_ns, BGR image)
         self.robotd = None
+        self._queue = asyncio.Queue()
+        self._playing = None
+
+    def handlers(self):
+        """Return the method table for dogproto.serve."""
+        return {"media.snapshot": self.h_snapshot,
+                "audio.play": self.h_play, "audio.stop": self.h_stop}
 
     def on_frame(self, t_ns, frame, markers):
         """Keep the newest frame and send its marker poses to robotd; never waits on robotd."""
         self.frame = (t_ns, frame)
         if self.robotd is not None:
             self.robotd.notify("robot.observe", {"t_mono_ns": t_ns, "markers": markers})
+
+    def frame_age_ms(self):
+        """Return the age of the newest frame in ms, or None before the first frame."""
+        return None if self.frame is None else (time.monotonic_ns() - self.frame[0]) // 1_000_000
+
+    async def snapshot(self, max_px):
+        """Return (JPEG bytes, age_ms) of the newest frame."""
+        if self.frame is None:
+            raise RpcError(dogproto.UNAVAILABLE, "no camera frame yet")
+        age_ms = self.frame_age_ms()
+        return await asyncio.to_thread(encode_jpeg, self.frame[1], max_px), age_ms
+
+    async def player(self):
+        """Play the queued items one at a time; cut() cancels the current one."""
+        while True:
+            pcm, rate = await self._queue.get()
+            self._playing = asyncio.ensure_future(self._play_one(pcm, rate))
+            await asyncio.wait({self._playing})
+            if not self._playing.cancelled() and self._playing.exception() is not None:
+                log.error("playback failed: %s", self._playing.exception())
+            self._playing = None
+
+    def cut(self):
+        """Silence the speaker now and drop the queue."""
+        while not self._queue.empty():
+            self._queue.get_nowait()
+        if self._playing is not None:
+            self._playing.cancel()
+
+    async def _play_one(self, pcm, rate):
+        """Play one PCM16 mono item to its end; a cancel stops it at once."""
+        if self.fake_audio:
+            audio_log("play")
+            try:
+                await asyncio.sleep(len(pcm) / 2 / rate)  # the real play time
+            except asyncio.CancelledError:
+                audio_log("cut")
+                raise
+            audio_log("end")
+            return
+        proc = await asyncio.create_subprocess_exec(
+            "aplay", "-q", "-D", self.speaker, "-t", "raw", "-f", "S16_LE", "-c", "1", "-r", str(rate),
+            stdin=asyncio.subprocess.PIPE)
+        try:
+            proc.stdin.write(pcm)
+            with contextlib.suppress(ConnectionError):
+                await proc.stdin.drain()
+                proc.stdin.close()
+            await proc.wait()
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+
+    async def h_snapshot(self, params, conn):
+        """media.snapshot: return the newest frame as a JPEG with its age."""
+        max_px = params.get("max_px", FRAME_W)
+        if not SNAPSHOT_PX[0] <= max_px <= SNAPSHOT_PX[1]:
+            raise RpcError(dogproto.INVALID_PARAMS, f"max_px must be {SNAPSHOT_PX[0]}..{SNAPSHOT_PX[1]}")
+        jpeg, age_ms = await self.snapshot(max_px)
+        return {"jpeg_b64": base64.b64encode(jpeg).decode(), "age_ms": age_ms}
+
+    async def h_play(self, params, conn):
+        """audio.play: queue one PCM16 mono item of 30 s or less; refused while push-to-talk is down."""
+        rate = params.get("rate", 24000)
+        if not PLAY_RATES[0] <= rate <= PLAY_RATES[1]:
+            raise RpcError(dogproto.INVALID_PARAMS, f"rate must be {PLAY_RATES[0]}..{PLAY_RATES[1]}")
+        try:
+            pcm = base64.b64decode(params["pcm16_b64"], validate=True)
+        except ValueError as exc:  # binascii.Error, or a character outside ASCII
+            raise RpcError(dogproto.INVALID_PARAMS, "pcm16_b64 is not base64") from exc
+        if not pcm or len(pcm) % 2:
+            raise RpcError(dogproto.INVALID_PARAMS, "pcm16_b64 must hold whole 16-bit samples")
+        if len(pcm) / 2 / rate > MAX_PLAY_S:
+            raise RpcError(dogproto.INVALID_PARAMS, f"an item must be {MAX_PLAY_S} s or less")
+        if self._queue.qsize() >= PLAY_QUEUE_MAX:
+            raise RpcError(dogproto.BUSY, "play queue full")
+        self._queue.put_nowait((pcm, rate))
+        return {"queued": self._queue.qsize()}
+
+    async def h_stop(self, params, conn):
+        """audio.stop: stop the speaker and clear the queue."""
+        self.cut()
+        return {}
 
 
 # ---------------------------------------------------------------- start-up
@@ -208,11 +321,16 @@ async def main(argv=None):
     except FileNotFoundError:
         cfg = {}
     media = Mediad(args.fake_audio, cfg.get("speaker", "default"), cfg.get("mic", "default"))
+    os.makedirs(dogproto.run_dir(), exist_ok=True)
+    await dogproto.serve(dogproto.sock_path("mediad"), media.handlers(), limit=dogproto.MEDIA_LIMIT, group="dog")
+    await dogproto.serve(dogproto.sock_path("mediad", cloud=True), media.handlers(), cloud=True,
+                         limit=dogproto.MEDIA_LIMIT, group="doglink")
     open_source = FakeCamera if args.fake_camera else functools.partial(open_camera, cfg.get("camera", "/dev/video0"))
     deliver = functools.partial(asyncio.get_running_loop().call_soon_threadsafe, media.on_frame)
     threading.Thread(target=capture_loop, args=(open_source, deliver), daemon=True).start()
     log.info("mediad ready, api %d", dogproto.API_VERSION)
-    await asyncio.gather(dogproto.keep_connected(
+    # systemd stops aplay and arecord with mediad: the unit kills its whole control group.
+    await asyncio.gather(media.player(), dogproto.keep_connected(
         dogproto.sock_path("robotd"), functools.partial(setattr, media, "robotd"), ROBOTD_RETRY_S))
 
 

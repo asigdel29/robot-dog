@@ -146,6 +146,14 @@ class Stack:
             json.dump(markers, handle)
         os.replace(path + ".tmp", path)
 
+    def audio_log(self):
+        """Return the fake speaker log as (t_mono_ns, "play"|"end"|"cut") tuples."""
+        try:
+            with open(os.path.join(self.run_dir, "audio_out.log")) as handle:
+                return [(int(t_ns), event) for t_ns, event in (line.split() for line in handle)]
+        except FileNotFoundError:
+            return []
+
     def log(self):
         """Return the fake bridge log as (t_mono_ns, "in"|"out", message) tuples.
 
