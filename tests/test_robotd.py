@@ -165,6 +165,19 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(daemon.link_up)
         self.assertFalse(daemon.armed)
 
+    async def test_one_capture_at_a_time(self):
+        """A second capture must not take the frames of the first one."""
+        daemon = self.make()
+        daemon.armed = False
+        first = asyncio.ensure_future(daemon.h_capture({"ms": 500}, Conn(False)))
+        await asyncio.sleep(0.01)
+        with self.assertRaises(dogproto.RpcError) as ctx:
+            await daemon.h_capture({"ms": 500}, Conn(False))
+        self.assertEqual(ctx.exception.code, dogproto.BUSY)
+        daemon._on_esp({"ev": "cap", "proto": "NEC"})
+        daemon._on_esp({"ev": "done", "id": daemon.link.ops[-1]["id"]})
+        self.assertEqual((await first)["frames"], [{"proto": "NEC"}])
+
 
 if __name__ == "__main__":
     unittest.main()

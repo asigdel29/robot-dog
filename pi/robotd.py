@@ -7,18 +7,27 @@ loop never waits on another service. The design follows microduck's robotd;
 docs/design/safety.md and docs/design/registry.md own the rules.
 """
 
+import asyncio
 import collections
 import contextlib
 import itertools
 import json
 import logging
 import math
+import os
+import random
+import termios
 import time
+import tty
 
 import dogproto
 from dogproto import RpcError
 
 log = logging.getLogger("robotd")
+
+HELLO_WAIT_S = 5.0
+ACK_WAIT_S = 0.5
+ESP_LINE_LIMIT = 1024
 
 PROTOS = ("NEC", "raw")
 KINDS = ("hold", "episodic", "perpetual", "mode")
@@ -152,6 +161,80 @@ def check_registry(doc):
     return errors
 
 
+def ir_wire(name, cmd):
+    """Return the load op fields for one command."""
+    ir = cmd["ir"]
+    wire = {"name": name, "proto": ir["proto"], "addr": ir.get("addr", 0), "cmd": ir.get("cmd", 0),
+            "raw": ir.get("raw_us", []), "khz": ir.get("carrier_khz", 38),
+            "repeat": cmd["repeat"], "period_ms": cmd["period_ms"]}
+    if "data" in ir:
+        wire["data"] = ir["data"]  # the captured NEC frame, sent byte for byte
+    return wire
+
+
+# ---------------------------------------------------------------- ESP32 link
+
+
+class EspLink:
+    """NDJSON link to the IR bridge over a tty; robotd is its only writer."""
+
+    def __init__(self, path, on_message, on_lost):
+        self.path = path
+        self._on_message = on_message
+        self._on_lost = on_lost
+        self._fd = None
+        self._buf = b""
+
+    def open(self):
+        """Open the tty in raw mode at 115200 baud and start to read it."""
+        fd = os.open(self.path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            tty.setraw(fd)
+            attrs = termios.tcgetattr(fd)
+            attrs[4] = attrs[5] = termios.B115200
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            termios.tcflush(fd, termios.TCIFLUSH)
+        except termios.error:
+            os.close(fd)
+            raise
+        self._fd = fd
+        asyncio.get_running_loop().add_reader(fd, self._readable)
+
+    def send(self, obj):
+        """Write one line; raise OSError when the link fails. The registry limits keep each line under 1024 bytes."""
+        data = (json.dumps(obj, separators=(",", ":")) + "\n").encode()
+        if os.write(self._fd, data) != len(data):
+            raise OSError("short serial write")
+
+    def close(self):
+        """Stop to read and close the tty; robotd drops the link object after this."""
+        asyncio.get_running_loop().remove_reader(self._fd)
+        os.close(self._fd)
+
+    def _readable(self):
+        """Read the tty and pass each JSON object line on; boot text and too long lines are dropped."""
+        try:
+            data = os.read(self._fd, 4096)
+        except BlockingIOError:
+            return
+        except OSError as exc:
+            self._on_lost(f"serial read failed: {exc}")
+            return
+        if not data:
+            self._on_lost("serial closed")
+            return
+        *lines, self._buf = (self._buf + data).split(b"\n")
+        if len(self._buf) > ESP_LINE_LIMIT:
+            self._buf = b""
+        for line in lines:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue  # boot text from the board
+            if isinstance(msg, dict):
+                self._on_message(msg)
+
+
 # ---------------------------------------------------------------- daemon
 
 
@@ -249,6 +332,46 @@ class Robotd:
         self._acks.clear()
         self._dones.clear()
 
+    async def _open_link(self):
+        """Open the tty, repeat hello until our own reply, then load the registry into bridge RAM."""
+        link = EspLink(self.serial_path, self._on_esp, self._link_lost)
+        link.open()
+        self.link = link
+        self._sid = random.randrange(1, 2 ** 31)
+        self._esp_ids = itertools.count(1)
+        self._hello = asyncio.get_running_loop().create_future()
+        deadline = time.monotonic() + HELLO_WAIT_S
+        while not self._hello.done():
+            if self.link is not link or time.monotonic() > deadline:
+                raise OSError("no hello from esp32")
+            link.send({"op": "hello", "sid": self._sid})
+            await asyncio.wait({self._hello}, timeout=0.5)
+        hello = self._hello.result()
+        entries = [(name, cmd) for name, cmd in self.registry["commands"].items() if cmd["ir"] is not None]
+        for name, cmd in entries:
+            await self._esp_call("load", **ir_wire(name, cmd))
+        self._loaded = len(entries)
+        self._esp_rx = time.monotonic()
+        # Report the bridge state only now: a client that sees DISARMED must be able to arm at once.
+        self.esp_state = hello.get("state", "?")
+        self.link_up = True
+        log.info("esp32 link up: fw=%s boot=%s loaded=%d", hello.get("fw"), hello.get("boot"), self._loaded)
+
+    async def connector(self):
+        """Open and re-open the ESP32 link forever; a new link always starts DISARMED."""
+        last_error = None  # log each distinct failure once, not each second
+        while True:
+            if self.link is None:
+                try:
+                    await self._open_link()
+                    last_error = None
+                except Exception as exc:  # any failure must leave the connector alive for the next try
+                    if str(exc) != last_error:
+                        last_error = str(exc)
+                        log.warning("esp32 open failed: %s", exc)
+                    self._close_link()
+            await asyncio.sleep(1.0)
+
     def _esp_send(self, op, **fields):
         """Send one op with a new id, counted on the running action; return the id."""
         if self.link is None:
@@ -262,6 +385,31 @@ class Robotd:
             self._link_lost(str(exc))
             raise RpcError(dogproto.UNAVAILABLE, "esp32 link down") from exc
         return esp_id
+
+    async def _esp_call(self, op, done_s=None, **fields):
+        """Send one op, wait for its ack and, with done_s, for its done; raise RpcError on nack or silence.
+
+        The reply futures exist before the next await, so a fast reply is never lost.
+        """
+        esp_id = self._esp_send(op, **fields)
+        loop = asyncio.get_running_loop()
+        ack = self._acks[esp_id] = loop.create_future()
+        if done_s:
+            done = self._dones[esp_id] = loop.create_future()
+        try:
+            # Not wait_for: on Python 3.11 it drops a cancel that arrives with the reply, so a stop could be lost.
+            async with asyncio.timeout(ACK_WAIT_S):
+                reply = await ack
+            if reply.get("ev") == "nack":
+                raise RpcError(dogproto.FAULT, f"esp32 refused {op}: {reply.get('why', '?')}")
+            if done_s:
+                async with asyncio.timeout(done_s):
+                    await done
+        except TimeoutError as exc:
+            raise RpcError(dogproto.TIMEOUT, f"esp32 did not finish {op}") from exc
+        finally:
+            self._acks.pop(esp_id, None)
+            self._dones.pop(esp_id, None)
 
     def _esp_quiet(self, op, **fields):
         """Send an op and ignore a link failure; used on the stop path."""
@@ -306,3 +454,25 @@ class Robotd:
         self._move = (0.0, 0.0, 0.0)
         self._stick = None
         self._stick_latched = True
+
+    def _require_link(self):
+        """Raise UNAVAILABLE while the bridge link is down."""
+        if not self.link_up:
+            raise RpcError(dogproto.UNAVAILABLE, "esp32 link down")
+
+    # ---- method handlers
+
+    async def h_capture(self, params, conn):
+        """robot.capture: record remote frames for ms; DISARMED only, one capture at a time."""
+        if self.armed or self._capture is not None:
+            raise RpcError(dogproto.BUSY, "a capture needs DISARMED and no other capture")
+        self._require_link()
+        ms = params["ms"]
+        if not 100 <= ms <= 10000:
+            raise RpcError(dogproto.INVALID_PARAMS, "ms must be 100..10000")
+        frames = self._capture = []
+        try:
+            await self._esp_call("capture", done_s=ms / 1000 + 1.0, ms=ms)
+            return {"frames": frames}
+        finally:
+            self._capture = None
