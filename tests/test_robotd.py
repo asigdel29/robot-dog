@@ -75,6 +75,27 @@ class RegistryRules(unittest.TestCase):
         many = demo(**{f"c{i}": {"ir": nec} for i in range(24)})
         self.assertTrue(any("more than 24" in e for e in robotd.check_registry(many)))
 
+    def test_unverified_drive_is_only_unavailable(self):
+        """An unverified drive command is not an error; goto needs forward and one turn."""
+        no_left = demo(left={"verified": False, "cloud": False})
+        self.assertEqual(robotd.check_registry(no_left), [])
+        self.assertFalse(robotd.capabilities(no_left)["drive"]["left"])
+        self.assertTrue(robotd.capabilities(no_left)["goto"])
+        no_turn = demo(left={"verified": False, "cloud": False}, right={"verified": False, "cloud": False})
+        self.assertFalse(robotd.capabilities(no_turn)["goto"])
+        self.assertFalse(robotd.capabilities(demo(forward={"verified": False, "cloud": False}))["goto"])
+
+
+class Geometry(unittest.TestCase):
+    """Stick mapping and the goto step."""
+
+    def test_stick(self):
+        """Inside the dead band there is no direction; outside it the larger axis wins."""
+        self.assertIsNone(robotd.stick_dir(0.3, -0.4))
+        for axes, direction in (((0.9, 0.6), "forward"), ((-0.9, 0.6), "back"), ((0.2, 0.8), "left"),
+                                ((0.2, -0.8), "right")):
+            self.assertEqual(robotd.stick_dir(*axes), direction)
+
 
 class Params(unittest.TestCase):
     """The dogproto PARAMS validator."""
@@ -154,6 +175,27 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
         daemon._esp_rx = time.monotonic() + 3600  # keep the silence watchdog quiet for direct tick() calls
         return daemon
 
+    async def test_stop_and_disarm_latch_a_held_stick(self):
+        """A stop or a disarm must hold while the stick stays pushed; padd repeats the stick at 20 Hz."""
+        for stop in ("h_stop", "h_disarm"):
+            with self.subTest(stop):
+                daemon = self.make()
+                local = Conn(False)
+                await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
+                daemon.tick(1)
+                self.assertIn("hold forward", daemon.link.names())
+                await getattr(daemon, stop)({}, local)
+                daemon.armed = True  # Start pressed again with the stick still pushed
+                stopped_at = len(daemon.link.ops)
+                for tick in range(2, 10):
+                    await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
+                    daemon.tick(tick)
+                self.assertNotIn("hold forward", daemon.link.names()[stopped_at:])
+                await daemon.h_move({"vx": 0.0, "vyaw": 0.0}, local)  # stick back at center
+                await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
+                daemon.tick(11)
+                self.assertIn("hold forward", daemon.link.names()[stopped_at:])
+
     async def test_duplicate_hello_reply_keeps_the_link(self):
         """A repeated hello can get two replies with our sid; only another sid means a board reset."""
         daemon = self.make()
@@ -164,6 +206,29 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
         daemon._on_esp({"ev": "hello", "sid": 0, "boot": 2, "fw": "x", "state": "DISARMED"})
         self.assertFalse(daemon.link_up)
         self.assertFalse(daemon.armed)
+
+    async def test_arm_races_leave_the_dog_disarmed(self):
+        """A bridge reset or a disarm that lands with the arm ack must not leave robotd armed."""
+        for race in ("reset", "disarm"):
+            def ack_then_race(link, obj):
+                if obj["op"] != "arm":
+                    return False
+                def both():
+                    link.daemon._on_esp({"ev": "ack", "id": obj["id"]})
+                    if race == "reset":
+                        link.daemon._on_esp({"ev": "hello", "sid": 0, "boot": 2, "fw": "x", "state": "DISARMED"})
+                    else:
+                        link.daemon._disarm("request")
+                asyncio.get_running_loop().call_soon(both)
+                return True
+
+            with self.subTest(race):
+                daemon = self.make(on_op=ack_then_race)
+                daemon.armed = False
+                daemon._sid = 1234
+                with self.assertRaises(dogproto.RpcError):
+                    await daemon.h_enable({}, Conn(False))
+                self.assertFalse(daemon.armed)
 
     async def test_one_capture_at_a_time(self):
         """A second capture must not take the frames of the first one."""
