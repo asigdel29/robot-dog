@@ -18,6 +18,8 @@ import sys
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 import uuid
 from unittest import mock
 
@@ -30,10 +32,32 @@ sys.path.insert(0, os.path.join(ROOT, "tests"))
 
 import dogproto  # noqa: E402
 import linkd  # noqa: E402
-from devstack import Stack  # noqa: E402
+from devstack import Stack, free_port  # noqa: E402
 
 DEVICE_TOKEN = "device-secret"
+TOOLS_TOKEN = "tools-secret"
+HERMES_KEY = "hermes-secret"
+OPENAI_KEY = "openai-secret"
 FAKE_JPEG = b"\xff\xd8\xff\xe0fake jpeg\xff\xd9"
+
+
+def http_json(url, body=None, headers=None):
+    """Make one HTTP request and return (status, parsed JSON body or None)."""
+    data = None if body is None else json.dumps(body).encode()
+    request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(request, timeout=5) as reply:
+            return reply.status, json.loads(reply.read() or b"null")
+    except urllib.error.HTTPError as err:
+        return err.code, None
+
+
+def answers(url):
+    """Return True when a GET of url answers 200; a server that is not up yet answers False."""
+    try:
+        return http_json(url)[0] == 200
+    except OSError:
+        return False
 
 
 class StubMediad(threading.Thread):
@@ -108,9 +132,28 @@ class LinkStack(Stack):
         self.mediad = StubMediad(self.sock("mediad", cloud=True))
         self.mediad.start()
         self.mediad.ready.wait(5)
+        if self.hub_ws is None:
+            hub_port, stub_port = free_port(), free_port()
+            self.hub_url = f"http://127.0.0.1:{hub_port}"
+            self.stub_url = f"http://127.0.0.1:{stub_port}"
+            self.env.update({
+                "DEVICE_TOKEN": DEVICE_TOKEN, "TOOLS_TOKEN": TOOLS_TOKEN, "HERMES_URL": self.stub_url,
+                "HERMES_API_KEY": HERMES_KEY, "OPENAI_API_KEY": OPENAI_KEY, "OPENAI_BASE_URL": f"{self.stub_url}/v1",
+                "DOG_STT_MODEL": "stub-stt", "DOG_TTS_MODEL": "stub-tts", "DOG_TTS_VOICE": "stub-voice",
+                "DOG_HUB_STATE": os.path.join(self.run_dir, "hubstate"), **self.hub_env})
+            self.hub_port = hub_port
+            self.spawn("hub", os.path.join(ROOT, "hub", "hub.py"), "--port", str(hub_port))
+            self.wait_for(lambda: answers(f"{self.hub_url}/healthz"), "hub /healthz", timeout=20)
         self.env.update({"DOG_HUB_URL": self.hub_ws or f"ws://127.0.0.1:{self.hub_port}/device",
                          "DOG_DEVICE_TOKEN": DEVICE_TOKEN})
         self.spawn("linkd", os.path.join(ROOT, "pi", "linkd.py"), "--assume-synced")
+        if self.hub_ws is None:
+            self.wait_for(lambda: "device dog-01 up" in self.out("hub"), "linkd link to the hub")
+
+    def out(self, name):
+        """Return the output of one process so far."""
+        with open(os.path.join(self.run_dir, f"{name}.out")) as handle:
+            return handle.read()
 
     def stop(self):
         """Stop the processes and the stub mediad."""
@@ -121,6 +164,38 @@ class LinkStack(Stack):
     def armed(self):
         """Return the armed flag of robotd."""
         return self.call("robot.state")["armed"]
+
+
+class LinkTestCase(unittest.TestCase):
+    """Starts a fresh LinkStack for each test; hub_env adds hub settings."""
+
+    hub_env = {}
+
+    def setUp(self):
+        """Start the stack."""
+        self.stack = LinkStack(hub_env=self.hub_env)
+        self.addCleanup(self.stack.stop)
+        self.stack.start()
+
+    def arm(self):
+        """Arm the dog from the local socket, as gamepad Start does."""
+        self.assertTrue(self.stack.call("robot.enable")["armed"])
+
+
+class Tools(LinkTestCase):
+    """The robot tools over the Model Context Protocol, through the hub and linkd to robotd."""
+
+    def test_silent_hub_disarms(self):
+        """A frozen hub (SIGSTOP) answers no ping: linkd drops the link and disarms in about 11 s."""
+        self.arm()
+        hub = self.stack.procs["hub"]
+        hub.send_signal(signal.SIGSTOP)
+        self.addCleanup(hub.send_signal, signal.SIGCONT)
+        frozen = time.monotonic()
+        self.stack.wait_for(lambda: not self.stack.armed(), "disarm after a silent hub", timeout=15)
+        took = time.monotonic() - frozen
+        print(f"\nsilent hub to disarm: {took:.1f} s")
+        self.assertLess(took, 12.5)
 
 
 class FakeHub:
