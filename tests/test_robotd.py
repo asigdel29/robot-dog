@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import json
+import math
 import os
 import sys
 import tempfile
@@ -95,6 +96,20 @@ class Geometry(unittest.TestCase):
         for axes, direction in (((0.9, 0.6), "forward"), ((-0.9, 0.6), "back"), ((0.2, 0.8), "left"),
                                 ((0.2, -0.8), "right")):
             self.assertEqual(robotd.stick_dir(*axes), direction)
+
+    def test_nav_step(self):
+        self.assertEqual(robotd.nav_step((100, 100, 0), (120, 100), 40), "done")
+        self.assertEqual(robotd.nav_step((100, 100, 0), (300, 110), 40), "forward")
+        # Goal straight below on screen (y down): clockwise, so right.
+        self.assertEqual(robotd.nav_step((100, 100, 0), (100, 300), 40), "right")
+        self.assertEqual(robotd.nav_step((100, 100, 0), (100, -100), 40), "left")
+        self.assertEqual(robotd.nav_step((100, 100, 0), (100, 300), 40, turn_sign=-1), "left")
+        self.assertAlmostEqual(robotd.wrap(3 * math.pi), math.pi)
+
+    def test_inside_polygon(self):
+        square = [[0, 0], [10, 0], [10, 10], [0, 10]]
+        self.assertTrue(robotd.inside((5, 5), square))
+        self.assertFalse(robotd.inside((15, 5), square))
 
 
 class Params(unittest.TestCase):
@@ -235,6 +250,23 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
                 await daemon.h_move({"vx": 1.0, "vyaw": 0.0}, local)
                 daemon.tick(11)
                 self.assertIn("hold forward", daemon.link.names()[stopped_at:])
+
+    async def test_goto_keeps_the_last_seen_goal(self):
+        """The dog covers a goal marker on the floor as it arrives; goto must still end there."""
+        registry = demo()
+        registry["goto"].update(forward_ms=50, turn_ms=50, settle_ms=10)
+        daemon = self.make(registry=registry)
+        local = Conn(False)
+        await daemon.h_observe({"t_mono_ns": time.monotonic_ns(),
+                                "markers": {"1": [100.0, 100.0, 0.0], "2": [160.0, 100.0, 0.0]}}, local)
+
+        async def arrive_on_goal(name, ms):  # stands in for the bridge hold: only the dog is seen now
+            await daemon.h_observe({"t_mono_ns": time.monotonic_ns(), "markers": {"1": [150.0, 100.0, 0.0]}}, local)
+
+        daemon._hold = arrive_on_goal
+        result = await daemon.h_goto({"marker": 2, "id": "g"}, Conn(True))
+        self.assertTrue(result["reached"], result)
+        self.assertEqual(result["steps"], 2)
 
     async def test_duplicate_hello_reply_keeps_the_link(self):
         """A repeated hello can get two replies with our sid; only another sid means a board reset."""
