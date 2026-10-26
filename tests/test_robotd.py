@@ -175,6 +175,46 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
         daemon._esp_rx = time.monotonic() + 3600  # keep the silence watchdog quiet for direct tick() calls
         return daemon
 
+    async def test_stop_in_same_turn_as_ack_is_not_lost(self):
+        """A stop that lands with the first hold ack must end the drive (Python 3.11 wait_for drops it)."""
+        def ack_then_stop(link, obj):
+            if obj["op"] == "hold" and link.names().count("hold forward") == 1:
+                def both():
+                    link.daemon._on_esp({"ev": "ack", "id": obj["id"]})
+                    link.daemon._esp_quiet("stop")
+                    link.daemon._cancel_action("stopped")
+                asyncio.get_running_loop().call_soon(both)
+                return True
+            return False
+
+        daemon = self.make(on_op=ack_then_stop)
+        with self.assertRaises(dogproto.RpcError) as ctx:
+            await daemon.h_drive({"dir": "forward", "ms": 600, "id": "a"}, Conn(True))
+        self.assertEqual(ctx.exception.code, dogproto.PREEMPTED)
+        names = daemon.link.names()
+        self.assertEqual(names[names.index("stop"):].count("hold forward"), 0, names)
+
+    async def test_disarm_during_perpetual_sends_stop_command_first(self):
+        daemon = self.make()
+        task = asyncio.ensure_future(daemon.h_do({"trick": "dance", "id": "d"}, Conn(True)))
+        await asyncio.sleep(0.05)
+        daemon._disarm("request")
+        with self.assertRaises(dogproto.RpcError):
+            await task
+        names = daemon.link.names()
+        self.assertEqual(names[names.index("send dance"):], ["send dance", "stop", "send stop", "disarm"])
+
+    async def test_stick_preempt_of_perpetual_sends_stop_command_before_hold(self):
+        daemon = self.make()
+        task = asyncio.ensure_future(daemon.h_do({"trick": "dance", "id": "d"}, Conn(True)))
+        await asyncio.sleep(0.05)
+        daemon._drive_stick("left")
+        with self.assertRaises(dogproto.RpcError):
+            await task
+        daemon._drive_stick("left")
+        names = daemon.link.names()
+        self.assertEqual(names[names.index("send dance"):], ["send dance", "send stop", "hold left"])
+
     async def test_stop_and_disarm_latch_a_held_stick(self):
         """A stop or a disarm must hold while the stick stays pushed; padd repeats the stick at 20 Hz."""
         for stop in ("h_stop", "h_disarm"):
@@ -229,6 +269,31 @@ class InProcess(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(dogproto.RpcError):
                     await daemon.h_enable({}, Conn(False))
                 self.assertFalse(daemon.armed)
+
+    async def test_cloud_drive_needs_cloud_flag(self):
+        daemon = self.make(registry=demo(forward={"cloud": False}))
+        with self.assertRaises(dogproto.RpcError) as ctx:
+            await daemon.h_drive({"dir": "forward", "ms": 300, "id": "a"}, Conn(True))
+        self.assertEqual(ctx.exception.code, dogproto.UNAVAILABLE)
+        caps = daemon.state(Conn(True))["caps"]
+        self.assertFalse(caps["drive"]["forward"] or caps["goto"])
+        await daemon.h_drive({"dir": "forward", "ms": 100, "id": "b"}, Conn(False))
+
+    async def test_bad_marker_is_refused_and_does_not_wedge(self):
+        daemon = self.make()
+        with self.assertRaises(dogproto.RpcError):
+            await daemon.h_observe({"t_mono_ns": 1, "markers": {"1": 5}}, Conn(False))
+        result = await daemon.h_do({"trick": "bark", "id": "b"}, Conn(True))
+        self.assertTrue(result["transmitted"])
+
+    async def test_failed_action_id_is_not_run_again(self):
+        daemon = self.make()
+        daemon._observed = lambda before: 1 / 0
+        for _ in range(2):
+            with self.assertRaises(dogproto.RpcError) as ctx:
+                await daemon.h_do({"trick": "bark", "id": "same"}, Conn(True))
+            self.assertEqual(ctx.exception.code, dogproto.INTERNAL_ERROR)
+        self.assertEqual(daemon.link.names().count("send bark"), 1)
 
     async def test_one_capture_at_a_time(self):
         """A second capture must not take the frames of the first one."""
