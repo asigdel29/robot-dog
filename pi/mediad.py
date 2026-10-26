@@ -5,13 +5,18 @@ robotd as robot.observe. It records push-to-talk audio with arecord, plays queue
 replies with aplay and serves the owner console. docs/design/media.md owns the rules.
 """
 
+import argparse
+import asyncio
+import contextlib
 import functools
 import json
 import logging
 import math
 import os
 import sys
+import threading
 import time
+import tomllib
 
 import cv2
 import numpy as np
@@ -23,6 +28,7 @@ log = logging.getLogger("mediad")
 CAMERA_FPS = 15
 FRAME_W, FRAME_H = 640, 480
 CAMERA_RETRY_S = 1.0
+ROBOTD_RETRY_S = 0.5
 FAKE_ROBOT_MARKER = 1  # goto.robot_marker of the dev stack registry
 FAKE_MARKER_PX = 36  # 6 px for each cell of a 4x4 marker with its border
 FAKE_MARGIN_PX = 6  # white quiet zone around each fake marker
@@ -161,3 +167,56 @@ def capture_loop(open_source, deliver):
             source.release()
             source = None
         time.sleep(CAMERA_RETRY_S)
+
+
+# ---------------------------------------------------------------- daemon
+
+
+class Mediad:
+    """All mediad state: the newest frame, the robotd link, subscribers, the play queue and push-to-talk."""
+
+    def __init__(self, fake_audio, speaker, mic):
+        self.fake_audio = fake_audio
+        self.speaker = speaker
+        self.mic = mic
+        self.frame = None  # (t_mono_ns, BGR image)
+        self.robotd = None
+
+    def on_frame(self, t_ns, frame, markers):
+        """Keep the newest frame and send its marker poses to robotd; never waits on robotd."""
+        self.frame = (t_ns, frame)
+        if self.robotd is not None:
+            self.robotd.notify("robot.observe", {"t_mono_ns": t_ns, "markers": markers})
+
+
+# ---------------------------------------------------------------- start-up
+
+
+async def main(argv=None):
+    """Start mediad: sockets, console, camera thread, robotd link and player; run until killed."""
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--config", default=os.environ.get("DOG_CONFIG", "/etc/dog/dog.toml"))
+    parser.add_argument("--fake-camera", action="store_true", help="draw markers from DOG_RUN_DIR/sim_pose.json")
+    parser.add_argument("--fake-audio", action="store_true", help="log audio to DOG_RUN_DIR instead of aplay/arecord")
+    parser.add_argument("--console-bind")
+    parser.add_argument("--console-port", type=int)
+    args = parser.parse_args(argv)
+    require_aruco_detector()
+    try:
+        with open(args.config, "rb") as handle:
+            cfg = tomllib.load(handle).get("mediad", {})
+    except FileNotFoundError:
+        cfg = {}
+    media = Mediad(args.fake_audio, cfg.get("speaker", "default"), cfg.get("mic", "default"))
+    open_source = FakeCamera if args.fake_camera else functools.partial(open_camera, cfg.get("camera", "/dev/video0"))
+    deliver = functools.partial(asyncio.get_running_loop().call_soon_threadsafe, media.on_frame)
+    threading.Thread(target=capture_loop, args=(open_source, deliver), daemon=True).start()
+    log.info("mediad ready, api %d", dogproto.API_VERSION)
+    await asyncio.gather(dogproto.keep_connected(
+        dogproto.sock_path("robotd"), functools.partial(setattr, media, "robotd"), ROBOTD_RETRY_S))
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=os.environ.get("DOG_LOG", "INFO"), format="%(name)s %(levelname)s %(message)s")
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(main(sys.argv[1:]))
