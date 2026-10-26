@@ -23,7 +23,12 @@ import urllib.request
 import uuid
 from unittest import mock
 
+import httpx2
+import websockets
+import websockets.sync.client
 import websockets.sync.server
+from mcp import Client
+from mcp.client.streamable_http import streamable_http_client
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "pi"))
@@ -38,6 +43,7 @@ DEVICE_TOKEN = "device-secret"
 TOOLS_TOKEN = "tools-secret"
 HERMES_KEY = "hermes-secret"
 OPENAI_KEY = "openai-secret"
+TOOL_NAMES = {"get_state", "look"}
 FAKE_JPEG = b"\xff\xd8\xff\xe0fake jpeg\xff\xd9"
 
 
@@ -161,6 +167,21 @@ class LinkStack(Stack):
         if self.mediad is not None:
             self.mediad.halt()
 
+    def tools(self, work):
+        """Run work(client) with a Model Context Protocol client on /tools, as Hermes does."""
+        async def session():
+            """Open the client, run work and return its result."""
+            headers = {"Authorization": f"Bearer {TOOLS_TOKEN}"}
+            async with httpx2.AsyncClient(headers=headers, timeout=httpx2.Timeout(10, read=60)) as http:
+                async with Client(streamable_http_client(f"{self.hub_url}/tools/", http_client=http)) as client:
+                    return await work(client)
+        return asyncio.run(session())
+
+    def tool(self, name, arguments=None):
+        """Call one tool and return (is_error, text of the result)."""
+        result = self.tools(lambda client: client.call_tool(name, arguments or {}))
+        return result.is_error, " ".join(getattr(block, "text", "") for block in result.content)
+
     def armed(self):
         """Return the armed flag of robotd."""
         return self.call("robot.state")["armed"]
@@ -184,6 +205,35 @@ class LinkTestCase(unittest.TestCase):
 
 class Tools(LinkTestCase):
     """The robot tools over the Model Context Protocol, through the hub and linkd to robotd."""
+
+    def test_tool_list_and_tokens(self):
+        """Two tools, two read-only; /tools needs TOOLS_TOKEN, /device needs DEVICE_TOKEN and a text hello."""
+        listed = self.stack.tools(lambda client: client.list_tools())
+        self.assertEqual({tool.name for tool in listed.tools}, TOOL_NAMES)
+        read_only = {t.name for t in listed.tools if t.annotations and t.annotations.read_only_hint}
+        self.assertEqual(read_only, {"get_state", "look"})
+        self.assertEqual(http_json(f"{self.stack.hub_url}/tools/", {})[0], 401)
+        self.assertEqual(http_json(f"{self.stack.hub_url}/tools/", {}, {"Authorization": "Bearer wrong"})[0], 401)
+        device_url = f"ws://127.0.0.1:{self.stack.hub_port}/device"
+        for headers in ({}, {"Authorization": "Bearer wrong"}):
+            with self.assertRaises(websockets.exceptions.InvalidStatus):
+                websockets.sync.client.connect(device_url, additional_headers=headers, open_timeout=5)
+        with websockets.sync.client.connect(device_url, additional_headers={"Authorization": f"Bearer {DEVICE_TOKEN}"},
+                                            open_timeout=5) as conn:
+            conn.send(b"\x00 binary hello")
+            with self.assertRaises(websockets.exceptions.ConnectionClosed) as closed:
+                conn.recv(timeout=5)
+        self.assertEqual(closed.exception.rcvd.code, 1008, "a binary hello is refused, not an internal error")
+
+    def test_state_look_say_stop(self):
+        """get_state, look, say (and its length limit) and stop."""
+        state = json.loads(self.stack.tool("get_state")[1])
+        self.assertEqual(state["link"], "up")
+        self.assertIn("bark", {t["name"] for t in state["tricks"]})
+        self.assertTrue(state["caps"]["goto"])
+        result = self.stack.tools(lambda client: client.call_tool("look", {}))
+        self.assertEqual(result.content[0].mime_type, "image/jpeg")
+        self.assertEqual(base64.b64decode(result.content[0].data), FAKE_JPEG)
 
     def test_silent_hub_disarms(self):
         """A frozen hub (SIGSTOP) answers no ping: linkd drops the link and disarms in about 11 s."""
