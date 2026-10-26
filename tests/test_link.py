@@ -13,6 +13,7 @@ import functools
 import json
 import os
 import queue
+import re
 import signal
 import sys
 import threading
@@ -180,6 +181,14 @@ class LinkStack(Stack):
         if self.mediad is not None:
             self.mediad.halt()
 
+    def stub_config(self, **changes):
+        """Change the stub_hermes config."""
+        http_json(f"{self.stub_url}/_stub/config", changes)
+
+    def stub_requests(self, path):
+        """Return the requests that stub_hermes recorded for one path."""
+        return [r for r in http_json(f"{self.stub_url}/_stub/requests")[1] if r["path"] == path]
+
     def tools(self, work):
         """Run work(client) with a Model Context Protocol client on /tools, as Hermes does."""
         async def session():
@@ -194,6 +203,18 @@ class LinkStack(Stack):
         """Call one tool and return (is_error, text of the result)."""
         result = self.tools(lambda client: client.call_tool(name, arguments or {}))
         return result.is_error, " ".join(getattr(block, "text", "") for block in result.content)
+
+    def utter(self, seconds=0.5):
+        """Make the stub mediad send one utterance of silence; return its id."""
+        utt_id = uuid.uuid4().hex
+        pcm = b"\x00\x00" * int(16000 * seconds)
+        self.mediad.notify("media.utterance", {"id": utt_id, "rate": 16000,
+                                               "pcm16_b64": base64.b64encode(pcm).decode()})
+        return utt_id
+
+    def latency_lines(self):
+        """Return the voice latency lines of the hub log."""
+        return re.findall(r"voice \S+ latency ms: .*", self.out("hub"))
 
     def armed(self):
         """Return the armed flag of robotd."""
@@ -332,6 +353,47 @@ class Tools(LinkTestCase):
             pass
 
 
+class VoiceLoop(LinkTestCase):
+    """Utterance to STT, Hermes run, TTS and audio.play, with the stop fast path and barge-in."""
+
+    def wait_latency_line(self):
+        """Wait for the end of a turn and print the latency lines."""
+        self.stack.wait_for(lambda: self.stack.latency_lines(), "voice latency line")
+        for line in self.stack.latency_lines():
+            print(f"\n{line}")
+
+    def test_utterance_plays_reply(self):
+        """One turn with the right models, headers and sentences; stream lines that are not events are skipped."""
+        junk = ["id: 7", "data: [DONE]", "data: [1, 2]", 'data: {"event": "message.delta", "delta": 7}']
+        self.stack.stub_config(junk_lines=junk)
+        utt_id = self.stack.utter()
+        self.stack.wait_for(lambda: len(self.stack.mediad.plays) >= 2, "two sentences played")
+        stt = self.stack.stub_requests("/v1/audio/transcriptions")[0]
+        self.assertEqual((stt["model"], stt["wav"], stt["authorization"]), ("stub-stt", True, f"Bearer {OPENAI_KEY}"))
+        run = self.stack.stub_requests("/v1/runs")[0]
+        self.assertEqual(run["body"]["input"], "[spoken via dog mic] hello dog")
+        self.assertEqual(run["headers"], {"authorization": f"Bearer {HERMES_KEY}", "idempotency-key": utt_id,
+                                          "x-hermes-session-key": "dog-01-voice"})
+        spoken = [r["body"] for r in self.stack.stub_requests("/v1/audio/speech")]
+        self.assertEqual([b["input"] for b in spoken], ["Sure, I can do that.", "Here I go!"])
+        self.assertEqual({(b["model"], b["voice"], b["response_format"]) for b in spoken},
+                         {("stub-tts", "stub-voice", "pcm")})
+        self.wait_latency_line()
+
+    def test_long_reply_waits_for_queue_room(self):
+        """At most 10 s of audio is queued at mediad; the rest waits for room."""
+        self.stack.stub_config(reply=[f" Part {n}." for n in range(14)], delta_delay=0.01, speech_seconds=1.0)
+        self.stack.utter()
+        self.stack.wait_for(lambda: self.stack.mediad.plays, "first part played")
+        first = self.stack.mediad.plays[0][0]
+        time.sleep(0.5)
+        self.assertLessEqual(len(self.stack.mediad.plays), 11)
+        self.stack.wait_for(lambda: len(self.stack.mediad.plays) == 14, "all parts played", timeout=10)
+        spread = (self.stack.mediad.plays[-1][0] - first) / 1e9
+        print(f"\nlong reply: 14 parts of 1 s sent over {spread:.1f} s")
+        self.assertGreater(spread, 2.5)
+
+
 class DailyCaps(LinkTestCase):
     """Over a daily cap the dog says nothing new, and the hub logs it."""
 
@@ -345,6 +407,10 @@ class DailyCaps(LinkTestCase):
         self.assertIn("daily speech limit", text)
         with open(os.path.join(self.stack.run_dir, "hubstate", "usage.json")) as handle:
             self.assertEqual(json.load(handle)["tts_chars"], 5)
+        self.stack.utter()
+        self.stack.wait_for(lambda: "daily cap reached: stt_s" in self.stack.out("hub"), "STT cap in the hub log")
+        self.assertEqual(self.stack.stub_requests("/v1/audio/transcriptions"), [])
+        self.assertEqual(len(self.stack.mediad.plays), 1)
 
 
 class FakeHub:
