@@ -13,8 +13,10 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import signal
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -27,6 +29,10 @@ from dogproto import RpcError
 
 log = logging.getLogger("linkd")
 
+#: A hub request whose sent_at differs from the Pi clock by more than this is refused with STALE.
+STALE_MS = 1500
+#: These only reduce motion or sound, so linkd never refuses them for age or clock sync.
+ALWAYS_FORWARD = frozenset({"robot.stop", "robot.disarm", "audio.stop"})
 PING_S = 5
 #: A silent hub is dropped after ping interval + pong timeout + this close timeout.
 CLOSE_S = 1
@@ -36,10 +42,21 @@ RECONNECT_MAX_S = 30
 STABLE_SESSION_S = 2 * PING_S
 #: Longer than the hub wait (35 s), which is longer than the robotd goto limit (30 s).
 LOCAL_TIMEOUT_S = 40
+CLOCK_CHECK_S = 30
 #: mediad notifications and the hub method each one becomes.
 FORWARDS = {"media.utterance": "voice.utterance", "media.bargein": "voice.cancel"}
 #: The release directory name (/opt/dog/releases/<ver>), or the checkout name in dev.
 VERSION = os.path.basename(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
+
+def ntp_synced():
+    """Return True or False from systemd's NTP sync flag, or None when the check fails; STALE needs a true clock."""
+    try:
+        out = subprocess.run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+                             capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return {"yes": True, "no": False}.get(out.stdout.strip())
 
 
 class Link:
@@ -49,8 +66,10 @@ class Link:
         self.url = url
         self.token = token
         self.device = device
+        #: The last known NTP state; when it starts False, run() checks it in the background.
         self.clock_synced = clock_synced
         self.ws = None
+        self._clock_task = None
         self._local = {}
         self._local_lock = asyncio.Lock()
         self._tasks = set()
@@ -59,6 +78,8 @@ class Link:
         """Connect to the hub until SIGTERM; wait 1 s to 30 s between attempts."""
         # SIGTERM cancels this task, so the session cleanup disarms the dog as for any link loss.
         asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
+        if not self.clock_synced:
+            self._clock_task = asyncio.ensure_future(self._watch_clock())
         delay = RECONNECT_MIN_S
         while True:
             started = None
@@ -77,6 +98,17 @@ class Link:
                 delay = RECONNECT_MIN_S
             await asyncio.sleep(delay)
             delay = min(delay * 2, RECONNECT_MAX_S)
+
+    async def _watch_clock(self):
+        """Read the NTP state each CLOCK_CHECK_S off the event loop; a failed check keeps the last value."""
+        while True:
+            synced = await asyncio.to_thread(ntp_synced)
+            if synced is None:
+                log.warning("NTP state unknown; keeping synced=%s", self.clock_synced)
+            elif synced != self.clock_synced:
+                log.info("NTP synced: %s", synced)
+                self.clock_synced = synced
+            await asyncio.sleep(CLOCK_CHECK_S)
 
     async def _session(self, ws):
         """Serve one hub connection until it closes."""
@@ -162,6 +194,8 @@ class Link:
             # linkd owns the mediad subscription; a second one from the hub would duplicate each utterance.
             if not isinstance(method, str) or method not in dogproto.CLOUD_METHODS or method == "media.subscribe":
                 raise RpcError(dogproto.METHOD_NOT_FOUND, f"unknown method {method}")
+            if method not in ALWAYS_FORWARD:
+                self._check_fresh(msg.get("sent_at"), received_ms)
             client = await self._client("robotd" if method.startswith("robot.") else "mediad")
             reply["result"] = await client.call(method, msg.get("params"), timeout=LOCAL_TIMEOUT_S)
         except RpcError as err:
@@ -173,6 +207,16 @@ class Link:
         except OSError as exc:
             reply["error"] = RpcError(dogproto.UNAVAILABLE, f"daemon not reachable: {exc}").to_obj()
         await self._send(ws, reply)
+
+    def _check_fresh(self, sent_at, received_ms):
+        """Raise STALE unless sent_at is finite, the clock is synced and the two clocks agree within STALE_MS."""
+        if isinstance(sent_at, bool) or not isinstance(sent_at, (int, float)) or not math.isfinite(sent_at):
+            raise RpcError(dogproto.STALE, "request has no valid sent_at")
+        if not self.clock_synced:
+            raise RpcError(dogproto.STALE, "the Pi clock is not NTP-synced")
+        age_ms = received_ms - sent_at
+        if abs(age_ms) > STALE_MS:
+            raise RpcError(dogproto.STALE, f"request age {age_ms:.0f} ms is outside +-{STALE_MS} ms")
 
 
 def main():
