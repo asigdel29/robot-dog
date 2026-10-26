@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(ROOT, "pi"))
 sys.path.insert(0, os.path.join(ROOT, "sim"))
 
 import dogproto  # noqa: E402
+import robotctl  # noqa: E402
 import robotd  # noqa: E402
 from devstack import DEMO_REGISTRY  # noqa: E402
 
@@ -140,6 +141,47 @@ class Params(unittest.TestCase):
     def test_cloud_methods_exclude_arming_and_stick(self):
         for method in ("robot.enable", "robot.move", "robot.capture", "robot.test", "robot.reload", "audio.ptt"):
             self.assertNotIn(method, dogproto.CLOUD_METHODS)
+
+
+class Capture(unittest.TestCase):
+    """robotctl builds a registry entry from captures."""
+
+    TAP = {"proto": "NEC", "addr": 0, "cmd": 0x18, "bits": 32, "raw": [9000, 4500, 560], "gap_us": 0}
+    REPEAT = {"proto": "NEC", "addr": 0, "cmd": 0x18, "bits": 0, "raw": [9000, 2250, 560], "gap_us": 108000,
+              "repeat": True}
+
+    def test_nec_hold(self):
+        entry = robotctl.entry_from_captures([self.TAP] * 3, [self.TAP, self.REPEAT, self.REPEAT])
+        self.assertEqual((entry["kind"], entry["repeat"], entry["period_ms"]), ("hold", "nec", 108))
+        self.assertFalse(entry["verified"])
+
+    def test_single_press(self):
+        entry = robotctl.entry_from_captures([self.TAP] * 3, [self.TAP])
+        self.assertEqual((entry["kind"], entry["repeat"]), ("episodic", "none"))
+
+    def test_mismatch_refused(self):
+        with self.assertRaises(robotctl.InputError):
+            robotctl.entry_from_captures([self.TAP, {**self.TAP, "cmd": 1}, self.TAP], [self.TAP])
+
+    def test_toggle_refused(self):
+        for proto in ("RC5", "RC6", "RC6A", "Marantz"):
+            with self.assertRaises(robotctl.InputError):
+                robotctl.entry_from_captures([{**self.TAP, "proto": proto}] * 3, [])
+
+    def test_nec_data_kept_for_exact_replay(self):
+        tap = {**self.TAP, "data": 0xE718FF00}
+        entry = robotctl.entry_from_captures([tap] * 3, [tap])
+        self.assertEqual(entry["ir"]["data"], 0xE718FF00)
+        self.assertEqual(robotd.ir_wire("x", {**robotd.CMD_DEFAULTS, **entry})["data"], 0xE718FF00)
+        with self.assertRaises(robotctl.InputError):
+            robotctl.entry_from_captures([tap, {**tap, "data": 0xE718FE01}, tap], [tap])
+
+    def test_raw_timings_compared(self):
+        raw = {"proto": "raw", "raw": [1000, 500, 1000, 500], "gap_us": 0}
+        entry = robotctl.entry_from_captures([raw, {**raw, "raw": [1050, 480, 990, 520]}, raw], [raw])
+        self.assertEqual(entry["ir"]["proto"], "raw")
+        with self.assertRaises(robotctl.InputError):
+            robotctl.entry_from_captures([raw, {**raw, "raw": [2000, 500, 1000, 500]}, raw], [raw])
 
 
 class StubLink:
