@@ -7,7 +7,18 @@ loop never waits on another service. The design follows microduck's robotd;
 docs/design/safety.md and docs/design/registry.md own the rules.
 """
 
+import collections
+import contextlib
+import itertools
+import json
+import logging
 import math
+import time
+
+import dogproto
+from dogproto import RpcError
+
+log = logging.getLogger("robotd")
 
 PROTOS = ("NEC", "raw")
 KINDS = ("hold", "episodic", "perpetual", "mode")
@@ -139,3 +150,159 @@ def check_registry(doc):
             and all(isinstance(p, list) and len(p) == 2 and all(_num(v) for v in p) for p in area)):
         errors.append("goto.area_px must be a list of three or more [x, y] points")
     return errors
+
+
+# ---------------------------------------------------------------- daemon
+
+
+class Robotd:
+    """All robotd state. Each field has one writer, and only this class opens the serial port."""
+
+    def __init__(self, serial_path, registry_path):
+        self.serial_path = serial_path
+        self.registry_path = registry_path
+        self._load_registry()
+        self.link = None
+        self.link_up = False
+        self.esp_state = "down"
+        self.esp_max_loop_us = None
+        self.armed = False
+        self._disarms = 0  # counts each disarm, so robot.enable can see one that lands during its arm op
+        self.fault = None
+        self.action = None
+        self.loop_hz = 0.0
+        self.degraded_windows = 0
+        self._sid = 0
+        self._esp_ids = itertools.count(1)
+        self._esp_rx = 0.0
+        self._hello = None
+        self._acks = {}
+        self._dones = {}
+        self._capture = None
+        self._loaded = 0
+        self._move = (0.0, 0.0, 0.0)
+        self._stick = None
+        self._stick_latched = False  # set by a stop or disarm; cleared when the stick is back at center
+        self._pose = (0.0, {})
+        self._results = collections.OrderedDict()
+        self._last_activity = time.monotonic()
+        self._tick_errors = 0
+
+    def _load_registry(self):
+        """Read the registry; one that breaks a rule is replaced by an empty one, so nothing can load or move."""
+        try:
+            with open(self.registry_path) as handle:
+                doc = json.load(handle)
+            self.reg_errors = check_registry(doc)
+        except (OSError, ValueError) as exc:
+            self.reg_errors = [f"cannot read registry: {exc}"]
+        self.registry = normalize({} if self.reg_errors else doc)
+
+    # ---- ESP32 messages
+
+    def _on_esp(self, msg):
+        """Apply one bridge event."""
+        self._esp_rx = time.monotonic()
+        ev = msg.get("ev")
+        if ev == "hello":
+            if msg.get("sid") != self._sid:
+                if self.link_up:
+                    self._link_lost("esp32 reset")
+            elif self._hello is not None and not self._hello.done():
+                # The handshake repeats hello, so a slow bridge can answer twice; our own sid is never a reset.
+                self._hello.set_result(msg)
+        elif ev in ("ack", "nack", "done"):
+            future = (self._dones if ev == "done" else self._acks).get(msg.get("id"))
+            if future is not None and not future.done():
+                future.set_result(msg)
+        elif ev == "tx":
+            if self.action is not None and msg.get("id") in self.action.esp_ids:
+                self.action.frames += msg.get("frames", 1)
+        elif ev == "state":
+            self.esp_state = msg.get("s", "?")
+            self.esp_max_loop_us = msg.get("max_loop_us")
+            if self.esp_state == "FAULT" and self.armed:
+                self._to_fault("esp32 in FAULT")
+        elif ev == "fault":
+            self._to_fault(f"esp32: {msg.get('why', '?')}")
+        elif ev == "cap" and self._capture is not None:
+            self._capture.append({k: v for k, v in msg.items() if k != "ev"})
+
+    def _link_lost(self, reason):
+        """Close the link; an armed dog goes to FAULT."""
+        log.warning("esp32 link lost: %s", reason)
+        was_up = self.link_up
+        self._close_link()
+        if was_up and self.armed:
+            self._to_fault(f"link lost: {reason}")
+
+    def _close_link(self):
+        """Close the tty and fail each op that waits for the bridge."""
+        if self.link is not None:
+            self.link.close()
+        self.link = None
+        self.link_up = False
+        self.esp_state = "down"
+        for future in [*self._acks.values(), *self._dones.values()]:
+            if not future.done():
+                future.set_exception(RpcError(dogproto.UNAVAILABLE, "esp32 link down"))
+        self._acks.clear()
+        self._dones.clear()
+
+    def _esp_send(self, op, **fields):
+        """Send one op with a new id, counted on the running action; return the id."""
+        if self.link is None:
+            raise RpcError(dogproto.UNAVAILABLE, "esp32 link down")
+        esp_id = next(self._esp_ids)
+        if self.action is not None:
+            self.action.esp_ids.add(esp_id)
+        try:
+            self.link.send({"op": op, "id": esp_id, **fields})
+        except OSError as exc:
+            self._link_lost(str(exc))
+            raise RpcError(dogproto.UNAVAILABLE, "esp32 link down") from exc
+        return esp_id
+
+    def _esp_quiet(self, op, **fields):
+        """Send an op and ignore a link failure; used on the stop path."""
+        with contextlib.suppress(RpcError):
+            self._esp_send(op, **fields)
+
+    # ---- safety state
+
+    def _touch(self):
+        """Restart the arm idle timer."""
+        self._last_activity = time.monotonic()
+
+    def _to_fault(self, reason):
+        """Go to FAULT and disarm; only robot.enable clears it."""
+        log.error("FAULT: %s", reason)
+        self.fault = reason
+        self._disarm(reason)
+
+    def _cancel_action(self, reason):
+        """Cancel the running action; return True when one was running."""
+        action = self.action
+        if action is None or action.task.done():
+            return False
+        action.reason = reason
+        action.task.cancel()
+        return True
+
+    def _disarm(self, reason):
+        """Disarm now; a running action first sends its stop_via, and _run_action then sends the bridge disarm."""
+        if self.armed:
+            log.info("disarm: %s", reason)
+        self.armed = False
+        self._disarms += 1
+        self._latch_stick()
+        if self._cancel_action(reason):
+            self._esp_quiet("stop")  # the bridge refuses stop_via once DISARMED
+        else:
+            self._esp_quiet("disarm")
+
+    def _latch_stick(self):
+        """Drop the stick intent and ignore the stick until it is back at center; padd repeats it at 20 Hz."""
+        self._move = (0.0, 0.0, 0.0)
+        self._stick = None
+        self._stick_latched = True
