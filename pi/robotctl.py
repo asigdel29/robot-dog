@@ -2,8 +2,9 @@
 
 It talks to robotd over the local socket and prints JSON. From a laptop, run it
 over SSH: ``ssh robot-pi robotctl state``. Exit codes: 0 success, 1 the daemon
-refused, 2 the daemon is not reachable, 3 bad input. The design follows
-microduck's robotctl.
+refused or an update did not commit, 2 the daemon is not reachable, 3 bad input.
+The ``update`` commands install, roll back and list releases. The design follows
+microduck's robotctl and updaterd.
 """
 
 import argparse
@@ -367,6 +368,18 @@ def prune():
             shutil.rmtree(os.path.join(releases, name), ignore_errors=True)
 
 
+def update_apply(tarball):
+    """Install a release tarball: digest, extract, preinstall, venv, activate with the health gate, prune."""
+    version = extract(tarball)
+    say(f"extracted {version}")
+    try:
+        hook(version, "preinstall")
+        make_venv(os.path.join(dog_root(), "releases", version))
+        return activate(version)
+    finally:
+        prune()
+
+
 def update_rollback():
     """Make the previous release current again, with the same health gate."""
     previous = link_version("previous")
@@ -443,12 +456,42 @@ def build_parser():
     mapping = reg.add_parser("map")
     mapping.add_argument("dir")
     mapping.add_argument("name")
+    upd = sub.add_parser("update").add_subparsers(dest="update", required=True)
+    upd.add_parser("apply").add_argument("tarball")
+    upd.add_parser("rollback")
+    upd.add_parser("status")
     return parser
+
+
+def run_update(args):
+    """Run one update command and return its exit code; apply and rollback move into their own unit first."""
+    if args.update == "status":
+        out(update_status())
+        return EXIT_OK
+    if not os.environ.get("INVOCATION_ID"):
+        tail = [os.path.abspath(args.tarball)] if args.update == "apply" else []
+        return in_own_unit(["update", args.update, *tail])
+    signal.signal(signal.SIGTERM, on_sigterm)
+    try:
+        with update_lock():
+            result = update_apply(args.tarball) if args.update == "apply" else update_rollback()
+    except InputError as err:
+        return report(f"update refused: {err}", EXIT_INPUT)
+    except (UpdateError, OSError) as err:
+        return report(f"update did not commit: {err}", EXIT_REFUSED)
+    report(f"update committed: {result['current']} is current with health {result['health']}", EXIT_OK)
+    try:
+        out(result)
+    except BrokenPipeError:  # the SSH session is gone; the journal has the outcome
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    return EXIT_OK
 
 
 def run(argv):
     """Run one command and return its exit code."""
     args = build_parser().parse_args(argv)
+    if args.cmd == "update":
+        return run_update(args)
     cfg = robotd.load_config(args.config)
     registry_path = cfg.get("registry", "/etc/dog/registry.json")
     captures_dir = cfg.get("captures", "/var/lib/dog/captures")
