@@ -94,10 +94,10 @@ flowchart LR
 
 | Part | Job | Buy |
 | --- | --- | --- |
-| SUPIREO Y8359 robot dog and its remote | The robot. The remote is necessary to record the IR codes. | Owned |
+| SUPIREO Y8359 robot dog and its remote | The robot. The remote is necessary to record the IR codes. | [Amazon](https://www.amazon.com/Programmable-Interactive-Imitates-Handstand-Functions/dp/B0DZN2KDBG) |
 | M5Stack Atom Echo (SKU C008-C) | Wi-Fi, microphone, speaker, button. Runs the action engine. | [Amazon](https://www.amazon.com/dp/B0C7QSVPB2), [Hackster](https://hackster.io/products/buy/74003) |
 | M5Stack Unit IR (SKU U002), with a Grove cable | IR emitter and IR receiver. | [Amazon](https://www.amazon.com/dp/B08TCC28VZ), [Hackster](https://hackster.io/products/buy/71896) |
-| USB-C data cable and a 5 V USB charger | Flash and power for the board. | Owned |
+| USB-C data cable and a 5 V USB charger | Flash and power for the board. | [Amazon](https://www.amazon.com/s?k=5v+usb-a+to+usb-c+charging+cable&language=en_US&adgrpid=1235852137657514&hvadid=77240892131925&hvbmt=bp&hvdev=c&hvlocphy=250471&hvnetw=s&hvqmt=p&hvtargid=kwd-77241096409644%3Aloc-190&hydadcr=24198_13647989&mcid=e49043f7819530a98401599c654b5188&tag=txtstdbgdt-20&ref=pd_sl_5ct1uxkizh_p)|
 
 `docs/design/echo.md` gives the pins, the setup and the plan.
 
