@@ -1,15 +1,19 @@
-"""Tests of `robotctl update` (health gate, own unit).
+"""Tests of `robotctl update` (digest, health gate, rollback, prune, status).
 
 Each update test uses a temp DOG_ROOT, PATH shims for systemctl and systemd-run, and a fake
 robotd on a temp DOG_RUN_DIR. The fake answers robot.state with the health that the VERSION
 of the current release names:
 
 - "ok-N" answers ok and "degraded-N" answers degraded.
+- "fault-N" answers fault and "silent-N" never answers.
+- "late-N" answers degraded once, then fault.
+- "pidchange-N" answers ok, but robotd gets a new MainPID after the first answer.
 
 DOG_FAKE_VENV skips the real venv and pip step. DOG_HEALTH_WAIT_S=3 gives a 1 s settle window.
 """
 
 import asyncio
+import fcntl
 import hashlib
 import io
 import json
@@ -36,6 +40,8 @@ echo "systemctl $*" >> "$DOG_ROOT/shim.log"
 case "$*" in
   "show robotd -p MainPID -p NRestarts")
     if [ -e "$DOG_ROOT/robotd.show" ]; then cat "$DOG_ROOT/robotd.show"; else printf 'MainPID=100\\nNRestarts=0\\n'; fi ;;
+  "restart dog.target")
+    if [ -e "$DOG_ROOT/fail-restart" ]; then exit 1; fi ;;
 esac
 '''
 SYSTEMD_RUN_SHIM = '''#!{python}
@@ -82,6 +88,15 @@ class FakeRobotd(threading.Thread):
             version = handle.read().strip()
         kind = version.split("-")[0]
         self.calls[version] = count = self.calls.get(version, 0) + 1
+        if kind == "silent":
+            await asyncio.Event().wait()
+        if kind == "late":
+            return {"health": "degraded" if count == 1 else "fault"}
+        if kind == "pidchange":
+            if count >= 2:
+                with open(os.path.join(self.root, "robotd.show"), "w") as handle:
+                    handle.write("MainPID=200\nNRestarts=1\n")
+            return {"health": "ok"}
         return {"health": kind}
 
     def stop(self):
@@ -165,6 +180,10 @@ class UpdateTests(unittest.TestCase):
         path = os.path.join(self.dog, name)
         return os.path.basename(os.readlink(path)) if os.path.islink(path) else None
 
+    def releases(self):
+        """Return the release directories on disk."""
+        return sorted(os.listdir(os.path.join(self.dog, "releases")))
+
     def lines(self, path):
         """Return the lines of a log file, or [] when it is absent."""
         if not os.path.exists(path):
@@ -197,6 +216,127 @@ class UpdateTests(unittest.TestCase):
         proc = self.apply("degraded-2")  # absent hardware is not a reason for a rollback
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual((self.link("current"), self.link("previous")), ("degraded-2", "ok-1"))
+
+    def test_bad_digest_refused_before_any_change(self):
+        self.assertEqual(self.apply("ok-1").returncode, 0)
+        hooks_before = self.lines(self.hook_log)
+        proc = self.apply("ok-2", digest_ok=False)
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("sha256 mismatch", proc.stderr)
+        self.assertEqual((self.link("current"), self.releases()), ("ok-1", ["ok-1"]))
+        self.assertEqual(self.lines(self.hook_log), hooks_before)
+        self.assertEqual(self.restarts(), 1)
+
+    def test_unsafe_members_refused(self):
+        self.assertEqual(self.apply("ok-1").returncode, 0)
+        for version, unsafe in (("ok-2", ("symlink", "pi/link")), ("ok-3", ("file", "../escape"))):
+            proc = self.apply(version, unsafe=unsafe)
+            self.assertEqual(proc.returncode, 3, proc.stderr)
+            self.assertIn("unsafe tar member", proc.stderr)
+        self.assertEqual((self.link("current"), self.releases()), ("ok-1", ["ok-1"]))
+        self.assertFalse(os.path.exists(os.path.join(self.dog, "escape")))
+        self.assertEqual(self.restarts(), 1)
+
+    def assert_rolled_back(self, version, restarts=3, **kwargs):
+        """Apply a bad release after ok-1; check that ok-1 is current again within the gate time."""
+        self.assertEqual(self.apply("ok-1").returncode, 0)
+        start = time.monotonic()
+        proc = self.apply(version, **kwargs)
+        elapsed = time.monotonic() - start
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("rolled back to ok-1", proc.stderr)
+        self.assertLess(elapsed, GATE_S + 4)
+        self.assertEqual((self.link("current"), self.link("previous")), ("ok-1", None))
+        self.assertEqual(self.releases(), ["ok-1"])
+        self.assertEqual(self.lines(self.hook_log)[-1], "postinstall ok-1")
+        self.assertEqual(self.restarts(), restarts)
+        return proc, elapsed
+
+    def test_late_fault_rolls_back(self):
+        proc, elapsed = self.assert_rolled_back("late-2")
+        self.assertIn("health fault", proc.stderr)
+        self.assertLess(elapsed, GATE_S)
+
+    def test_robotd_restart_in_gate_rolls_back(self):
+        proc, _ = self.assert_rolled_back("pidchange-2")
+        self.assertIn("robotd started again", proc.stderr)
+
+    def test_no_answer_rolls_back_after_gate(self):
+        self.assertGreaterEqual(self.assert_rolled_back("silent-2")[1], GATE_S)
+
+    def test_failed_postinstall_rolls_back(self):
+        self.assert_rolled_back("ok-2", restarts=2, failing_hook="postinstall")
+
+    def test_failed_restart_rolls_back(self):
+        self.assertEqual(self.apply("ok-1").returncode, 0)
+        open(os.path.join(self.root, "fail-restart"), "w").close()
+        proc = self.apply("ok-2")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("systemctl failed", proc.stderr)
+        self.assertEqual((self.link("current"), self.releases()), ("ok-1", ["ok-1"]))
+
+    def test_sigterm_rolls_back(self):
+        self.assertEqual(self.apply("ok-1").returncode, 0)
+        for name in ("term-postinstall-ok-2", "term-postinstall-ok-1"):  # SIGTERM in the update and in each rollback
+            open(os.path.join(self.root, name), "w").close()
+        for version, reason in (("ok-2", "stopped by SIGTERM"), ("fault-3", "health fault")):
+            proc = self.apply(version)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn(f"{version}: {reason}; rolled back to ok-1", proc.stderr)
+        self.assertEqual((self.link("current"), self.releases()), ("ok-1", ["ok-1"]))
+        self.assertEqual(self.restarts(), 4)  # each rollback ran to its end
+
+    def test_failed_preinstall_changes_nothing(self):
+        self.assertEqual(self.apply("ok-1").returncode, 0)
+        proc = self.apply("ok-2", failing_hook="preinstall")
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual((self.link("current"), self.releases()), ("ok-1", ["ok-1"]))
+        self.assertEqual(self.restarts(), 1)
+
+    def test_failed_first_install_can_run_again(self):
+        for _ in range(2):  # the second run must not stop at "already the current release"
+            proc = self.apply("fault-1")
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("no release is current", proc.stderr)
+            self.assertIsNone(self.link("current"))
+            self.assertEqual(self.releases(), [])
+        self.assertIn("systemctl disable --now dog.target", self.lines(self.shim_log))
+        self.assertEqual(self.apply("ok-1").returncode, 0)
+        self.assertEqual(self.link("current"), "ok-1")
+
+    def test_previous_version_is_refused(self):
+        for version in ("ok-1", "ok-2"):
+            self.assertEqual(self.apply(version).returncode, 0)
+        proc = self.apply("ok-1")
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn("update rollback", proc.stderr)
+        self.assertEqual(self.releases(), ["ok-1", "ok-2"])
+
+    def test_second_update_is_refused_while_one_is_active(self):
+        with open(os.path.join(self.dog, ".lock"), "w") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            proc = self.apply("ok-1")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("another update is active", proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.dog, "releases")))
+
+    def test_prune_keeps_one_previous(self):
+        for version in ("ok-1", "ok-2", "ok-3"):
+            self.assertEqual(self.apply(version).returncode, 0)
+        self.assertEqual(self.releases(), ["ok-2", "ok-3"])
+        self.assertEqual((self.link("current"), self.link("previous")), ("ok-3", "ok-2"))
+
+    def test_rollback_and_status(self):
+        self.assertEqual(self.robotctl("update", "rollback").returncode, 3)  # nothing to roll back to
+        for version in ("ok-1", "ok-2"):
+            self.assertEqual(self.apply(version).returncode, 0)
+        proc = self.robotctl("update", "rollback")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        shim_lines = len(self.lines(self.shim_log))
+        proc = self.robotctl("update", "status")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout), {"current": "ok-1", "previous": "ok-2", "releases": ["ok-1", "ok-2"]})
+        self.assertEqual(len(self.lines(self.shim_log)), shim_lines)  # status only reads, so no systemd-run
 
 
 if __name__ == "__main__":
