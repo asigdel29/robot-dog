@@ -11,6 +11,7 @@ docs/design/cloud.md owns the protocol, the tool contracts and the limits.
 import argparse
 import asyncio
 import base64
+import collections
 import contextlib
 import hmac
 import inspect
@@ -20,6 +21,8 @@ import logging
 import os
 import sys
 import time
+import uuid
+from typing import Literal
 
 import uvicorn
 from mcp.server.mcpserver import Image, MCPServer
@@ -42,6 +45,8 @@ DEVICE_WAIT_S = 35
 HELLO_WAIT_S = 10
 FRAME_LIMIT = 2 * 1024 * 1024
 PING_S = 5
+MOTION_PER_MIN = 30
+NOT_ARMED = -32001
 
 TOOL_RULES = inspect.cleandoc("""
     Tools for a toy robot dog in a marked play area.
@@ -111,6 +116,9 @@ class Device:
         error = msg.get("error")
         if not isinstance(error, dict):
             future.set_result(msg.get("result"))
+        elif error.get("code") == NOT_ARMED:
+            future.set_exception(DeviceError("the dog is not armed: ask the owner to press Start on the gamepad",
+                                             NOT_ARMED))
         else:
             future.set_exception(DeviceError(f"{error.get('message', 'error')} (code {error.get('code')})",
                                              error.get("code")))
@@ -139,6 +147,7 @@ def _bearer_ok(header, token):
 
 
 tools = MCPServer("dog", instructions=TOOL_RULES)
+_motion_times = collections.deque()
 
 
 def tool(read_only=False):
@@ -148,6 +157,17 @@ def tool(read_only=False):
         annotations = ToolAnnotations(read_only_hint=True) if read_only else None
         return tools.tool(description=inspect.cleandoc(fn.__doc__), annotations=annotations)(fn)
     return register
+
+
+async def _motion(method, params):
+    """Send one motion request with a new action id, under the rate limit of 30 per minute."""
+    now = time.monotonic()
+    while _motion_times and now - _motion_times[0] >= 60:
+        _motion_times.popleft()
+    if len(_motion_times) >= MOTION_PER_MIN:
+        raise ToolError(f"rate limit: at most {MOTION_PER_MIN} motion calls per minute; wait, then try again")
+    _motion_times.append(now)
+    return await device.call(method, {**params, "id": uuid.uuid4().hex})
 
 
 @tool(read_only=True)
@@ -162,6 +182,38 @@ async def get_state():
     return {"link": "up", **await device.call("robot.state")}
 
 
+@tool()
+async def do_trick(name: str):
+    """Do one trick by name; use only a name from get_state tricks.
+
+    Returns when the trick ends, with transmitted (IR sent) and observed (camera
+    motion or null). Never claim success from transmitted alone. If the dog is
+    not armed, ask the owner to press Start on the gamepad.
+    """
+    return await _motion("robot.do", {"trick": name})
+
+
+@tool()
+async def drive(direction: Literal["forward", "back", "left", "right"], ms: int):
+    """Drive one direction for ms milliseconds: 50 up to the registry limit, at most 1000.
+
+    get_state caps says which directions work. The result has transmitted and
+    observed; never claim the dog moved from transmitted alone. If the dog is
+    not armed, ask the owner to press Start on the gamepad.
+    """
+    return await _motion("robot.drive", {"dir": direction, "ms": ms})
+
+
+@tool()
+async def go_to_marker(marker_id: int):
+    """Walk to the ArUco marker with this id in short steps, for at most 30 s.
+
+    get_state caps.goto says if it works. The result says reached or not, and
+    why. If the dog is not armed, ask the owner to press Start on the gamepad.
+    """
+    return await _motion("robot.goto", {"marker": marker_id})
+
+
 @tool(read_only=True)
 async def look():
     """Return a JPEG photo of the play area from the camera above it, and its age in ms.
@@ -170,6 +222,12 @@ async def look():
     """
     snap = await device.call("media.snapshot", {"max_px": 640})
     return [Image(data=base64.b64decode(snap["jpeg_b64"]), format="jpeg"), f"photo age: {snap['age_ms']} ms"]
+
+
+@tool()
+async def stop():
+    """Stop the dog now: end IR output and cancel the running action. The dog stays armed. Never rate limited."""
+    return await device.call("robot.stop")
 
 
 def _require_bearer(app, token):
