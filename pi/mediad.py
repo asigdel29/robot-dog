@@ -211,6 +211,7 @@ class Mediad:
         self._queue = asyncio.Queue()
         self._playing = None
         self._ptt_owner = None  # the connection that holds push-to-talk down
+        self._ptt_watched = set()  # connections with a close callback for push-to-talk
         self._ptt_up = None
         self._recording = None
 
@@ -350,6 +351,8 @@ class Mediad:
             raise RpcError(dogproto.INVALID_PARAMS, f"an item must be {MAX_PLAY_S} s or less")
         if self._queue.qsize() >= PLAY_QUEUE_MAX:
             raise RpcError(dogproto.BUSY, "play queue full")
+        if self._ptt_owner is not None:
+            raise RpcError(dogproto.BUSY, "push-to-talk is down")  # never play into the microphone
         self._queue.put_nowait((pcm, rate))
         return {"queued": self._queue.qsize()}
 
@@ -367,6 +370,9 @@ class Mediad:
         self._notify("media.bargein", {})
         if self._ptt_owner is None:
             self._ptt_owner = conn
+            if conn not in self._ptt_watched:
+                self._ptt_watched.add(conn)
+                conn.on_close.append(lambda: self._ptt_closed(conn))
             if self._recording is None or self._recording.done():
                 self._ptt_up = asyncio.Event()
                 self._recording = asyncio.ensure_future(self._record(self._ptt_up))
@@ -377,6 +383,12 @@ class Mediad:
         self._ptt_owner = None
         if self._ptt_up is not None:
             self._ptt_up.set()
+
+    def _ptt_closed(self, conn):
+        """Release push-to-talk when the connection that pressed closes, so a dead padd cannot keep the mic open."""
+        self._ptt_watched.discard(conn)
+        if self._ptt_owner is conn:
+            self._release_ptt()
 
 
 # ---------------------------------------------------------------- start-up
