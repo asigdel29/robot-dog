@@ -1,4 +1,4 @@
-"""Tests of `robotctl update` (digest, health gate, rollback, prune, status).
+"""Tests of `robotctl update` (digest, health gate, rollback, prune, status) and of the unit ExecStart lines.
 
 Each update test uses a temp DOG_ROOT, PATH shims for systemctl and systemd-run, and a fake
 robotd on a temp DOG_RUN_DIR. The fake answers robot.state with the health that the VERSION
@@ -18,6 +18,8 @@ import hashlib
 import io
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -337,6 +339,52 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout), {"current": "ok-1", "previous": "ok-2", "releases": ["ok-1", "ok-2"]})
         self.assertEqual(len(self.lines(self.shim_log)), shim_lines)  # status only reads, so no systemd-run
+
+
+class UnitExecStart(unittest.TestCase):
+    """Each unit ExecStart gives arguments that the daemon's own argparse accepts."""
+
+    UNITS = [os.path.join(ROOT, "deploy", "pi", name)
+             for name in ("robotd.service", "mediad.service", "padd.service", "linkd.service")]
+    UNITS.append(os.path.join(ROOT, "deploy", "hub", "doghub.service"))
+    #: Runs the daemon until its argparse parses; exit 0 = accepted, 2 = refused, 77 = import failed.
+    PROBE = (
+        "import argparse, os, runpy, sys\n"
+        "class Parsed(Exception): pass\n"
+        "parse = argparse.ArgumentParser.parse_args\n"
+        "def probe(self, args=None, namespace=None):\n"
+        "    parse(self, args, namespace)\n"
+        "    raise Parsed\n"
+        "argparse.ArgumentParser.parse_args = probe\n"
+        "sys.path.insert(0, os.path.dirname(sys.argv[1]))\n"
+        "sys.argv = sys.argv[1:]\n"
+        "try:\n"
+        "    runpy.run_path(sys.argv[0], run_name='__main__')\n"
+        "except Parsed:\n"
+        "    sys.exit(0)\n"
+        "except ImportError as err:\n"
+        "    print(err)\n"
+        "    sys.exit(77)\n"
+        "sys.exit(99)\n"
+    )
+
+    def test_exec_start_arguments_parse(self):
+        for unit in self.UNITS:
+            with open(unit) as handle:
+                line = next(x for x in handle if x.startswith("ExecStart="))
+            argv = shlex.split(line[len("ExecStart="):])
+            script = re.sub(r"^/opt/dog/current/|^/opt/doghub/", "", argv[1])
+            path = os.path.join(ROOT, script)
+            with self.subTest(unit=os.path.basename(unit)):
+                if not os.path.exists(path):
+                    self.skipTest(f"{script} is not in this tree")
+                if len(argv) == 2:
+                    continue  # the unit gives no arguments
+                proc = subprocess.run([sys.executable, "-c", self.PROBE, path, *argv[2:]], capture_output=True,
+                                      text=True, timeout=30)
+                if proc.returncode == 77:
+                    self.skipTest(f"{script} needs a package that is not installed: {proc.stdout.strip()}")
+                self.assertEqual(proc.returncode, 0, f"{script} refused {argv[2:]}: {proc.stderr[-500:]}")
 
 
 if __name__ == "__main__":

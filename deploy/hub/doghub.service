@@ -1,0 +1,39 @@
+# doghub.service: runs the hub (device link, robot tools, voice loop) as user doghub on 127.0.0.1:8000.
+# Caddy is the only public front. The secrets come from /etc/doghub/hub.env (root:root, mode 0600).
+# The code in /opt/doghub belongs to root, so the hub cannot change its own code.
+
+[Unit]
+Description=Robot dog hub (doghub)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=doghub
+Group=doghub
+EnvironmentFile=/etc/doghub/hub.env
+WorkingDirectory=/opt/doghub
+# hub.py always binds 127.0.0.1. It exits when DEVICE_TOKEN, TOOLS_TOKEN, HERMES_API_KEY or OPENAI_API_KEY is empty.
+ExecStart=/opt/doghub/.venv/bin/python /opt/doghub/hub/hub.py --port 8000
+Restart=always
+RestartSec=1
+StateDirectory=doghub
+StateDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
