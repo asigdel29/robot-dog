@@ -5,6 +5,20 @@ temporary run directory and prints how to reach them. Tests import Stack. Each
 process gets DOG_RUN_DIR, so nothing touches /run/dog or /etc/dog.
 """
 
+import asyncio
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "pi"))
+
+import dogproto  # noqa: E402
+
 
 def _nec(cmd, **extra):
     return {"ir": {"proto": "NEC", "addr": 0, "cmd": cmd, "bits": 32, "raw_us": [], "carrier_khz": 38},
@@ -30,3 +44,98 @@ DEMO_REGISTRY = {
     "goto": {"robot_marker": 1, "goal_radius_px": 40, "area_px": [[0, 0], [640, 0], [640, 480], [0, 480]],
              "turn_ms": 400, "forward_ms": 500, "settle_ms": 200, "turn_sign": 1},
 }
+
+
+class Stack:
+    """Processes of one dev stack and helpers to call them and read the fake log."""
+
+    def __init__(self, registry=None):
+        self.run_dir = tempfile.mkdtemp(prefix="dog-")
+        self.registry_path = os.path.join(self.run_dir, "registry.json")
+        with open(self.registry_path, "w") as handle:
+            json.dump(DEMO_REGISTRY if registry is None else registry, handle)
+        self.env = {**os.environ, "DOG_RUN_DIR": self.run_dir, "PYTHONUNBUFFERED": "1"}
+        self.procs = {}
+        self._log_pos = 0
+        self._log_rows = []
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop()
+
+    def spawn(self, name, *args):
+        """Start one process; its output goes to <run_dir>/<name>.out."""
+        with open(os.path.join(self.run_dir, f"{name}.out"), "w") as log:
+            self.procs[name] = subprocess.Popen([sys.executable, *args], env=self.env, stdout=log, stderr=log)
+
+    def start(self):
+        """Start fake_esp32 and robotd and wait until the bridge link is up."""
+        self.spawn("fake_esp32", os.path.join(ROOT, "sim", "fake_esp32.py"), "--run-dir", self.run_dir)
+        self.wait_for(lambda: os.path.exists(os.path.join(self.run_dir, "esp32")), "fake esp32 pty")
+        self.start_robotd()
+
+    def start_robotd(self):
+        """Start (or start again) robotd and wait for its link to the fake bridge."""
+        self.spawn("robotd", os.path.join(ROOT, "pi", "robotd.py"), "--serial", os.path.join(self.run_dir, "esp32"),
+                   "--registry", self.registry_path, "--config", os.path.join(self.run_dir, "absent.toml"))
+        self.wait_for(lambda: self._state("esp") == "DISARMED", "robotd esp32 link")
+
+    def _state(self, field):
+        """Return one field of robot.state, or None while robotd does not answer."""
+        try:
+            return self.call("robot.state")[field]
+        except (OSError, dogproto.RpcError, TimeoutError):
+            return None
+
+    def wait_for(self, predicate, what, timeout=10.0):
+        """Poll predicate until it is true; raise TimeoutError with what."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if predicate():
+                return
+            time.sleep(0.05)
+        raise TimeoutError(f"timed out waiting for {what}")
+
+    def sock(self, service, cloud=False):
+        """Return a socket path of this stack."""
+        return os.path.join(self.run_dir, f"{service}{'-cloud' if cloud else ''}.sock")
+
+    def call(self, method, params=None, cloud=False, timeout=5.0, service="robotd"):
+        """Make one request to a daemon of this stack."""
+        return asyncio.run(dogproto.call_once(self.sock(service, cloud), method, params, timeout))
+
+    def kill(self, name, sig=signal.SIGKILL):
+        """Send a signal to one process and wait for it to exit."""
+        proc = self.procs[name]
+        proc.send_signal(sig)
+        proc.wait(5)
+
+    def stop(self):
+        """Stop every process of the stack."""
+        for proc in self.procs.values():
+            if proc.poll() is None:
+                proc.terminate()
+        for proc in self.procs.values():
+            try:
+                proc.wait(5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+def main():
+    """Start a dev stack and keep it alive until Ctrl-C."""
+    with Stack() as stack:
+        print(f"run dir: {stack.run_dir}")
+        print(f"robotctl: DOG_RUN_DIR={stack.run_dir} python pi/robotctl.py --config /dev/null state")
+        try:
+            while all(p.poll() is None for p in stack.procs.values()):
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    main()
